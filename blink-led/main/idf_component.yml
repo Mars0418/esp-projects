@@ -1,0 +1,4 @@
+dependencies:
+  idf:
+    version: ">=5.4.4,<5.5.0"
+  espressif/led_strip: "^3.0.3"
