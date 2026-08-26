@@ -4,4 +4,7 @@ cmake_minimum_required(VERSION 3.16)
 set(CCACHE_ENABLE OFF CACHE BOOL "Disable ccache for Unicode paths" FORCE)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# Only build main and the components it declares. This keeps small hardware
+# diagnostics fast while still following transitive component dependencies.
+idf_build_set_property(MINIMAL_BUILD ON)
 project(tb6612-motor-a-test)

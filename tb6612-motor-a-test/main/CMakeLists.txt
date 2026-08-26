@@ -1,5 +1,8 @@
+set(APP_SOURCE "keyboard_remote.c" CACHE STRING
+    "Application source file; use three_wheel_diagnostic.c for wheel testing")
+
 idf_component_register(
-    SRCS "keyboard_remote.c"
+    SRCS "${APP_SOURCE}"
     INCLUDE_DIRS "."
-    REQUIRES esp_driver_gpio esp_driver_ledc esp_driver_usb_serial_jtag esp_timer
+    REQUIRES esp_driver_gpio esp_driver_ledc esp_driver_usb_serial_jtag esp_timer vfs
 )
