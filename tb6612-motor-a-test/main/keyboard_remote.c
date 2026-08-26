@@ -22,7 +22,7 @@
 #define LINE_LEFT_OUTER_GPIO  GPIO_NUM_13
 #define LINE_LEFT_INNER_GPIO  GPIO_NUM_14
 #define LINE_RIGHT_INNER_GPIO GPIO_NUM_21
-#define LINE_RIGHT_OUTER_GPIO GPIO_NUM_39
+#define LINE_RIGHT_OUTER_GPIO GPIO_NUM_47
 
 #define ENCODER_A_PHASE_A_GPIO GPIO_NUM_16
 #define ENCODER_A_PHASE_B_GPIO GPIO_NUM_17
@@ -35,16 +35,16 @@
 #define CONTROL_PERIOD_MS   10
 #define LINE_STABLE_SAMPLES  2
 #define LINE_REPORT_INTERVAL_MS 200
-#define LINE_BASE_DUTY        145
-#define LINE_MIN_DUTY         125
-#define LINE_MAX_DUTY         195
+#define LINE_BASE_DUTY        130
+#define LINE_MIN_DUTY         105
+#define LINE_MAX_DUTY         175
 #define LINE_ERROR_SCALE        8
-#define LINE_PID_KP              9
+#define LINE_PID_KP              6
 #define LINE_PID_KI_DIV        400
-#define LINE_PID_KD             12
+#define LINE_PID_KD              6
 #define LINE_PID_DEADBAND        3
 #define LINE_PID_INTEGRAL_MAX 3200
-#define LINE_PID_OUTPUT_MAX     45
+#define LINE_PID_OUTPUT_MAX     30
 #define LINE_D_TRIM_DUTY        0
 #define LINE_PULSE_ON_MS        80
 #define LINE_PULSE_CYCLE_MS     80
@@ -60,7 +60,7 @@
 #define SPEED_PI_KP_DIV          4
 #define SPEED_PI_KI_DIV        100
 #define SPEED_PI_INTEGRAL_MAX 1500
-#define SPEED_PI_OUTPUT_MAX     50
+#define SPEED_PI_OUTPUT_MAX     35
 
 typedef struct {
     gpio_num_t pwm_pin;
@@ -220,7 +220,7 @@ static int calculate_line_pid(int measured_error)
     } else {
         const int previous_error = line_pid_filtered_error;
         line_pid_filtered_error =
-            (line_pid_filtered_error + measured_error) / 2;
+            (3 * line_pid_filtered_error + measured_error) / 4;
         derivative = line_pid_filtered_error - previous_error;
     }
 
@@ -563,13 +563,12 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
         }
     }
 
+    /* Finish detection is intentionally disabled. Treat a transverse black
+     * region as track and continue forward so corner handling remains in
+     * charge of the following sensor transition. */
     if (black_count == 4) {
-        force_stop();
-        reset_line_pid();
-        line_lost_since_us = 0;
-        if (sensor_state != last_line_control_state) {
-            ESP_LOGW(TAG, "LINE: all sensors black / intersection; STOP");
-        }
+        drive_line_duties_pulsed(LINE_BASE_DUTY,
+                                 LINE_BASE_DUTY, now_us);
         last_line_control_state = sensor_state;
         return;
     }
@@ -796,16 +795,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Press F once to start line following; X or SPACE is emergency stop");
     ESP_LOGI(TAG, "Manual PWM=%d/1023; input timeout=%d ms; channel C remains stopped",
              PWM_DUTY, COMMAND_TIMEOUT_MS);
-    ESP_LOGI(TAG, "IR test pins: OUT1=GPIO13 OUT2=GPIO14 OUT3=GPIO21 OUT4=GPIO39");
+    ESP_LOGI(TAG, "IR test pins: OUT1=GPIO13 OUT2=GPIO14 OUT3=GPIO21 OUT4=GPIO47");
     ESP_LOGI(TAG, "Dual speed PI: A(E1)=GPIO16/17 B-left(E2)=GPIO8/18; boost limit=+/- %d",
              SPEED_PI_OUTPUT_MAX);
-    ESP_LOGI(TAG, "Line PID: Kp=%d Ki=1/%d Kd=%d deadband=%d/%d output=+/-%d",
+    ESP_LOGI(TAG, "Line PID: Kp=%d KiDiv=%d Kd=%d output=+/-%d",
              LINE_PID_KP, LINE_PID_KI_DIV, LINE_PID_KD,
-             LINE_PID_DEADBAND, LINE_ERROR_SCALE, LINE_PID_OUTPUT_MAX);
-    ESP_LOGI(TAG, "Line follow PWM: base=%d D-trim=%d max=%d; pulse=%d/%d ms; lost=%d ms; right-angle=%d ms",
-             LINE_BASE_DUTY, LINE_D_TRIM_DUTY, LINE_MAX_DUTY,
-             LINE_PULSE_ON_MS, LINE_PULSE_CYCLE_MS,
-             LINE_LOST_TIMEOUT_MS, LINE_TURN_TIMEOUT_MS);
+             LINE_PID_OUTPUT_MAX);
+    ESP_LOGI(TAG, "Sharp turns: pivot outer=%d inner=%d; finish detection disabled",
+             LINE_TURN_DUTY, LINE_TURN_INNER_DUTY);
 
     uint8_t line_candidate = 0xff;
     uint8_t line_reported = 0xff;
