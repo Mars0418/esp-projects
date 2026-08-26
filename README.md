@@ -1,8 +1,9 @@
-# ESP32-S3 小车工程（本机配置）
+# ESP32-S3 小车工程
 
 小车键盘遥控主工程是 `tb6612-motor-a-test`，当前编译入口为
-`main/keyboard_remote.c`。已按这台电脑配置为 ESP-IDF 5.5.5，开发板在 Windows
-中的已分配端口是 `COM5`。
+`main/keyboard_remote.c`。推荐使用已验证的 ESP-IDF 5.5.5；`car.ps1` 会优先
+使用参数指定或当前已激活的 ESP-IDF，否则扫描常见安装目录。串口按 Espressif
+USB VID 自动识别，不依赖固定 COM 号。
 
 ## 最快启动
 
@@ -24,8 +25,15 @@
    将四路红外放在线上后按一次 `F` 启动自动巡线。
    按 `Ctrl+]` 退出监视。
 
-只编译可以运行 `.\car.ps1 build`。如果 Windows 以后改了 COM 号，脚本会按
-Espressif USB VID/PID 自动识别；也可显式指定，例如 `.\car.ps1 run -Port COM6`。
+只编译可以运行 `.\car.ps1 build`。也可显式指定串口或 ESP-IDF，例如：
+
+```powershell
+.\car.ps1 run -Port COM11
+.\car.ps1 build -IdfPath C:\esp\v6.1-beta1\esp-idf
+```
+
+不同 ESP-IDF 版本使用独立的 `build-local-<版本>` 和本地 `sdkconfig.local-<版本>`，
+不会改写仓库共享的 `sdkconfig`。
 
 ## 安全逻辑
 

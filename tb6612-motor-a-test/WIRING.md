@@ -66,15 +66,14 @@ OUT4→GPIO39，模块使用 3.3V 供电并与驱动板共地。
 4. 最后打开 11.1V 电源。
 5. 出现意外转动、异味或明显发热时立即关闭 11.1V。
 
-## 本机开发配置
+## 开发配置
 
-- ESP-IDF：`C:\Espressif\v5.5.5\esp-idf`
+- 推荐并已验证的 ESP-IDF：5.5.5；`car.ps1` 也可自动识别其他已安装版本
 - 芯片目标：`esp32s3`
 - Flash：32 MB
 - USB 控制台：USB Serial/JTAG，115200 baud
-- Windows 已分配端口：`COM5`（Espressif VID `303A`、PID `1001`）
-- 构建目录：`build-local-v5.5.5`
+- Windows 串口：按 Espressif VID `303A` 自动识别，也可用 `-Port COMx` 指定
+- 构建目录：`build-local-<ESP-IDF版本>`
 
-主板当前未连接时，Windows 不会把 `COM5` 列为活动端口。先接好数据 USB
-线，再运行根目录的 `.\car.ps1 ports` 确认；如果系统重新分配了端口，
-`.\car.ps1 run` 会按 USB VID/PID 自动选择。
+主板未连接时不会出现对应串口。先接好数据 USB 线，再运行根目录的
+`.\car.ps1 ports` 确认；`.\car.ps1 run` 会自动选择唯一的 Espressif 串口。

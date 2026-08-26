@@ -3,6 +3,7 @@
 **/build-*/
 **/managed_components/
 **/sdkconfig.old
+**/sdkconfig.local-*
 
 # Local tools and temporary data
 .github-upload/

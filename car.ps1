@@ -2,69 +2,113 @@
 param(
     [ValidateSet("build", "flash", "monitor", "run", "ports")]
     [string]$Action = "run",
-    [string]$Port = ""
+    [string]$Port = "",
+    [string]$IdfPath = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectDir = Join-Path $PSScriptRoot "tb6612-motor-a-test"
-$idfPath = "C:\Espressif\v5.5.5\esp-idf"
-$idfPython = "C:\Espressif\tools\python\v5.5.5\venv\Scripts\python.exe"
-$activationScript = "C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1"
-$buildDir = "build-local-v5.5.5"
-$expectedPort = "COM5"
+$preferredIdfVersion = "5.5.5"
 $env:PYTHONUTF8 = "1"
 
-if (-not (Test-Path -LiteralPath (Join-Path $idfPath "tools\idf.py"))) {
-    throw "ESP-IDF 5.5.5 was not found at $idfPath."
+function Test-IdfPath {
+    param([string]$Path)
+
+    return $Path -and (Test-Path -LiteralPath (Join-Path $Path "tools\idf.py"))
 }
-if (-not (Test-Path -LiteralPath $idfPython)) {
-    throw "The ESP-IDF Python environment was not found at $idfPython."
-}
-if (-not (Test-Path -LiteralPath $activationScript)) {
-    throw "The ESP-IDF activation profile was not found at $activationScript."
+
+function Resolve-IdfPath {
+    param([string]$RequestedPath)
+
+    if ($RequestedPath) {
+        if (-not (Test-IdfPath $RequestedPath)) {
+            throw "ESP-IDF was not found at '$RequestedPath'. Expected tools\idf.py below that directory."
+        }
+        return (Resolve-Path -LiteralPath $RequestedPath).Path
+    }
+
+    if (Test-IdfPath $env:IDF_PATH) {
+        return (Resolve-Path -LiteralPath $env:IDF_PATH).Path
+    }
+
+    $searchPatterns = @(
+        "C:\Espressif\frameworks\esp-idf-v*",
+        "C:\Espressif\v*\esp-idf",
+        "C:\esp\v*\esp-idf",
+        (Join-Path $env:USERPROFILE ".espressif\frameworks\esp-idf-v*"),
+        (Join-Path $env:USERPROFILE "esp\v*\esp-idf")
+    )
+
+    $validPaths = @(@(
+        foreach ($pattern in $searchPatterns) {
+            foreach ($candidate in @(Get-Item -Path $pattern -ErrorAction SilentlyContinue)) {
+                if (Test-IdfPath $candidate.FullName) {
+                    $candidate.FullName
+                }
+            }
+        }
+    ) | Select-Object -Unique)
+
+    if ($validPaths.Count -eq 0) {
+        throw "No ESP-IDF installation was found. Activate ESP-IDF first or pass -IdfPath <path>."
+    }
+    if ($validPaths.Count -eq 1) {
+        return $validPaths[0]
+    }
+
+    $escapedPreferredVersion = [regex]::Escape($preferredIdfVersion)
+    $preferredPaths = @($validPaths | Where-Object {
+        $_ -match "[\\/]v?$escapedPreferredVersion([\\/]|$)" -or
+        $_ -match "esp-idf-v$escapedPreferredVersion$"
+    })
+    if ($preferredPaths.Count -eq 1) {
+        return $preferredPaths[0]
+    }
+
+    $formattedPaths = $validPaths -join "`n  "
+    throw "Multiple ESP-IDF installations were found. Select one with -IdfPath:`n  $formattedPaths"
 }
 
 function Get-SerialPorts {
-    $pythonCode = @'
-import json
-from serial.tools import list_ports
+    $portEntities = @(Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
+        Where-Object { $_.Name -match "\(COM\d+\)" })
 
-items = []
-for port in list_ports.comports():
-    # Use keyword arguments so Windows PowerShell cannot strip Python's
-    # dictionary-key quotes while forwarding the native -c argument.
-    items.append(dict(
-        device=port.device,
-        description=port.description,
-        hwid=port.hwid,
-        vid=port.vid,
-        pid=port.pid,
-    ))
-print(json.dumps(items, ensure_ascii=False))
-'@
-    $json = & $idfPython -c $pythonCode
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to enumerate serial ports."
-    }
-    if (-not $json -or $json.Trim() -eq "[]") {
-        return
-    }
-    # Windows PowerShell 5.1 can preserve a JSON array as one nested object.
-    # Emit each port explicitly so callers always receive flat port records.
-    $parsedPorts = ConvertFrom-Json -InputObject $json
-    foreach ($parsedPort in $parsedPorts) {
-        Write-Output $parsedPort
+    foreach ($entity in $portEntities) {
+        if ([string]$entity.Name -notmatch "\((COM\d+)\)") {
+            continue
+        }
+        $device = $Matches[1].ToUpperInvariant()
+        $hardwareId = [string]$entity.PNPDeviceID
+        $vid = $null
+        $usbPid = $null
+
+        if ($hardwareId -match "VID_([0-9A-Fa-f]{4})") {
+            $vid = [Convert]::ToInt32($Matches[1], 16)
+        }
+        if ($hardwareId -match "PID_([0-9A-Fa-f]{4})") {
+            $usbPid = [Convert]::ToInt32($Matches[1], 16)
+        }
+
+        [pscustomobject]@{
+            device      = $device
+            description = [string]$entity.Name
+            vid         = $vid
+            pid         = $usbPid
+            hwid        = $hardwareId
+        }
     }
 }
 
-$serialPorts = @(Get-SerialPorts)
+$serialPorts = @(Get-SerialPorts | Sort-Object {
+    [int]($_.device -replace "\D", "")
+})
 $activePortNames = @($serialPorts | ForEach-Object { $_.device })
 
 if ($Action -eq "ports") {
     if ($serialPorts.Count -eq 0) {
-        Write-Host "No active serial ports. The ESP32-S3 previously used $expectedPort, but it is disconnected."
+        Write-Host "No active serial ports. Connect the ESP32-S3 with a USB data cable."
         exit 0
     }
     $serialPorts | Select-Object device, description, vid, pid, hwid | Format-Table -AutoSize
@@ -78,34 +122,58 @@ if ($Action -ne "build") {
             throw "$Port is not active. Reconnect the ESP32-S3 and run '.\car.ps1 ports'."
         }
     } else {
-        $espPorts = @($serialPorts | Where-Object {
-            $_.vid -eq 0x303A -and $_.pid -eq 0x1001
-        })
+        $espPorts = @($serialPorts | Where-Object { $_.vid -eq 0x303A })
         if ($espPorts.Count -eq 1) {
             $Port = $espPorts[0].device
-        } elseif ($expectedPort -in $activePortNames) {
-            $Port = $expectedPort
+        } elseif ($espPorts.Count -gt 1) {
+            $portList = $espPorts.device -join ", "
+            throw "Multiple Espressif serial ports were found ($portList). Select one with -Port COMx."
         } else {
-            throw "The ESP32-S3 serial port is not active. Reconnect its data USB cable; its assigned port is $expectedPort."
+            throw "No Espressif serial port was found. Connect the ESP32-S3 and run '.\car.ps1 ports'."
         }
     }
     Write-Host "Using ESP32-S3 port $Port"
 }
 
-. $activationScript
+$resolvedIdfPath = Resolve-IdfPath $IdfPath
+$exportScript = Join-Path $resolvedIdfPath "export.ps1"
+if (-not (Test-Path -LiteralPath $exportScript)) {
+    throw "ESP-IDF activation script was not found at '$exportScript'."
+}
+
+Write-Host "Using ESP-IDF at $resolvedIdfPath"
+. $exportScript
 $env:IDF_CCACHE_ENABLE = "0"
+
+$idfPy = Join-Path $resolvedIdfPath "tools\idf.py"
+$pythonCommand = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$idfVersionLine = (& $pythonCommand.Source $idfPy --version | Select-Object -First 1).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $idfVersionLine) {
+    throw "Unable to determine the ESP-IDF version."
+}
+$idfVersion = $idfVersionLine -replace "^ESP-IDF\s+v?", ""
+$buildVersion = $idfVersion -replace "[^A-Za-z0-9._-]", "-"
+$buildDir = "build-local-$buildVersion"
+$sharedSdkconfig = Join-Path $projectDir "sdkconfig"
+$localSdkconfig = Join-Path $projectDir "sdkconfig.local-$buildVersion"
+
+if (-not (Test-Path -LiteralPath $localSdkconfig)) {
+    Copy-Item -LiteralPath $sharedSdkconfig -Destination $localSdkconfig
+}
+
+Write-Host "Using $idfVersionLine with build directory $buildDir"
+Write-Host "Using local project configuration $localSdkconfig"
 
 Push-Location $projectDir
 try {
-    $idfPy = Join-Path $idfPath "tools\idf.py"
-    $idfArgs = @("-B", $buildDir)
+    $idfArgs = @("-D", "SDKCONFIG=$localSdkconfig", "-B", $buildDir)
     switch ($Action) {
         "build"   { $idfArgs += "build" }
         "flash"   { $idfArgs += @("-p", $Port, "flash") }
         "monitor" { $idfArgs += @("-p", $Port, "monitor") }
         "run"     { $idfArgs += @("-p", $Port, "flash", "monitor") }
     }
-    & $idfPython $idfPy @idfArgs
+    & $pythonCommand.Source $idfPy @idfArgs
     if ($LASTEXITCODE -ne 0) {
         throw "idf.py failed with exit code $LASTEXITCODE."
     }
