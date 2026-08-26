@@ -26,8 +26,8 @@
 
 #define ENCODER_A_PHASE_A_GPIO GPIO_NUM_16
 #define ENCODER_A_PHASE_B_GPIO GPIO_NUM_17
-#define ENCODER_C_PHASE_A_GPIO GPIO_NUM_2
-#define ENCODER_C_PHASE_B_GPIO GPIO_NUM_1
+#define ENCODER_LEFT_PHASE_A_GPIO GPIO_NUM_8
+#define ENCODER_LEFT_PHASE_B_GPIO GPIO_NUM_18
 
 #define PWM_FREQUENCY_HZ 20000
 #define PWM_DUTY          260
@@ -35,24 +35,32 @@
 #define CONTROL_PERIOD_MS   10
 #define LINE_STABLE_SAMPLES  2
 #define LINE_REPORT_INTERVAL_MS 200
-#define LINE_BASE_DUTY        180
-#define LINE_MAX_DUTY         240
-#define LINE_KP_DUTY           14
+#define LINE_BASE_DUTY        145
+#define LINE_MIN_DUTY         125
+#define LINE_MAX_DUTY         195
+#define LINE_ERROR_SCALE        8
+#define LINE_PID_KP              9
+#define LINE_PID_KI_DIV        400
+#define LINE_PID_KD             12
+#define LINE_PID_DEADBAND        3
+#define LINE_PID_INTEGRAL_MAX 3200
+#define LINE_PID_OUTPUT_MAX     45
 #define LINE_D_TRIM_DUTY        0
-#define LINE_PULSE_ON_MS        70
-#define LINE_PULSE_CYCLE_MS     70
+#define LINE_PULSE_ON_MS        80
+#define LINE_PULSE_CYCLE_MS     80
 #define LINE_LOST_TIMEOUT_MS 2000
-#define LINE_TURN_DUTY         200
-#define LINE_TURN_INNER_DUTY   110
+#define LINE_TURN_DUTY         170
+#define LINE_TURN_INNER_DUTY   135
 #define LINE_TURN_MIN_MS       100
 #define LINE_TURN_TIMEOUT_MS  1200
 #define ENCODER_REPORT_MS      500
-#define BALANCE_UPDATE_MS      100
-#define BALANCE_NORMALIZE      256
-#define BALANCE_KP               2
-#define BALANCE_KI_DIV           8
-#define BALANCE_INTEGRAL_MAX    80
-#define BALANCE_TRIM_MAX        25
+#define SPEED_PI_UPDATE_MS     150
+#define SPEED_TARGET_NUM         3
+#define SPEED_TARGET_DEN         2
+#define SPEED_PI_KP_DIV          4
+#define SPEED_PI_KI_DIV        100
+#define SPEED_PI_INTEGRAL_MAX 1500
+#define SPEED_PI_OUTPUT_MAX     50
 
 typedef struct {
     gpio_num_t pwm_pin;
@@ -86,7 +94,7 @@ typedef struct {
 enum {
     MOTOR_A = 0,
     MOTOR_B = 1,
-    MOTOR_D = 2,
+    MOTOR_C = 2,
 };
 
 static const char *TAG = "keyboard_remote";
@@ -112,13 +120,22 @@ static sharp_turn_t line_lost_search_turn;
 static int64_t line_pulse_epoch_us;
 static encoder_t encoders[] = {
     {"A-right", ENCODER_A_PHASE_A_GPIO, ENCODER_A_PHASE_B_GPIO, 0, 0},
-    {"C-left",  ENCODER_C_PHASE_A_GPIO, ENCODER_C_PHASE_B_GPIO, 0, 0},
+    {"C-left-on-B", ENCODER_LEFT_PHASE_A_GPIO,
+                    ENCODER_LEFT_PHASE_B_GPIO, 0, 0},
 };
-static int64_t balance_last_update_us;
-static int32_t balance_previous_a;
-static int32_t balance_previous_c;
-static int balance_integral;
-static int balance_trim;
+static int64_t speed_pi_last_update_us;
+static int32_t speed_pi_previous_a;
+static int32_t speed_pi_previous_b;
+static int speed_pi_integral_a;
+static int speed_pi_integral_b;
+static int speed_pi_output_a;
+static int speed_pi_output_b;
+static bool line_pid_initialized;
+static int line_pid_filtered_error;
+static int line_pid_integral;
+static int line_pid_p;
+static int line_pid_i;
+static int line_pid_d;
 
 static const int8_t quadrature_delta[16] = {
      0,  1, -1,  0,
@@ -148,8 +165,8 @@ static void configure_encoders(void)
     const gpio_config_t config = {
         .pin_bit_mask = (1ULL << ENCODER_A_PHASE_A_GPIO) |
                         (1ULL << ENCODER_A_PHASE_B_GPIO) |
-                        (1ULL << ENCODER_C_PHASE_A_GPIO) |
-                        (1ULL << ENCODER_C_PHASE_B_GPIO),
+                        (1ULL << ENCODER_LEFT_PHASE_A_GPIO) |
+                        (1ULL << ENCODER_LEFT_PHASE_B_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -180,51 +197,115 @@ static int clamp_int(int value, int minimum, int maximum)
     return value;
 }
 
-static void reset_wheel_balance(int64_t now_us)
+static void reset_line_pid(void)
 {
-    balance_last_update_us = now_us;
-    balance_previous_a = encoders[0].count;
-    balance_previous_c = encoders[1].count;
-    balance_integral = 0;
-    balance_trim = 0;
+    line_pid_initialized = false;
+    line_pid_filtered_error = 0;
+    line_pid_integral = 0;
+    line_pid_p = 0;
+    line_pid_i = 0;
+    line_pid_d = 0;
 }
 
-/* Limited PI synchronizer. It compares encoder movement normalized by each
- * wheel's requested PWM, so the outer line controller can still request
- * different wheel speeds on a curve. Positive trim slows A and speeds C. */
-static void update_wheel_balance(uint32_t a_request, uint32_t c_request,
-                                 int64_t now_us)
+/* The four line sensors are digital, so their position estimate changes in
+ * steps. A one-pole filter before the PID keeps those steps from becoming
+ * abrupt wheel commands. The small I term removes persistent bias, while
+ * sign-change reset and explicit limits prevent wind-up on corners. */
+static int calculate_line_pid(int measured_error)
 {
-    if (a_request == 0 || c_request == 0) {
-        reset_wheel_balance(now_us);
+    int derivative = 0;
+    if (!line_pid_initialized) {
+        line_pid_filtered_error = measured_error;
+        line_pid_initialized = true;
+    } else {
+        const int previous_error = line_pid_filtered_error;
+        line_pid_filtered_error =
+            (line_pid_filtered_error + measured_error) / 2;
+        derivative = line_pid_filtered_error - previous_error;
+    }
+
+    int control_error = line_pid_filtered_error;
+    if (abs(control_error) <= LINE_PID_DEADBAND) {
+        control_error = 0;
+    }
+
+    if (control_error == 0) {
+        line_pid_integral = line_pid_integral * 7 / 8;
+    } else {
+        const bool changed_side =
+            (line_pid_integral > 0 && control_error < 0) ||
+            (line_pid_integral < 0 && control_error > 0);
+        if (changed_side) {
+            line_pid_integral = 0;
+        }
+        line_pid_integral = clamp_int(line_pid_integral + control_error,
+                                      -LINE_PID_INTEGRAL_MAX,
+                                      LINE_PID_INTEGRAL_MAX);
+    }
+
+    line_pid_p = LINE_PID_KP * control_error / LINE_ERROR_SCALE;
+    line_pid_i = line_pid_integral / LINE_PID_KI_DIV;
+    line_pid_d = LINE_PID_KD * derivative / LINE_ERROR_SCALE;
+    return clamp_int(line_pid_p + line_pid_i + line_pid_d,
+                     -LINE_PID_OUTPUT_MAX, LINE_PID_OUTPUT_MAX);
+}
+
+static void reset_wheel_speed_pi(int64_t now_us)
+{
+    speed_pi_last_update_us = now_us;
+    speed_pi_previous_a = encoders[0].count;
+    speed_pi_previous_b = encoders[1].count;
+    speed_pi_integral_a = 0;
+    speed_pi_integral_b = 0;
+    speed_pi_output_a = 0;
+    speed_pi_output_b = 0;
+}
+
+/* Independent wheel-speed PI controllers. Each nominal PWM request from the
+ * outer line PID is converted to an encoder-count target. Unlike a controller
+ * that only compares the two wheels, these controllers produce a strong
+ * positive correction when both wheels stall at the same time. */
+static void update_wheel_speed_pi(uint32_t a_request, uint32_t b_request,
+                                  int64_t now_us)
+{
+    if (a_request == 0 || b_request == 0) {
+        reset_wheel_speed_pi(now_us);
         return;
     }
-    if (now_us - balance_last_update_us <
-        (int64_t)BALANCE_UPDATE_MS * 1000) {
+    if (now_us - speed_pi_last_update_us <
+        (int64_t)SPEED_PI_UPDATE_MS * 1000) {
         return;
     }
 
     const int32_t count_a = encoders[0].count;
-    const int32_t count_c = encoders[1].count;
-    const int32_t delta_a = abs(count_a - balance_previous_a);
-    const int32_t delta_c = abs(count_c - balance_previous_c);
-    balance_previous_a = count_a;
-    balance_previous_c = count_c;
-    balance_last_update_us = now_us;
+    const int32_t count_b = encoders[1].count;
+    const int32_t delta_a = abs(count_a - speed_pi_previous_a);
+    const int32_t delta_b = abs(count_b - speed_pi_previous_b);
+    speed_pi_previous_a = count_a;
+    speed_pi_previous_b = count_b;
+    speed_pi_last_update_us = now_us;
 
-    const int normalized_a =
-        (int)(delta_a * BALANCE_NORMALIZE / (int32_t)a_request);
-    const int normalized_c =
-        (int)(delta_c * BALANCE_NORMALIZE / (int32_t)c_request);
-    const int error = normalized_a - normalized_c;
+    const int target_a =
+        (int)a_request * SPEED_TARGET_NUM / SPEED_TARGET_DEN;
+    const int target_b =
+        (int)b_request * SPEED_TARGET_NUM / SPEED_TARGET_DEN;
+    const int error_a = target_a - (int)delta_a;
+    const int error_b = target_b - (int)delta_b;
 
-    balance_integral = clamp_int(balance_integral + error,
-                                 -BALANCE_INTEGRAL_MAX,
-                                 BALANCE_INTEGRAL_MAX);
-    balance_trim = clamp_int(BALANCE_KP * error +
-                                 balance_integral / BALANCE_KI_DIV,
-                             -BALANCE_TRIM_MAX,
-                             BALANCE_TRIM_MAX);
+    speed_pi_integral_a =
+        clamp_int(speed_pi_integral_a + error_a,
+                  -SPEED_PI_INTEGRAL_MAX, SPEED_PI_INTEGRAL_MAX);
+    speed_pi_integral_b =
+        clamp_int(speed_pi_integral_b + error_b,
+                  -SPEED_PI_INTEGRAL_MAX, SPEED_PI_INTEGRAL_MAX);
+    speed_pi_output_a =
+        clamp_int(error_a / SPEED_PI_KP_DIV +
+                      speed_pi_integral_a / SPEED_PI_KI_DIV,
+                  -SPEED_PI_OUTPUT_MAX, SPEED_PI_OUTPUT_MAX);
+    speed_pi_output_b =
+        clamp_int(error_b / SPEED_PI_KP_DIV +
+                      speed_pi_integral_b / SPEED_PI_KI_DIV,
+                  -SPEED_PI_OUTPUT_MAX, SPEED_PI_OUTPUT_MAX);
 }
 
 static void configure_output_low(gpio_num_t pin)
@@ -294,8 +375,11 @@ static void motor_prepare(size_t index, int direction, uint32_t duty)
 
 static uint32_t clamp_line_duty(int duty)
 {
-    if (duty < 0) {
+    if (duty <= 0) {
         return 0;
+    }
+    if (duty < LINE_MIN_DUTY) {
+        return LINE_MIN_DUTY;
     }
     if (duty > LINE_MAX_DUTY) {
         return LINE_MAX_DUTY;
@@ -309,14 +393,15 @@ static void force_stop(void)
     current_motion = MOTION_STOP;
 }
 
-/* Motor A is the right-side drive wheel; the C-channel motor is the left-side
- * wheel. The C connector has the opposite forward polarity from the old D
- * connector, so its forward direction is +1. */
-static void drive_line_duties(uint32_t a_duty, uint32_t d_duty)
+/* After swapping the B/C plugs, Motor A remains the right drive wheel and the
+ * physical left wheel is driven by channel B. Channel C is intentionally
+ * stopped. The B channel reverses this wheel's control polarity, so its
+ * forward software direction is -1. */
+static void drive_line_duties(uint32_t a_duty, uint32_t left_duty)
 {
     motor_prepare(MOTOR_A, -1, a_duty);
-    motor_prepare(MOTOR_B, 0, 0);
-    motor_prepare(MOTOR_D, 1, d_duty);
+    motor_prepare(MOTOR_B, -1, left_duty);
+    motor_prepare(MOTOR_C, 0, 0);
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
     current_motion = MOTION_FORWARD;
 }
@@ -324,18 +409,18 @@ static void drive_line_duties(uint32_t a_duty, uint32_t d_duty)
 static void drive_sharp_turn(sharp_turn_t turn)
 {
     if (turn == SHARP_TURN_LEFT) {
-        /* Smooth left arc: outer wheel fast, inner wheel crawling forward. */
+        /* Differential pivot: right wheel forward, left wheel reverse. */
         motor_prepare(MOTOR_A, -1, LINE_TURN_DUTY);
-        motor_prepare(MOTOR_D, 1, LINE_TURN_INNER_DUTY);
+        motor_prepare(MOTOR_B, 1, LINE_TURN_INNER_DUTY);
         current_motion = MOTION_LEFT;
     } else {
-        /* Smooth right arc: outer wheel fast, inner wheel crawling forward. */
-        motor_prepare(MOTOR_A, -1, LINE_TURN_INNER_DUTY);
-        motor_prepare(MOTOR_D, 1,
+        /* Differential pivot: right wheel reverse, left wheel forward. */
+        motor_prepare(MOTOR_A, 1, LINE_TURN_INNER_DUTY);
+        motor_prepare(MOTOR_B, -1,
                       clamp_line_duty(LINE_TURN_DUTY + LINE_D_TRIM_DUTY));
         current_motion = MOTION_RIGHT;
     }
-    motor_prepare(MOTOR_B, 0, 0);
+    motor_prepare(MOTOR_C, 0, 0);
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
 }
 
@@ -345,19 +430,19 @@ static bool line_pulse_is_on(int64_t now_us)
     return elapsed_ms % LINE_PULSE_CYCLE_MS < LINE_PULSE_ON_MS;
 }
 
-/* Keep each active pulse above the motors' starting-torque threshold, then
- * coast briefly. This is slower than using a continuously tiny PWM value and
- * avoids one motor stalling earlier than the other. */
-static void drive_line_duties_pulsed(uint32_t a_duty, uint32_t d_duty,
+/* Keep this wrapper so pulse modulation can be re-enabled if needed. With
+ * ON_MS equal to CYCLE_MS the motors receive continuous PWM, which avoids the
+ * stop-start caster-wheel shake seen on the three-wheel chassis. */
+static void drive_line_duties_pulsed(uint32_t a_duty, uint32_t left_duty,
                                      int64_t now_us)
 {
-    update_wheel_balance(a_duty, d_duty, now_us);
+    update_wheel_speed_pi(a_duty, left_duty, now_us);
     const uint32_t adjusted_a =
-        clamp_line_duty((int)a_duty - balance_trim);
-    const uint32_t adjusted_c =
-        clamp_line_duty((int)d_duty + balance_trim);
+        clamp_line_duty((int)a_duty + speed_pi_output_a);
+    const uint32_t adjusted_b =
+        clamp_line_duty((int)left_duty + speed_pi_output_b);
     if (line_pulse_is_on(now_us)) {
-        drive_line_duties(adjusted_a, adjusted_c);
+        drive_line_duties(adjusted_a, adjusted_b);
     } else {
         force_stop();
     }
@@ -365,7 +450,7 @@ static void drive_line_duties_pulsed(uint32_t a_duty, uint32_t d_duty,
 
 static void drive_sharp_turn_pulsed(sharp_turn_t turn, int64_t now_us)
 {
-    reset_wheel_balance(now_us);
+    reset_wheel_speed_pi(now_us);
     if (line_pulse_is_on(now_us)) {
         drive_sharp_turn(turn);
     } else {
@@ -388,7 +473,8 @@ static void set_line_follow_enabled(bool enabled)
     line_lost_search_active = false;
     line_lost_search_turn = SHARP_TURN_NONE;
     line_pulse_epoch_us = esp_timer_get_time();
-    reset_wheel_balance(line_pulse_epoch_us);
+    reset_line_pid();
+    reset_wheel_speed_pi(line_pulse_epoch_us);
     ESP_LOGI(TAG, "LINE FOLLOW %s", enabled ? "ENABLED" : "DISABLED / STOP");
 }
 
@@ -424,6 +510,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
             line_lost_search_turn = SHARP_TURN_NONE;
             line_lost_since_us = 0;
             line_lost_stop_reported = false;
+            reset_line_pid();
         } else if (search_us >= (int64_t)LINE_LOST_TIMEOUT_MS * 1000) {
             force_stop();
             if (!line_lost_stop_reported) {
@@ -433,6 +520,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
             line_lost_search_active = false;
             line_lost_search_turn = SHARP_TURN_NONE;
             line_has_been_seen = false;
+            reset_line_pid();
             last_line_control_state = sensor_state;
             return;
         } else {
@@ -457,6 +545,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
             sharp_turn = SHARP_TURN_NONE;
             sharp_turn_since_us = 0;
             line_lost_since_us = 0;
+            reset_line_pid();
         } else if (turn_us >= (int64_t)LINE_TURN_TIMEOUT_MS * 1000) {
             force_stop();
             ESP_LOGW(TAG, "RIGHT-ANGLE timeout; STOP");
@@ -464,6 +553,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
             sharp_turn_since_us = 0;
             line_has_been_seen = false;
             line_lost_stop_reported = true;
+            reset_line_pid();
             last_line_control_state = sensor_state;
             return;
         } else {
@@ -475,6 +565,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
 
     if (black_count == 4) {
         force_stop();
+        reset_line_pid();
         line_lost_since_us = 0;
         if (sensor_state != last_line_control_state) {
             ESP_LOGW(TAG, "LINE: all sensors black / intersection; STOP");
@@ -484,7 +575,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
     }
 
     if (black_count > 0) {
-        const int error = weighted_sum / black_count;
+        const int error = weighted_sum * LINE_ERROR_SCALE / black_count;
 
         /* Require two adjacent sensors on the same side before declaring a
          * right-angle corner. A single outer sensor is only a normal curve. */
@@ -497,10 +588,13 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
         }
         if (sharp_turn != SHARP_TURN_NONE) {
             sharp_turn_since_us = now_us;
-            last_line_error = sharp_turn == SHARP_TURN_LEFT ? -3 : 3;
+            last_line_error = sharp_turn == SHARP_TURN_LEFT
+                                  ? -3 * LINE_ERROR_SCALE
+                                  : 3 * LINE_ERROR_SCALE;
             line_has_been_seen = true;
             line_lost_since_us = 0;
-            ESP_LOGI(TAG, "RIGHT-ANGLE %s: gentle turn start",
+            reset_line_pid();
+            ESP_LOGI(TAG, "RIGHT-ANGLE %s: differential pivot start",
                      sharp_turn == SHARP_TURN_LEFT ? "LEFT" : "RIGHT");
             drive_sharp_turn_pulsed(sharp_turn, now_us);
             last_line_control_state = sensor_state;
@@ -514,17 +608,18 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
             last_line_error = error;
         }
 
-        const int correction = error * LINE_KP_DUTY;
+        const int correction = calculate_line_pid(error);
         const uint32_t a_duty =
             clamp_line_duty(LINE_BASE_DUTY - correction);
-        const uint32_t d_duty =
+        const uint32_t left_duty =
             clamp_line_duty(LINE_BASE_DUTY + correction + LINE_D_TRIM_DUTY);
-        drive_line_duties_pulsed(a_duty, d_duty, now_us);
+        drive_line_duties_pulsed(a_duty, left_duty, now_us);
 
         if (sensor_state != last_line_control_state) {
-            ESP_LOGI(TAG, "LINE TRACK state=%x error=%d PWM(A-right)=%lu PWM(D-left)=%lu",
-                     sensor_state, error,
-                     (unsigned long)a_duty, (unsigned long)d_duty);
+            ESP_LOGI(TAG, "LINE PID state=%x error=%d/8 P=%d I=%d D=%d corr=%d PWM(A-right)=%lu PWM(C-left)=%lu",
+                     sensor_state, error, line_pid_p, line_pid_i, line_pid_d,
+                     correction,
+                     (unsigned long)a_duty, (unsigned long)left_duty);
         }
         last_line_control_state = sensor_state;
         return;
@@ -534,6 +629,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
      * car had acquired a line. */
     if (!line_has_been_seen) {
         force_stop();
+        reset_line_pid();
         if (!line_lost_stop_reported) {
             ESP_LOGW(TAG, "NO LINE AT START; STOP");
             line_lost_stop_reported = true;
@@ -544,6 +640,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
 
     if (last_line_error == 0) {
         force_stop();
+        reset_line_pid();
         if (!line_lost_stop_reported) {
             ESP_LOGW(TAG, "LINE LOST: no previous side direction; STOP");
             line_lost_stop_reported = true;
@@ -558,6 +655,7 @@ static void update_line_follow(uint8_t sensor_state, int64_t now_us)
                                 : SHARP_TURN_RIGHT;
     line_lost_search_active = true;
     line_lost_stop_reported = false;
+    reset_line_pid();
     ESP_LOGW(TAG, "LINE LOST: slow search %s until >=2 black sensors",
              line_lost_search_turn == SHARP_TURN_LEFT ? "LEFT" : "RIGHT");
     drive_sharp_turn_pulsed(line_lost_search_turn, now_us);
@@ -589,33 +687,34 @@ static void apply_motion(motion_t motion)
     }
 
     int a_direction = 0;
-    int d_direction = 0;
+    int left_direction = 0;
     switch (motion) {
     case MOTION_FORWARD:
         a_direction = -1;
-        d_direction = 1;
+        left_direction = -1;
         break;
     case MOTION_REVERSE:
         a_direction = 1;
-        d_direction = -1;
+        left_direction = 1;
         break;
     case MOTION_LEFT:
         a_direction = -1;
         break;
     case MOTION_RIGHT:
-        d_direction = 1;
+        left_direction = -1;
         break;
     default:
         return;
     }
 
     motor_prepare(MOTOR_A, a_direction, a_direction ? PWM_DUTY : 0);
-    motor_prepare(MOTOR_B, 0, 0);
-    motor_prepare(MOTOR_D, d_direction, d_direction ? PWM_DUTY : 0);
+    motor_prepare(MOTOR_B, left_direction,
+                  left_direction ? PWM_DUTY : 0);
+    motor_prepare(MOTOR_C, 0, 0);
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
     current_motion = motion;
-    ESP_LOGI(TAG, "%s: A=%d B=0 D=%d", motion_name(motion),
-             a_direction, d_direction);
+    ESP_LOGI(TAG, "%s: A-right=%d B-left=%d C-channel=0",
+             motion_name(motion), a_direction, left_direction);
 }
 
 static bool decode_key(char key, motion_t *motion)
@@ -695,11 +794,14 @@ void app_main(void)
     ESP_LOGI(TAG, "USB KEYBOARD REMOTE READY");
     ESP_LOGI(TAG, "Hold W/S/A/D to move; X or SPACE to stop");
     ESP_LOGI(TAG, "Press F once to start line following; X or SPACE is emergency stop");
-    ESP_LOGI(TAG, "Manual PWM=%d/1023; input timeout=%d ms; Motor B remains stopped",
+    ESP_LOGI(TAG, "Manual PWM=%d/1023; input timeout=%d ms; channel C remains stopped",
              PWM_DUTY, COMMAND_TIMEOUT_MS);
     ESP_LOGI(TAG, "IR test pins: OUT1=GPIO13 OUT2=GPIO14 OUT3=GPIO21 OUT4=GPIO39");
-    ESP_LOGI(TAG, "Encoder PI: A(E1)=GPIO16/17 C(E3)=GPIO2/1; trim limit=+/- %d",
-             BALANCE_TRIM_MAX);
+    ESP_LOGI(TAG, "Dual speed PI: A(E1)=GPIO16/17 B-left(E2)=GPIO8/18; boost limit=+/- %d",
+             SPEED_PI_OUTPUT_MAX);
+    ESP_LOGI(TAG, "Line PID: Kp=%d Ki=1/%d Kd=%d deadband=%d/%d output=+/-%d",
+             LINE_PID_KP, LINE_PID_KI_DIV, LINE_PID_KD,
+             LINE_PID_DEADBAND, LINE_ERROR_SCALE, LINE_PID_OUTPUT_MAX);
     ESP_LOGI(TAG, "Line follow PWM: base=%d D-trim=%d max=%d; pulse=%d/%d ms; lost=%d ms; right-angle=%d ms",
              LINE_BASE_DUTY, LINE_D_TRIM_DUTY, LINE_MAX_DUTY,
              LINE_PULSE_ON_MS, LINE_PULSE_CYCLE_MS,
@@ -711,7 +813,7 @@ void app_main(void)
     int64_t line_next_report_us = 0;
     int64_t encoder_next_report_us = 0;
     int32_t encoder_previous_a = 0;
-    int32_t encoder_previous_c = 0;
+    int32_t encoder_previous_b = 0;
 
     while (1) {
         char input[16];
@@ -768,15 +870,16 @@ void app_main(void)
         }
         if (now_us >= encoder_next_report_us) {
             const int32_t encoder_a = encoders[0].count;
-            const int32_t encoder_c = encoders[1].count;
-            ESP_LOGI(TAG, "ENC count A=%" PRId32 " C=%" PRId32
-                          " delta/%dms A=%" PRId32 " C=%" PRId32
-                          " PI-trim=%d",
-                     encoder_a, encoder_c, ENCODER_REPORT_MS,
+            const int32_t encoder_b = encoders[1].count;
+            ESP_LOGI(TAG, "ENC count A=%" PRId32 " B=%" PRId32
+                          " delta/%dms A=%" PRId32 " B=%" PRId32
+                          " speed-PI A=%d B=%d",
+                     encoder_a, encoder_b, ENCODER_REPORT_MS,
                      encoder_a - encoder_previous_a,
-                     encoder_c - encoder_previous_c, balance_trim);
+                     encoder_b - encoder_previous_b,
+                     speed_pi_output_a, speed_pi_output_b);
             encoder_previous_a = encoder_a;
-            encoder_previous_c = encoder_c;
+            encoder_previous_b = encoder_b;
             encoder_next_report_us = now_us +
                 (int64_t)ENCODER_REPORT_MS * 1000;
         }
