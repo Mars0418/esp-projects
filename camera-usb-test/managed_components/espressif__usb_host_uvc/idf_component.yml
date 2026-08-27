@@ -1,0 +1,18 @@
+dependencies:
+  idf:
+    version: '>=4.4'
+description: USB Host UVC driver
+repository: git://github.com/espressif/esp-usb.git
+repository_info:
+  commit_sha: 8dfe41cc9183305798119af0bc593b11a3b1e5b4
+  path: host/class/uvc/usb_host_uvc
+sbom:
+  manifests:
+  - dest: libuvc
+    path: sbom_libuvc.yml
+targets:
+- esp32s2
+- esp32s3
+- esp32p4
+url: https://github.com/espressif/esp-usb/tree/master/host/class/uvc/usb_host_uvc
+version: 1.0.4

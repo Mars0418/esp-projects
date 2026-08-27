@@ -2,6 +2,9 @@
 **/build/
 **/build-*/
 **/managed_components/
+!camera-usb-test/managed_components/
+camera-usb-test/managed_components/*
+!camera-usb-test/managed_components/espressif__usb_host_uvc/
 **/sdkconfig.old
 **/sdkconfig.local-*
 
