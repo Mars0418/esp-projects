@@ -2,6 +2,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -30,14 +33,17 @@
 #define MOTOR_D_CHANNEL LEDC_CHANNEL_2
 
 #define PWM_MAX_DUTY 1023
-#define FOLLOW_BASE_DUTY 150
-#define FOLLOW_LOW_CONFIDENCE_DUTY 120
-#define FOLLOW_MIN_DUTY 90
-#define FOLLOW_MAX_DUTY 230
-#define FOLLOW_CORRECTION_MAX 90
+#define FOLLOW_BASE_DUTY 280
+#define FOLLOW_LOW_CONFIDENCE_DUTY 220
+#define FOLLOW_INNER_MIN_DUTY 70
+#define FOLLOW_MAX_DUTY 420
+#define FOLLOW_CORRECTION_MAX 75
+#define FOLLOW_CORRECTION_STEP 5
+#define FOLLOW_ERROR_DEADBAND 45
+#define FOLLOW_INTEGRAL_LIMIT 1500
 #define FOLLOW_FRAME_TIMEOUT_MS 600
 #define FOLLOW_MIN_CONFIDENCE 30
-#define STEERING_SIGN 1
+#define STEERING_SIGN -1
 
 typedef struct {
     gpio_num_t pwm;
@@ -58,6 +64,9 @@ static line_vision_result_t s_latest_result;
 static int64_t s_latest_frame_us;
 static uint32_t s_result_sequence;
 static bool s_enabled;
+static volatile bool s_debug_enabled;
+static char s_uart_line[64];
+static size_t s_uart_line_length;
 
 static int clamp_int(int value, int minimum, int maximum)
 {
@@ -103,12 +112,46 @@ static void drive_forward(int a_duty, int d_duty)
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
 }
 
+static void process_uart_line(void)
+{
+    s_uart_line[s_uart_line_length] = '\0';
+    int red;
+    int green;
+    int blue;
+    int enabled;
+    if (sscanf(s_uart_line, "RGB,%d,%d,%d", &red, &green, &blue) == 3) {
+        red = clamp_int(red, 0, 255);
+        green = clamp_int(green, 0, 255);
+        blue = clamp_int(blue, 0, 255);
+        line_vision_set_rgb_thresholds((uint8_t)red, (uint8_t)green,
+                                       (uint8_t)blue);
+        ESP_LOGI(TAG, "RGB_THRESHOLDS r=%d g=%d b=%d", red, green, blue);
+    } else if (sscanf(s_uart_line, "DEBUG,%d", &enabled) == 1) {
+        s_debug_enabled = enabled != 0;
+        if (s_debug_enabled) {
+            ESP_LOGI(TAG, "RGB_DEBUG enabled=1; normal logs paused");
+            esp_log_level_set("*", ESP_LOG_NONE);
+        } else {
+            esp_log_level_set("*", ESP_LOG_INFO);
+            ESP_LOGI(TAG, "RGB_DEBUG enabled=0; normal logs resumed");
+        }
+    } else if (strcmp(s_uart_line, "STATUS") == 0) {
+        const line_vision_rgb_thresholds_t thresholds =
+            line_vision_get_rgb_thresholds();
+        ESP_LOGI(TAG, "RGB_THRESHOLDS r=%u g=%u b=%u debug=%d",
+                 thresholds.red, thresholds.green, thresholds.blue,
+                 s_debug_enabled);
+    }
+    s_uart_line_length = 0;
+}
+
 static void handle_uart_command(void)
 {
-    uint8_t input[16];
+    uint8_t input[64];
     const int count = uart_read_bytes(UART_NUM_0, input, sizeof(input), 0);
     for (int index = 0; index < count; ++index) {
-        if (input[index] == 'f' || input[index] == 'F') {
+        const uint8_t value = input[index];
+        if (value == 'f' || value == 'F') {
             line_vision_result_t result;
             int64_t frame_us;
             portENTER_CRITICAL(&s_result_lock);
@@ -128,11 +171,20 @@ static void handle_uart_command(void)
                 stop_motors();
                 ESP_LOGW(TAG, "START REFUSED: no fresh, confident line");
             }
-        } else if (input[index] == 'x' || input[index] == 'X' ||
-                   input[index] == ' ') {
+        } else if (value == 'x' || value == 'X' || value == ' ') {
             s_enabled = false;
             stop_motors();
             ESP_LOGW(TAG, "CAMERA LINE FOLLOW STOPPED");
+        } else if (value == '\r' || value == '\n') {
+            if (s_uart_line_length > 0) {
+                process_uart_line();
+            }
+        } else if (value >= 32 && value <= 126) {
+            if (s_uart_line_length + 1 < sizeof(s_uart_line)) {
+                s_uart_line[s_uart_line_length++] = (char)value;
+            } else {
+                s_uart_line_length = 0;
+            }
         }
     }
 }
@@ -141,7 +193,13 @@ static void control_task(void *argument)
 {
     (void)argument;
     uint32_t processed_sequence = 0;
-    int previous_error = 0;
+    int filtered_error = 0;
+    int integral_error = 0;
+    bool filter_initialized = false;
+    int current_base = 0;
+    int current_correction = 0;
+    int current_a_duty = 0;
+    int current_d_duty = 0;
     int64_t last_report_us = 0;
     stop_motors();
 
@@ -163,30 +221,78 @@ static void control_task(void *argument)
                                 result.confidence >= FOLLOW_MIN_CONFIDENCE;
         if (!s_enabled || !frame_fresh || !line_valid) {
             stop_motors();
+            filtered_error = 0;
+            integral_error = 0;
+            filter_initialized = false;
+            current_base = 0;
+            current_correction = 0;
+            current_a_duty = 0;
+            current_d_duty = 0;
         } else if (sequence != processed_sequence) {
             const int signed_error = STEERING_SIGN * result.steering_error;
-            const int derivative = signed_error - previous_error;
-            previous_error = signed_error;
-            int correction = signed_error * 70 / 1000 +
-                             derivative * 25 / 1000;
-            correction = clamp_int(correction, -FOLLOW_CORRECTION_MAX,
-                                   FOLLOW_CORRECTION_MAX);
-            const int base = result.confidence < 50
-                                 ? FOLLOW_LOW_CONFIDENCE_DUTY
-                                 : FOLLOW_BASE_DUTY;
+            int previous_filtered_error = filtered_error;
+            if (!filter_initialized) {
+                filtered_error = signed_error;
+                previous_filtered_error = filtered_error;
+                filter_initialized = true;
+            } else {
+                filtered_error =
+                    (3 * filtered_error + signed_error) / 4;
+            }
+            const int derivative = filtered_error - previous_filtered_error;
+            const int control_error = abs(filtered_error) <=
+                                              FOLLOW_ERROR_DEADBAND
+                                          ? 0
+                                          : filtered_error;
+            if (control_error == 0) {
+                integral_error = integral_error * 3 / 4;
+            } else {
+                if ((control_error > 0 && integral_error < 0) ||
+                    (control_error < 0 && integral_error > 0)) {
+                    integral_error /= 2;
+                }
+                integral_error = clamp_int(
+                    integral_error + control_error,
+                    -FOLLOW_INTEGRAL_LIMIT, FOLLOW_INTEGRAL_LIMIT);
+            }
+            const int target_correction = clamp_int(
+                control_error * 70 / 1000 + integral_error / 1000 +
+                    derivative * 3 / 1000,
+                -FOLLOW_CORRECTION_MAX, FOLLOW_CORRECTION_MAX);
+            const int correction = clamp_int(
+                target_correction,
+                current_correction - FOLLOW_CORRECTION_STEP,
+                current_correction + FOLLOW_CORRECTION_STEP);
+            const int confidence_base = result.confidence < 50
+                                            ? FOLLOW_LOW_CONFIDENCE_DUTY
+                                            : FOLLOW_BASE_DUTY;
+            const int turn_slowdown =
+                clamp_int(abs(control_error) * 20 / 1000, 0, 20);
+            const int base = confidence_base - turn_slowdown;
             const int a_duty = clamp_int(base - correction,
-                                         FOLLOW_MIN_DUTY, FOLLOW_MAX_DUTY);
+                                         FOLLOW_INNER_MIN_DUTY,
+                                         FOLLOW_MAX_DUTY);
             const int d_duty = clamp_int(base + correction,
-                                         FOLLOW_MIN_DUTY, FOLLOW_MAX_DUTY);
+                                         FOLLOW_INNER_MIN_DUTY,
+                                         FOLLOW_MAX_DUTY);
+            current_base = base;
+            current_correction = correction;
+            current_a_duty = a_duty;
+            current_d_duty = d_duty;
             drive_forward(a_duty, d_duty);
             processed_sequence = sequence;
         }
 
         if (now_us - last_report_us >= 500000) {
             ESP_LOGI(TAG,
-                     "FOLLOW_STATUS enabled=%d line=%d confidence=%d error=%d near=%d far=%d fresh=%d",
+                     "FOLLOW_STATUS enabled=%d line=%d confidence=%d points=%d lateral=%d heading=%d error=%d filtered=%d integral=%d near=%d far=%d base=%d correction=%d wheel_a=%d wheel_d=%d fresh=%d",
                      s_enabled, result.found, result.confidence,
-                     result.steering_error, result.near_x, result.far_x,
+                     result.vector_point_count,
+                     result.lateral_error, result.heading_error,
+                     result.steering_error, filtered_error, integral_error,
+                     result.near_x, result.far_x,
+                     current_base, current_correction,
+                     current_a_duty, current_d_duty,
                      frame_fresh);
             last_report_us = now_us;
         }
@@ -235,7 +341,7 @@ esp_err_t camera_line_follow_init(void)
                                 6, NULL, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGW(TAG, "SAFE STOP. Send F to start, X or SPACE to stop");
+    ESP_LOGW(TAG, "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG,0/1");
     return ESP_OK;
 }
 
@@ -255,4 +361,9 @@ void camera_line_follow_camera_disconnected(void)
     portEXIT_CRITICAL(&s_result_lock);
     s_enabled = false;
     stop_motors();
+}
+
+bool camera_line_follow_debug_enabled(void)
+{
+    return s_debug_enabled;
 }

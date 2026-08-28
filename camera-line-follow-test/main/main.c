@@ -5,6 +5,7 @@
 
 #include "camera_display.h"
 #include "camera_line_follow.h"
+#include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -20,21 +21,31 @@
 #include "libuvc_adapter.h"
 #include "libuvc_helper.h"
 #include "line_vision.h"
+#include "mbedtls/base64.h"
 #include "usb/usb_host.h"
 
-#define CAMERA_WIDTH          640
-#define CAMERA_HEIGHT         480
-#define CAMERA_FPS            15
 #define MJPEG_SLOT_COUNT      2
 #define MJPEG_SLOT_CAPACITY   (256 * 1024)
-#define DECODED_WIDTH         (CAMERA_WIDTH / 4)
-#define DECODED_HEIGHT        (CAMERA_HEIGHT / 4)
+#define DECODED_WIDTH         80
+#define DECODED_HEIGHT        60
 #define DECODED_BUFFER_BYTES  (DECODED_WIDTH * DECODED_HEIGHT * 2)
 #define JPEG_WORK_BUFFER_BYTES 8192
+#define RGB_DEBUG_WIDTH       32
+#define RGB_DEBUG_HEIGHT      24
+#define RGB_DEBUG_INTERVAL_US 500000
+#define RGB_DEBUG_PIXELS      (RGB_DEBUG_WIDTH * RGB_DEBUG_HEIGHT)
+#define RGB_DEBUG_BYTES       (RGB_DEBUG_PIXELS * 2)
+#define RGB_DEBUG_MASK_BYTES  ((RGB_DEBUG_PIXELS + 7) / 8)
+#define RGB_DEBUG_B64_BYTES   (((RGB_DEBUG_BYTES + 2) / 3) * 4 + 1)
+#define MASK_DEBUG_B64_BYTES  (((RGB_DEBUG_MASK_BYTES + 2) / 3) * 4 + 1)
 
 typedef struct {
     uint8_t *data;
     size_t length;
+    size_t step;
+    uint16_t width;
+    uint16_t height;
+    enum uvc_frame_format format;
     bool busy;
 } mjpeg_slot_t;
 
@@ -43,12 +54,80 @@ static EventGroupHandle_t s_uvc_events;
 static QueueHandle_t s_frame_queue;
 static mjpeg_slot_t s_slots[MJPEG_SLOT_COUNT];
 static uint8_t *s_decoded_frame;
+static uint8_t *s_debug_raw_frame;
 static uint8_t *s_jpeg_work_buffer;
 static portMUX_TYPE s_slot_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_received_frames;
 static volatile uint32_t s_displayed_frames;
 static volatile uint32_t s_dropped_frames;
 static volatile uint32_t s_line_frames;
+static uint8_t s_rgb_debug_pixels[RGB_DEBUG_BYTES];
+static uint8_t s_rgb_debug_mask[RGB_DEBUG_MASK_BYTES];
+static unsigned char s_rgb_debug_b64[RGB_DEBUG_B64_BYTES];
+static unsigned char s_mask_debug_b64[MASK_DEBUG_B64_BYTES];
+static char s_rgb_debug_line[2560];
+static uint32_t s_rgb_debug_sequence;
+static int s_stream_width = 640;
+static int s_stream_height = 480;
+static int s_stream_fps = 15;
+static enum uvc_frame_format s_stream_format = UVC_FRAME_FORMAT_MJPEG;
+static esp_jpeg_image_scale_t s_decode_scale = JPEG_IMAGE_SCALE_1_8;
+
+static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot);
+
+static void emit_rgb_debug_frame(const uint8_t *raw_pixels,
+                                 size_t width, size_t height,
+                                 const line_vision_result_t *result)
+{
+    memset(s_rgb_debug_mask, 0, sizeof(s_rgb_debug_mask));
+    for (size_t sample_y = 0; sample_y < RGB_DEBUG_HEIGHT; ++sample_y) {
+        const size_t source_y = (sample_y * height + height / 2) /
+                                RGB_DEBUG_HEIGHT;
+        for (size_t sample_x = 0; sample_x < RGB_DEBUG_WIDTH; ++sample_x) {
+            const size_t source_x = (sample_x * width + width / 2) /
+                                    RGB_DEBUG_WIDTH;
+            const size_t source_index = source_y * width + source_x;
+            const size_t sample_index = sample_y * RGB_DEBUG_WIDTH + sample_x;
+            s_rgb_debug_pixels[sample_index * 2] =
+                raw_pixels[source_index * 2];
+            s_rgb_debug_pixels[sample_index * 2 + 1] =
+                raw_pixels[source_index * 2 + 1];
+            if (line_vision_pixel_selected(source_index)) {
+                s_rgb_debug_mask[sample_index / 8] |=
+                    (uint8_t)(1U << (sample_index % 8));
+            }
+        }
+    }
+
+    size_t rgb_length = 0;
+    size_t mask_length = 0;
+    if (mbedtls_base64_encode(s_rgb_debug_b64,
+                              sizeof(s_rgb_debug_b64),
+                              &rgb_length, s_rgb_debug_pixels,
+                              sizeof(s_rgb_debug_pixels)) != 0 ||
+        mbedtls_base64_encode(s_mask_debug_b64,
+                              sizeof(s_mask_debug_b64),
+                              &mask_length, s_rgb_debug_mask,
+                              sizeof(s_rgb_debug_mask)) != 0) {
+        return;
+    }
+    s_rgb_debug_b64[rgb_length] = '\0';
+    s_mask_debug_b64[mask_length] = '\0';
+    const line_vision_rgb_thresholds_t thresholds =
+        line_vision_get_rgb_thresholds();
+    const int line_length = snprintf(
+        s_rgb_debug_line, sizeof(s_rgb_debug_line),
+        "@RGB,%lu,%d,%d,%u,%u,%u,%d,%d,%d,%d,%d,%s,%s\n",
+        (unsigned long)++s_rgb_debug_sequence,
+        RGB_DEBUG_WIDTH, RGB_DEBUG_HEIGHT,
+        thresholds.red, thresholds.green, thresholds.blue,
+        result->found, result->confidence, result->steering_error,
+        result->near_x, result->far_x,
+        s_rgb_debug_b64, s_mask_debug_b64);
+    if (line_length > 0 && line_length < (int)sizeof(s_rgb_debug_line)) {
+        uart_write_bytes(UART_NUM_0, s_rgb_debug_line, line_length);
+    }
+}
 
 static void usb_library_task(void *argument)
 {
@@ -122,16 +201,30 @@ static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
     s_received_frames++;
 
     const uint8_t *frame_bytes = frame->data;
-    size_t jpeg_length = frame->data_bytes;
-    while (jpeg_length >= 2 &&
-           !(frame_bytes[jpeg_length - 2] == 0xff &&
-             frame_bytes[jpeg_length - 1] == 0xd9)) {
-        jpeg_length--;
+    size_t frame_length = frame->data_bytes;
+    if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+        while (frame_length >= 2 &&
+               !(frame_bytes[frame_length - 2] == 0xff &&
+                 frame_bytes[frame_length - 1] == 0xd9)) {
+            frame_length--;
+        }
+        if (frame_length < 4 || frame_bytes[0] != 0xff ||
+            frame_bytes[1] != 0xd8) {
+            s_dropped_frames++;
+            return;
+        }
+    } else if (frame->frame_format == UVC_FRAME_FORMAT_YUYV) {
+        if (frame->step < frame->width * 2 ||
+            frame_length < frame->step * frame->height) {
+            s_dropped_frames++;
+            return;
+        }
+        frame_length = frame->step * frame->height;
+    } else {
+        s_dropped_frames++;
+        return;
     }
-
-    if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG || jpeg_length < 4 ||
-        jpeg_length > MJPEG_SLOT_CAPACITY || frame_bytes[0] != 0xff ||
-        frame_bytes[1] != 0xd8) {
+    if (frame_length > MJPEG_SLOT_CAPACITY) {
         s_dropped_frames++;
         return;
     }
@@ -142,8 +235,12 @@ static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
         return;
     }
 
-    memcpy(s_slots[slot_index].data, frame->data, jpeg_length);
-    s_slots[slot_index].length = jpeg_length;
+    memcpy(s_slots[slot_index].data, frame->data, frame_length);
+    s_slots[slot_index].length = frame_length;
+    s_slots[slot_index].step = frame->step;
+    s_slots[slot_index].width = frame->width;
+    s_slots[slot_index].height = frame->height;
+    s_slots[slot_index].format = frame->frame_format;
     if (xQueueSend(s_frame_queue, &slot_index, 0) != pdPASS) {
         release_mjpeg_slot(slot_index);
         s_dropped_frames++;
@@ -154,32 +251,46 @@ static void frame_display_task(void *argument)
 {
     (void)argument;
     int slot_index;
+    uint32_t processed_frames = 0;
     int64_t last_report_us = esp_timer_get_time();
+    int64_t last_rgb_debug_us = 0;
 
     while (true) {
         if (xQueueReceive(s_frame_queue, &slot_index, portMAX_DELAY) != pdPASS) {
             continue;
         }
 
-        esp_jpeg_image_cfg_t jpeg_config = {
-            .indata = s_slots[slot_index].data,
-            .indata_size = s_slots[slot_index].length,
-            .outbuf = s_decoded_frame,
-            .outbuf_size = DECODED_BUFFER_BYTES,
-            .out_format = JPEG_IMAGE_FORMAT_RGB565,
-            .out_scale = JPEG_IMAGE_SCALE_1_4,
-            .flags = {
-                .swap_color_bytes = 1,
-            },
-            .advanced = {
-                .working_buffer = s_jpeg_work_buffer,
-                .working_buffer_size = JPEG_WORK_BUFFER_BYTES,
-            },
-        };
         esp_jpeg_image_output_t output = {0};
-        const esp_err_t decode_error = esp_jpeg_decode(&jpeg_config, &output);
+        esp_err_t decode_error;
+        if (s_slots[slot_index].format == UVC_FRAME_FORMAT_YUYV) {
+            decode_error = downsample_yuyv_luma(&s_slots[slot_index]);
+            output.width = DECODED_WIDTH;
+            output.height = DECODED_HEIGHT;
+        } else {
+            esp_jpeg_image_cfg_t jpeg_config = {
+                .indata = s_slots[slot_index].data,
+                .indata_size = s_slots[slot_index].length,
+                .outbuf = s_decoded_frame,
+                .outbuf_size = DECODED_BUFFER_BYTES,
+                .out_format = JPEG_IMAGE_FORMAT_RGB565,
+                .out_scale = s_decode_scale,
+                .flags = {
+                    .swap_color_bytes = 1,
+                },
+                .advanced = {
+                    .working_buffer = s_jpeg_work_buffer,
+                    .working_buffer_size = JPEG_WORK_BUFFER_BYTES,
+                },
+            };
+            decode_error = esp_jpeg_decode(&jpeg_config, &output);
+        }
         if (decode_error == ESP_OK && output.width == DECODED_WIDTH &&
             output.height == DECODED_HEIGHT) {
+            const bool rgb_debug = camera_line_follow_debug_enabled();
+            if (rgb_debug) {
+                memcpy(s_debug_raw_frame, s_decoded_frame,
+                       DECODED_BUFFER_BYTES);
+            }
             line_vision_result_t vision_result;
             line_vision_process(s_decoded_frame, output.width, output.height,
                                 &vision_result);
@@ -187,18 +298,17 @@ static void frame_display_task(void *argument)
             if (vision_result.found) {
                 s_line_frames++;
             }
-            const esp_err_t display_error =
-                camera_display_show_rotated_rgb565(s_decoded_frame,
-                                                    output.width,
-                                                    output.height);
-            if (display_error == ESP_OK) {
-                s_displayed_frames++;
-            } else {
-                ESP_LOGE(TAG, "TFT frame failed: %s",
-                         esp_err_to_name(display_error));
+            /* Keep the TFT static; vision/control latency has priority. */
+            processed_frames++;
+            const int64_t debug_now_us = esp_timer_get_time();
+            if (rgb_debug &&
+                debug_now_us - last_rgb_debug_us >= RGB_DEBUG_INTERVAL_US) {
+                emit_rgb_debug_frame(s_debug_raw_frame, output.width,
+                                     output.height, &vision_result);
+                last_rgb_debug_us = debug_now_us;
             }
         } else {
-            ESP_LOGW(TAG, "JPEG decode failed: %s, output=%ux%u",
+            ESP_LOGW(TAG, "Frame conversion failed: %s, output=%ux%u",
                      esp_err_to_name(decode_error), output.width, output.height);
         }
         release_mjpeg_slot(slot_index);
@@ -206,15 +316,40 @@ static void frame_display_task(void *argument)
         const int64_t now_us = esp_timer_get_time();
         if (now_us - last_report_us >= 1000000) {
             ESP_LOGI(TAG,
-                     "FRAME_STATUS received=%lu displayed=%lu dropped=%lu line=%lu",
+                     "FRAME_STATUS received=%lu processed=%lu displayed=%lu dropped=%lu line=%lu",
                      (unsigned long)s_received_frames,
+                     (unsigned long)processed_frames,
                      (unsigned long)s_displayed_frames,
                      (unsigned long)s_dropped_frames,
                      (unsigned long)s_line_frames);
             last_report_us = now_us;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* Let IDLE1 run even when the input queue remains continuously full. */
+        vTaskDelay(1);
     }
+}
+
+static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot)
+{
+    if (slot->format != UVC_FRAME_FORMAT_YUYV || slot->step == 0 ||
+        slot->width < DECODED_WIDTH || slot->height < DECODED_HEIGHT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t y = 0; y < DECODED_HEIGHT; ++y) {
+        const size_t source_y = y * slot->height / DECODED_HEIGHT;
+        const uint8_t *source_row = slot->data + source_y * slot->step;
+        for (size_t x = 0; x < DECODED_WIDTH; ++x) {
+            const size_t source_x = x * slot->width / DECODED_WIDTH;
+            const uint8_t luminance = source_row[source_x * 2];
+            const uint16_t gray = ((uint16_t)(luminance >> 3) << 11) |
+                                  ((uint16_t)(luminance >> 2) << 5) |
+                                  (luminance >> 3);
+            const size_t destination = 2 * (y * DECODED_WIDTH + x);
+            s_decoded_frame[destination] = gray >> 8;
+            s_decoded_frame[destination + 1] = gray & 0xff;
+        }
+    }
+    return ESP_OK;
 }
 
 static esp_err_t initialize_frame_pipeline(void)
@@ -238,6 +373,12 @@ static esp_err_t initialize_frame_pipeline(void)
     if (s_decoded_frame == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_debug_raw_frame = heap_caps_malloc(DECODED_BUFFER_BYTES,
+                                         MALLOC_CAP_SPIRAM |
+                                         MALLOC_CAP_8BIT);
+    if (s_debug_raw_frame == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     s_jpeg_work_buffer = heap_caps_malloc(JPEG_WORK_BUFFER_BYTES,
                                           MALLOC_CAP_INTERNAL |
                                           MALLOC_CAP_8BIT);
@@ -255,20 +396,45 @@ static esp_err_t initialize_frame_pipeline(void)
 static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
                                           uvc_stream_ctrl_t *control)
 {
-    static const int frame_rates[] = {CAMERA_FPS, 30, 0};
+    typedef struct {
+        enum uvc_frame_format format;
+        int width;
+        int height;
+        int fps;
+        esp_jpeg_image_scale_t scale;
+    } camera_profile_t;
+    static const camera_profile_t profiles[] = {
+        {UVC_FRAME_FORMAT_YUYV, 160, 120, 30, JPEG_IMAGE_SCALE_0},
+        {UVC_FRAME_FORMAT_YUYV, 160, 120, 15, JPEG_IMAGE_SCALE_0},
+        {UVC_FRAME_FORMAT_YUYV, 320, 240, 15, JPEG_IMAGE_SCALE_0},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 15, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_8},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_8},
+    };
     uvc_error_t result = UVC_ERROR_INVALID_MODE;
     for (size_t profile = 0;
-         profile < sizeof(frame_rates) / sizeof(frame_rates[0]); ++profile) {
-        for (int attempt = 1; attempt <= 3; ++attempt) {
-            ESP_LOGI(TAG, "Trying MJPEG %dx%d at %d fps (attempt %d)",
-                     CAMERA_WIDTH, CAMERA_HEIGHT, frame_rates[profile], attempt);
+         profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            ESP_LOGI(TAG, "Trying %s %dx%d at %d fps (attempt %d)",
+                     profiles[profile].format == UVC_FRAME_FORMAT_YUYV
+                         ? "YUYV" : "MJPEG",
+                     profiles[profile].width, profiles[profile].height,
+                     profiles[profile].fps, attempt);
             result = uvc_get_stream_ctrl_format_size(device_handle, control,
-                                                      UVC_FRAME_FORMAT_MJPEG,
-                                                      CAMERA_WIDTH,
-                                                      CAMERA_HEIGHT,
-                                                      frame_rates[profile]);
+                                                      profiles[profile].format,
+                                                      profiles[profile].width,
+                                                      profiles[profile].height,
+                                                      profiles[profile].fps);
             if (result == UVC_SUCCESS) {
-                control->dwMaxPayloadTransferSize = 512;
+                s_stream_width = profiles[profile].width;
+                s_stream_height = profiles[profile].height;
+                s_stream_fps = profiles[profile].fps;
+                s_stream_format = profiles[profile].format;
+                s_decode_scale = profiles[profile].scale;
+                control->dwMaxPayloadTransferSize =
+                    profiles[profile].format == UVC_FRAME_FORMAT_YUYV
+                        ? 1023 : 512;
                 return UVC_SUCCESS;
             }
         }
@@ -278,7 +444,7 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "USB camera line-following test with TFT preview");
+    ESP_LOGI(TAG, "USB camera line-following test; vision-first, TFT static");
     ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=115200");
     ESP_LOGI(TAG, "Camera: D-=GPIO19 D+=GPIO20; motors start in SAFE STOP");
 
@@ -343,7 +509,10 @@ void app_main(void)
         }
 
         if (result == UVC_SUCCESS) {
-            ESP_LOGI(TAG, "CAMERA_STATUS=STREAMING_640X480_MJPEG");
+            ESP_LOGI(TAG, "CAMERA_STATUS=STREAMING_%dx%d_%dFPS_%s",
+                     s_stream_width, s_stream_height, s_stream_fps,
+                     s_stream_format == UVC_FRAME_FORMAT_YUYV
+                         ? "YUYV" : "MJPEG");
             wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
             camera_line_follow_camera_disconnected();
             uvc_stop_streaming(device_handle);
