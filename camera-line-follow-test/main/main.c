@@ -25,6 +25,7 @@
 #include "usb/usb_host.h"
 
 #define MJPEG_SLOT_COUNT      2
+#define FRAME_QUEUE_LENGTH    1
 #define MJPEG_SLOT_CAPACITY   (256 * 1024)
 #define DECODED_WIDTH         80
 #define DECODED_HEIGHT        60
@@ -33,6 +34,7 @@
 #define RGB_DEBUG_WIDTH       32
 #define RGB_DEBUG_HEIGHT      24
 #define RGB_DEBUG_INTERVAL_US 500000
+#define TFT_PREVIEW_INTERVAL_US 500000
 #define RGB_DEBUG_PIXELS      (RGB_DEBUG_WIDTH * RGB_DEBUG_HEIGHT)
 #define RGB_DEBUG_BYTES       (RGB_DEBUG_PIXELS * 2)
 #define RGB_DEBUG_MASK_BYTES  ((RGB_DEBUG_PIXELS + 7) / 8)
@@ -46,6 +48,7 @@ typedef struct {
     uint16_t width;
     uint16_t height;
     enum uvc_frame_format format;
+    int64_t captured_at_us;
     bool busy;
 } mjpeg_slot_t;
 
@@ -61,6 +64,7 @@ static volatile uint32_t s_received_frames;
 static volatile uint32_t s_displayed_frames;
 static volatile uint32_t s_dropped_frames;
 static volatile uint32_t s_line_frames;
+static bool s_capture_core_reported;
 static uint8_t s_rgb_debug_pixels[RGB_DEBUG_BYTES];
 static uint8_t s_rgb_debug_mask[RGB_DEBUG_MASK_BYTES];
 static unsigned char s_rgb_debug_b64[RGB_DEBUG_B64_BYTES];
@@ -198,6 +202,10 @@ static void release_mjpeg_slot(int index)
 static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
 {
     (void)user_pointer;
+    if (!s_capture_core_reported) {
+        ESP_LOGI(TAG, "CAPTURE_CALLBACK core=%d", xPortGetCoreID());
+        s_capture_core_reported = true;
+    }
     s_received_frames++;
 
     const uint8_t *frame_bytes = frame->data;
@@ -229,7 +237,17 @@ static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
         return;
     }
 
-    const int slot_index = reserve_mjpeg_slot();
+    int slot_index = reserve_mjpeg_slot();
+    if (slot_index < 0) {
+        /* The decoder owns one slot and the queue owns the other. Replace the
+         * queued frame so control never waits behind stale camera data. */
+        int stale_slot;
+        if (xQueueReceive(s_frame_queue, &stale_slot, 0) == pdPASS) {
+            release_mjpeg_slot(stale_slot);
+            s_dropped_frames++;
+            slot_index = reserve_mjpeg_slot();
+        }
+    }
     if (slot_index < 0) {
         s_dropped_frames++;
         return;
@@ -241,6 +259,7 @@ static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
     s_slots[slot_index].width = frame->width;
     s_slots[slot_index].height = frame->height;
     s_slots[slot_index].format = frame->frame_format;
+    s_slots[slot_index].captured_at_us = esp_timer_get_time();
     if (xQueueSend(s_frame_queue, &slot_index, 0) != pdPASS) {
         release_mjpeg_slot(slot_index);
         s_dropped_frames++;
@@ -250,15 +269,20 @@ static void camera_frame_callback(uvc_frame_t *frame, void *user_pointer)
 static void frame_display_task(void *argument)
 {
     (void)argument;
+    ESP_LOGI(TAG, "DECODE_VISION_TASK core=%d", xPortGetCoreID());
     int slot_index;
     uint32_t processed_frames = 0;
     int64_t last_report_us = esp_timer_get_time();
     int64_t last_rgb_debug_us = 0;
+    int64_t last_tft_preview_us = 0;
+    int64_t latest_frame_age_ms = 0;
+    int64_t maximum_frame_age_ms = 0;
 
     while (true) {
         if (xQueueReceive(s_frame_queue, &slot_index, portMAX_DELAY) != pdPASS) {
             continue;
         }
+        const int64_t captured_at_us = s_slots[slot_index].captured_at_us;
 
         esp_jpeg_image_output_t output = {0};
         esp_err_t decode_error;
@@ -298,9 +322,21 @@ static void frame_display_task(void *argument)
             if (vision_result.found) {
                 s_line_frames++;
             }
-            /* Keep the TFT static; vision/control latency has priority. */
             processed_frames++;
             const int64_t debug_now_us = esp_timer_get_time();
+            if (debug_now_us - last_tft_preview_us >=
+                    TFT_PREVIEW_INTERVAL_US) {
+                const esp_err_t display_error =
+                    camera_display_show_rotated_rgb565(
+                        s_decoded_frame, output.width, output.height);
+                if (display_error == ESP_OK) {
+                    s_displayed_frames++;
+                } else {
+                    ESP_LOGW(TAG, "TFT preview failed: %s",
+                             esp_err_to_name(display_error));
+                }
+                last_tft_preview_us = debug_now_us;
+            }
             if (rgb_debug &&
                 debug_now_us - last_rgb_debug_us >= RGB_DEBUG_INTERVAL_US) {
                 emit_rgb_debug_frame(s_debug_raw_frame, output.width,
@@ -314,15 +350,22 @@ static void frame_display_task(void *argument)
         release_mjpeg_slot(slot_index);
 
         const int64_t now_us = esp_timer_get_time();
+        latest_frame_age_ms = (now_us - captured_at_us) / 1000;
+        if (latest_frame_age_ms > maximum_frame_age_ms) {
+            maximum_frame_age_ms = latest_frame_age_ms;
+        }
         if (now_us - last_report_us >= 1000000) {
             ESP_LOGI(TAG,
-                     "FRAME_STATUS received=%lu processed=%lu displayed=%lu dropped=%lu line=%lu",
+                     "FRAME_STATUS received=%lu processed=%lu displayed=%lu dropped=%lu line=%lu age=%lldms max_age=%lldms",
                      (unsigned long)s_received_frames,
                      (unsigned long)processed_frames,
                      (unsigned long)s_displayed_frames,
                      (unsigned long)s_dropped_frames,
-                     (unsigned long)s_line_frames);
+                     (unsigned long)s_line_frames,
+                     (long long)latest_frame_age_ms,
+                     (long long)maximum_frame_age_ms);
             last_report_us = now_us;
+            maximum_frame_age_ms = latest_frame_age_ms;
         }
         /* Let IDLE1 run even when the input queue remains continuously full. */
         vTaskDelay(1);
@@ -354,7 +397,7 @@ static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot)
 
 static esp_err_t initialize_frame_pipeline(void)
 {
-    s_frame_queue = xQueueCreate(MJPEG_SLOT_COUNT, sizeof(int));
+    s_frame_queue = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(int));
     if (s_frame_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -390,6 +433,8 @@ static esp_err_t initialize_frame_pipeline(void)
                                 NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG,
+             "PIPELINE USB/control=core0 decode/vision=core1 queue=latest");
     return ESP_OK;
 }
 
@@ -444,7 +489,7 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "USB camera line-following test; vision-first, TFT static");
+    ESP_LOGI(TAG, "USB camera line-following test; TFT preview at 2 fps");
     ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=115200");
     ESP_LOGI(TAG, "Camera: D-=GPIO19 D+=GPIO20; motors start in SAFE STOP");
 

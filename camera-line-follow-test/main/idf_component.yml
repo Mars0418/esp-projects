@@ -1,5 +1,9 @@
 dependencies:
   idf: ">=5.0"
+  espressif/usb:
+    version: "1.5.0"
+    rules:
+      - if: "idf_version >=6.0"
   usb_host_uvc:
     path: ../../camera-usb-test/managed_components/espressif__usb_host_uvc
   esp_jpeg: ">=1.0.2"

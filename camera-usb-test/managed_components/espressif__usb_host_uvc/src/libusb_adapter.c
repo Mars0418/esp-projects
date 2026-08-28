@@ -289,6 +289,7 @@ int libusb_init(struct libusb_context **ctx)
     };
 
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.pin_to_core = 0;
     esp_pthread_set_cfg(&cfg);
 
     GOTO_ON_FALSE( driver = calloc(1, sizeof(uvc_driver_t)) );
@@ -298,8 +299,9 @@ int libusb_init(struct libusb_context **ctx)
     STAILQ_INIT(&driver->opened_devices_tailq);
 
     if (s_config.create_background_task) {
-        GOTO_ON_FALSE( xTaskCreate(usb_client_event_handler, "uvc_events", s_config.stack_size,
-                                   NULL, s_config.task_priority, &client_task_handle) );
+        GOTO_ON_FALSE( xTaskCreatePinnedToCore(
+            usb_client_event_handler, "uvc_events", s_config.stack_size,
+            NULL, s_config.task_priority, &client_task_handle, 0) );
     }
 
     UVC_ENTER_CRITICAL();
@@ -714,7 +716,9 @@ int libusb_get_config_descriptor(libusb_device *dev,
 
     RETURN_ON_ERROR_LIBUSB( usb_host_get_active_config_descriptor(device->handle, &config_desc) );
 
-    int res = raw_desc_to_libusb_config(&config_desc->val[0], config_desc->wTotalLength, config);
+    int res = raw_desc_to_libusb_config((const uint8_t *)config_desc,
+                                        config_desc->wTotalLength,
+                                        config);
 
     device->endpoint_mps = get_interupt_endpoint_mps(config_desc);
 
