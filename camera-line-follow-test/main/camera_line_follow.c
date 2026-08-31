@@ -32,29 +32,39 @@
 #define MOTOR_D_IN2 GPIO_NUM_41
 #define MOTOR_D_CHANNEL LEDC_CHANNEL_2
 
+#define ENCODER_A_PHASE_A GPIO_NUM_16
+#define ENCODER_A_PHASE_B GPIO_NUM_17
+#define ENCODER_D_PHASE_A GPIO_NUM_2
+#define ENCODER_D_PHASE_B GPIO_NUM_1
+#define ENCODER_COUNTS_PER_REV 406
+
 #define PWM_MAX_DUTY 1023
-#define FOLLOW_BASE_DUTY 180
-#define FOLLOW_LOW_CONFIDENCE_DUTY 150
-#define FOLLOW_INNER_MIN_DUTY 100
-#define FOLLOW_MAX_DUTY 230
-#define FOLLOW_CORRECTION_MAX 50
+#define FOLLOW_BASE_DUTY 150
+#define FOLLOW_LOW_CONFIDENCE_DUTY 140
+#define FOLLOW_INNER_MIN_DUTY 120
+#define FOLLOW_MAX_DUTY 170
+#define FOLLOW_CORRECTION_MAX 20
 #define FOLLOW_CORRECTION_STEP 5
 #define FOLLOW_ERROR_DEADBAND 45
 #define FOLLOW_INTEGRAL_LIMIT 1500
 #define FOLLOW_FRAME_TIMEOUT_MS 600
 #define FOLLOW_MIN_CONFIDENCE 30
+#define FOLLOW_STATUS_INTERVAL_MS 2000
+#define LINE_EVENT_CONFIRM_FRAMES 3
 #define STEERING_SIGN -1
 
 #define TURN_CONFIRM_FRAMES 3
-#define TURN_TRIGGER_Y 31
-#define TURN_APPROACH_DUTY 130
-#define TURN_APPROACH_TIMEOUT_MS 1800
-#define PIVOT_INNER_REVERSE_DUTY 165
-#define PIVOT_OUTER_FORWARD_DUTY 210
+/* Raw ROI y=12..57 runs from near to far; lower y is closer to the car. */
+#define TURN_TRIGGER_Y LINE_VISION_TURN_TRIGGER_Y
+#define TURN_APPROACH_DUTY 140
+#define TURN_APPROACH_TIMEOUT_MS 2500
+#define TURN_ADVANCE_DUTY 80
+#define TURN_ADVANCE_COUNTS (ENCODER_COUNTS_PER_REV * 3 / 2)
+#define TURN_ADVANCE_TIMEOUT_MS 3000
+#define TURN_SPIN_DUTY 80
 #define PIVOT_MIN_TIME_MS 250
 #define PIVOT_MAX_TIME_MS 1200
-#define REACQUIRE_PIVOT_DUTY 145
-#define REACQUIRE_TIMEOUT_MS 1000
+#define REACQUIRE_SPIN_DUTY 80
 #define REACQUIRE_STABLE_FRAMES 3
 #define REACQUIRE_LATERAL_LIMIT 350
 #define REACQUIRE_HEADING_LIMIT 550
@@ -62,6 +72,7 @@
 typedef enum {
     FOLLOW_STATE_TRACK,
     FOLLOW_STATE_APPROACH_TURN,
+    FOLLOW_STATE_ADVANCE_TO_TURN,
     FOLLOW_STATE_PIVOT,
     FOLLOW_STATE_REACQUIRE,
 } follow_state_t;
@@ -73,6 +84,13 @@ typedef struct {
     ledc_channel_t channel;
 } motor_t;
 
+typedef struct {
+    gpio_num_t phase_a;
+    gpio_num_t phase_b;
+    volatile int32_t count;
+    volatile uint8_t previous_state;
+} encoder_t;
+
 static const char *TAG = "CAMERA_FOLLOW";
 static const motor_t s_motor_a = {
     MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, MOTOR_A_CHANNEL};
@@ -80,6 +98,10 @@ static const motor_t s_motor_b = {
     MOTOR_B_PWM, MOTOR_B_IN1, MOTOR_B_IN2, MOTOR_B_CHANNEL};
 static const motor_t s_motor_d = {
     MOTOR_D_PWM, MOTOR_D_IN1, MOTOR_D_IN2, MOTOR_D_CHANNEL};
+static encoder_t s_encoder_a = {
+    ENCODER_A_PHASE_A, ENCODER_A_PHASE_B, 0, 0};
+static encoder_t s_encoder_d = {
+    ENCODER_D_PHASE_A, ENCODER_D_PHASE_B, 0, 0};
 static portMUX_TYPE s_result_lock = portMUX_INITIALIZER_UNLOCKED;
 static line_vision_result_t s_latest_result;
 static int64_t s_latest_frame_us;
@@ -88,6 +110,13 @@ static bool s_enabled;
 static volatile bool s_debug_enabled;
 static char s_uart_line[64];
 static size_t s_uart_line_length;
+
+static const int8_t s_quadrature_delta[16] = {
+     0,  1, -1,  0,
+    -1,  0,  0,  1,
+     1,  0,  0, -1,
+     0, -1,  1,  0,
+};
 
 static int clamp_int(int value, int minimum, int maximum)
 {
@@ -133,19 +162,92 @@ static void drive_forward(int a_duty, int d_duty)
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
 }
 
-static void drive_pivot(int physical_direction, int inner_duty, int outer_duty)
+static void drive_three_wheel_spin(int physical_direction, int duty)
+{
+    const int a_direction = physical_direction > 0 ? 1 : -1;
+    const int d_direction = -a_direction;
+    const int b_direction = d_direction;
+
+    /* A/D provide differential yaw; B reinforces that yaw on the kiwi base. */
+    motor_prepare(&s_motor_a, a_direction, duty);
+    motor_prepare(&s_motor_b, b_direction, duty);
+    motor_prepare(&s_motor_d, d_direction, duty);
+    ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+}
+
+static uint8_t encoder_read_state(const encoder_t *encoder)
+{
+    return ((uint8_t)gpio_get_level(encoder->phase_a) << 1) |
+           (uint8_t)gpio_get_level(encoder->phase_b);
+}
+
+static void encoder_gpio_isr(void *argument)
+{
+    encoder_t *encoder = (encoder_t *)argument;
+    const uint8_t current_state = encoder_read_state(encoder);
+    const uint8_t transition =
+        (uint8_t)((encoder->previous_state << 2) | current_state);
+    encoder->count += s_quadrature_delta[transition];
+    encoder->previous_state = current_state;
+}
+
+static esp_err_t configure_encoders(void)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = (1ULL << ENCODER_A_PHASE_A) |
+                        (1ULL << ENCODER_A_PHASE_B) |
+                        (1ULL << ENCODER_D_PHASE_A) |
+                        (1ULL << ENCODER_D_PHASE_B),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&config), TAG,
+                        "encoder GPIO config failed");
+
+    const esp_err_t isr_error = gpio_install_isr_service(0);
+    if (isr_error != ESP_OK && isr_error != ESP_ERR_INVALID_STATE) {
+        return isr_error;
+    }
+
+    encoder_t *encoders[] = {&s_encoder_a, &s_encoder_d};
+    for (size_t index = 0; index < 2; ++index) {
+        encoders[index]->count = 0;
+        encoders[index]->previous_state = encoder_read_state(encoders[index]);
+        ESP_RETURN_ON_ERROR(
+            gpio_isr_handler_add(encoders[index]->phase_a,
+                                 encoder_gpio_isr, encoders[index]),
+            TAG, "encoder phase A ISR failed");
+        ESP_RETURN_ON_ERROR(
+            gpio_isr_handler_add(encoders[index]->phase_b,
+                                 encoder_gpio_isr, encoders[index]),
+            TAG, "encoder phase B ISR failed");
+    }
+    return ESP_OK;
+}
+
+static int32_t encoder_distance(int32_t current, int32_t start)
+{
+    int32_t distance = current - start;
+    if (distance < 0) {
+        distance = -distance;
+    }
+    return distance;
+}
+
+static void signed_spin_duties(int physical_direction, int duty,
+                               int *a_duty, int *b_duty, int *d_duty)
 {
     if (physical_direction > 0) {
-        /* Right turn: right/A is inner and reverses, left/D drives forward. */
-        motor_prepare(&s_motor_a, 1, inner_duty);
-        motor_prepare(&s_motor_d, -1, outer_duty);
+        *a_duty = duty;
+        *b_duty = -duty;
+        *d_duty = -duty;
     } else {
-        /* Left turn: left/D is inner and reverses, right/A drives forward. */
-        motor_prepare(&s_motor_a, -1, outer_duty);
-        motor_prepare(&s_motor_d, 1, inner_duty);
+        *a_duty = -duty;
+        *b_duty = duty;
+        *d_duty = duty;
     }
-    motor_prepare(&s_motor_b, 0, 0);
-    ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
 }
 
 static const char *state_name(follow_state_t state)
@@ -153,6 +255,7 @@ static const char *state_name(follow_state_t state)
     switch (state) {
     case FOLLOW_STATE_TRACK: return "TRACK";
     case FOLLOW_STATE_APPROACH_TURN: return "APPROACH";
+    case FOLLOW_STATE_ADVANCE_TO_TURN: return "ADVANCE";
     case FOLLOW_STATE_PIVOT: return "PIVOT";
     case FOLLOW_STATE_REACQUIRE: return "REACQUIRE";
     default: return "UNKNOWN";
@@ -246,6 +349,7 @@ static void control_task(void *argument)
     int current_base = 0;
     int current_correction = 0;
     int current_a_duty = 0;
+    int current_b_duty = 0;
     int current_d_duty = 0;
     follow_state_t state = FOLLOW_STATE_TRACK;
     int turn_candidate_direction = 0;
@@ -253,8 +357,15 @@ static void control_task(void *argument)
     int latched_turn_direction = 0;
     int stable_frames = 0;
     int64_t state_started_us = 0;
-    int64_t last_turn_seen_us = 0;
+    int32_t advance_start_a_count = 0;
+    int32_t advance_start_d_count = 0;
+    int32_t advance_a_counts = 0;
+    int32_t advance_d_counts = 0;
     bool was_enabled = false;
+    bool line_state_known = false;
+    bool last_line_valid = false;
+    bool line_candidate_valid = false;
+    int line_candidate_frames = 0;
     int64_t last_report_us = 0;
     stop_motors();
 
@@ -273,7 +384,8 @@ static void control_task(void *argument)
         const bool frame_fresh = frame_us > 0 &&
             now_us - frame_us <= (int64_t)FOLLOW_FRAME_TIMEOUT_MS * 1000;
         const bool line_valid = result.found &&
-                                result.confidence >= FOLLOW_MIN_CONFIDENCE;
+                                 result.confidence >= FOLLOW_MIN_CONFIDENCE;
+        const bool result_updated = sequence != processed_sequence;
 
         if (s_enabled && !was_enabled) {
             state = FOLLOW_STATE_TRACK;
@@ -282,10 +394,13 @@ static void control_task(void *argument)
             turn_candidate_frames = 0;
             latched_turn_direction = 0;
             stable_frames = 0;
-            last_turn_seen_us = 0;
             filtered_error = 0;
             integral_error = 0;
             filter_initialized = false;
+            advance_start_a_count = s_encoder_a.count;
+            advance_start_d_count = s_encoder_d.count;
+            advance_a_counts = 0;
+            advance_d_counts = 0;
         }
         was_enabled = s_enabled;
 
@@ -302,16 +417,15 @@ static void control_task(void *argument)
             current_base = 0;
             current_correction = 0;
             current_a_duty = 0;
+            current_b_duty = 0;
             current_d_duty = 0;
             state = FOLLOW_STATE_TRACK;
-        } else if (sequence != processed_sequence) {
+        } else if (result_updated) {
             const bool corner_valid = result.big_turn &&
                                       result.turn_confidence >= 50 &&
                                       result.turn_direction != 0;
-            if (corner_valid) {
-                last_turn_seen_us = now_us;
-            }
-
+            const bool corner_position_valid =
+                result.corner_x >= 0 && result.corner_y >= 0;
             if (state == FOLLOW_STATE_TRACK) {
                 if (corner_valid) {
                     if (turn_candidate_direction == result.turn_direction) {
@@ -323,39 +437,58 @@ static void control_task(void *argument)
                     if (turn_candidate_frames >= TURN_CONFIRM_FRAMES) {
                         latched_turn_direction =
                             STEERING_SIGN * turn_candidate_direction;
-                        state = FOLLOW_STATE_APPROACH_TURN;
                         state_started_us = now_us;
                         ESP_LOGW(TAG,
                                  "TURN CONFIRMED visual=%d physical=%d angle=%d corner_y=%d",
                                  turn_candidate_direction,
                                  latched_turn_direction,
                                  result.turn_angle_deg, result.corner_y);
+                        if (result.corner_y <= TURN_TRIGGER_Y) {
+                            state = FOLLOW_STATE_ADVANCE_TO_TURN;
+                            advance_start_a_count = s_encoder_a.count;
+                            advance_start_d_count = s_encoder_d.count;
+                            advance_a_counts = 0;
+                            advance_d_counts = 0;
+                            ESP_LOGW(TAG,
+                                     "TURN TRIGGER y=%d locked_dir=%d; ADVANCE target=%d",
+                                     result.corner_y,
+                                     latched_turn_direction,
+                                     TURN_ADVANCE_COUNTS);
+                        } else {
+                            state = FOLLOW_STATE_APPROACH_TURN;
+                        }
                     }
                 } else {
                     turn_candidate_frames = 0;
                     turn_candidate_direction = 0;
                 }
             } else if (state == FOLLOW_STATE_APPROACH_TURN) {
-                if (corner_valid &&
-                    STEERING_SIGN * result.turn_direction ==
-                        latched_turn_direction &&
+                /* Direction was already confirmed; later noisy direction
+                 * estimates must not cancel the locked turn. */
+                if (corner_position_valid &&
                     result.corner_y <= TURN_TRIGGER_Y) {
-                    state = FOLLOW_STATE_PIVOT;
+                    state = FOLLOW_STATE_ADVANCE_TO_TURN;
                     state_started_us = now_us;
-                    stable_frames = 0;
+                    advance_start_a_count = s_encoder_a.count;
+                    advance_start_d_count = s_encoder_d.count;
+                    advance_a_counts = 0;
+                    advance_d_counts = 0;
                     ESP_LOGW(TAG,
-                             "PIVOT START: corner reached y=%d angle=%d direction=%d",
-                             result.corner_y, result.turn_angle_deg,
-                             latched_turn_direction);
-                } else if ((!line_valid && last_turn_seen_us > 0 &&
-                            now_us - last_turn_seen_us <= 500000) ||
-                           now_us - state_started_us >=
-                               (int64_t)TURN_APPROACH_TIMEOUT_MS * 1000) {
-                    state = FOLLOW_STATE_PIVOT;
+                             "TURN TRIGGER y=%d instant_dir=%d locked_dir=%d; ADVANCE target=%d",
+                             result.corner_y,
+                             STEERING_SIGN * result.turn_direction,
+                             latched_turn_direction,
+                             TURN_ADVANCE_COUNTS);
+                } else if (now_us - state_started_us >=
+                           (int64_t)TURN_APPROACH_TIMEOUT_MS * 1000) {
+                    state = FOLLOW_STATE_TRACK;
                     state_started_us = now_us;
-                    stable_frames = 0;
+                    turn_candidate_direction = 0;
+                    turn_candidate_frames = 0;
+                    latched_turn_direction = 0;
                     ESP_LOGW(TAG,
-                             "PIVOT START: confirmed corner passed near ROI");
+                             "APPROACH TIMEOUT: corner did not reach y<=%d; resume TRACK",
+                             TURN_TRIGGER_Y);
                 }
             } else if (state == FOLLOW_STATE_PIVOT ||
                        state == FOLLOW_STATE_REACQUIRE) {
@@ -412,10 +545,7 @@ static void control_task(void *argument)
                 const int turn_slowdown =
                     clamp_int(abs(control_error) * 20 / 1000, 0, 20);
                 const int base = confidence_base - turn_slowdown;
-                const int inner_min =
-                    state == FOLLOW_STATE_APPROACH_TURN
-                        ? 75
-                        : FOLLOW_INNER_MIN_DUTY;
+                const int inner_min = FOLLOW_INNER_MIN_DUTY;
                 const int a_duty = clamp_int(base - correction,
                                              inner_min,
                                              FOLLOW_MAX_DUTY);
@@ -425,33 +555,56 @@ static void control_task(void *argument)
                 current_base = base;
                 current_correction = correction;
                 current_a_duty = a_duty;
+                current_b_duty = 0;
                 current_d_duty = d_duty;
                 drive_forward(a_duty, d_duty);
-            } else if ((state == FOLLOW_STATE_TRACK ||
-                        state == FOLLOW_STATE_APPROACH_TURN) &&
-                       !line_valid) {
-                stop_motors();
-                current_base = 0;
-                current_correction = 0;
-                current_a_duty = 0;
-                current_d_duty = 0;
             }
             processed_sequence = sequence;
         }
 
-        if (s_enabled && frame_fresh && state == FOLLOW_STATE_PIVOT) {
-            drive_pivot(latched_turn_direction,
-                        PIVOT_INNER_REVERSE_DUTY,
-                        PIVOT_OUTER_FORWARD_DUTY);
+        if (s_enabled && frame_fresh &&
+            state == FOLLOW_STATE_ADVANCE_TO_TURN) {
+            advance_a_counts = encoder_distance(s_encoder_a.count,
+                                                advance_start_a_count);
+            advance_d_counts = encoder_distance(s_encoder_d.count,
+                                                advance_start_d_count);
+            drive_forward(TURN_ADVANCE_DUTY, TURN_ADVANCE_DUTY);
+            current_base = TURN_ADVANCE_DUTY;
+            current_correction = 0;
+            current_a_duty = TURN_ADVANCE_DUTY;
+            current_b_duty = 0;
+            current_d_duty = TURN_ADVANCE_DUTY;
+
+            const bool advance_complete =
+                advance_a_counts >= TURN_ADVANCE_COUNTS &&
+                advance_d_counts >= TURN_ADVANCE_COUNTS;
+            const bool advance_timed_out =
+                now_us - state_started_us >=
+                    (int64_t)TURN_ADVANCE_TIMEOUT_MS * 1000;
+            if (advance_complete || advance_timed_out) {
+                if (advance_timed_out && !advance_complete) {
+                    ESP_LOGW(TAG,
+                             "ADVANCE TIMEOUT A=%ld D=%ld target=%d; start spin",
+                             (long)advance_a_counts,
+                             (long)advance_d_counts,
+                             TURN_ADVANCE_COUNTS);
+                }
+                state = FOLLOW_STATE_PIVOT;
+                state_started_us = now_us;
+                stable_frames = 0;
+                ESP_LOGW(TAG,
+                         "SPIN START direction=%d duty=%d advance=A%ld/D%ld",
+                         latched_turn_direction, TURN_SPIN_DUTY,
+                         (long)advance_a_counts, (long)advance_d_counts);
+            }
+        } else if (s_enabled && frame_fresh &&
+                   state == FOLLOW_STATE_PIVOT) {
+            drive_three_wheel_spin(latched_turn_direction, TURN_SPIN_DUTY);
             current_base = 0;
             current_correction = latched_turn_direction;
-            if (latched_turn_direction > 0) {
-                current_a_duty = -PIVOT_INNER_REVERSE_DUTY;
-                current_d_duty = PIVOT_OUTER_FORWARD_DUTY;
-            } else {
-                current_a_duty = PIVOT_OUTER_FORWARD_DUTY;
-                current_d_duty = -PIVOT_INNER_REVERSE_DUTY;
-            }
+            signed_spin_duties(latched_turn_direction, TURN_SPIN_DUTY,
+                               &current_a_duty, &current_b_duty,
+                               &current_d_duty);
             const int64_t pivot_age_us = now_us - state_started_us;
             if ((pivot_age_us >= (int64_t)PIVOT_MIN_TIME_MS * 1000 &&
                  stable_frames >= REACQUIRE_STABLE_FRAMES) ||
@@ -463,16 +616,12 @@ static void control_task(void *argument)
             }
         } else if (s_enabled && frame_fresh &&
                    state == FOLLOW_STATE_REACQUIRE) {
-            drive_pivot(latched_turn_direction,
-                        REACQUIRE_PIVOT_DUTY,
-                        REACQUIRE_PIVOT_DUTY);
-            if (latched_turn_direction > 0) {
-                current_a_duty = -REACQUIRE_PIVOT_DUTY;
-                current_d_duty = REACQUIRE_PIVOT_DUTY;
-            } else {
-                current_a_duty = REACQUIRE_PIVOT_DUTY;
-                current_d_duty = -REACQUIRE_PIVOT_DUTY;
-            }
+            drive_three_wheel_spin(latched_turn_direction,
+                                   REACQUIRE_SPIN_DUTY);
+            signed_spin_duties(latched_turn_direction,
+                               REACQUIRE_SPIN_DUTY,
+                               &current_a_duty, &current_b_duty,
+                               &current_d_duty);
             if (stable_frames >= REACQUIRE_STABLE_FRAMES) {
                 state = FOLLOW_STATE_TRACK;
                 state_started_us = now_us;
@@ -483,29 +632,54 @@ static void control_task(void *argument)
                 integral_error = 0;
                 filter_initialized = false;
                 ESP_LOGW(TAG, "LINE REACQUIRED: normal tracking resumed");
-            } else if (now_us - state_started_us >=
-                       (int64_t)REACQUIRE_TIMEOUT_MS * 1000) {
-                s_enabled = false;
-                was_enabled = false;
-                stop_motors();
-                ESP_LOGE(TAG, "REACQUIRE TIMEOUT: safety stop");
             }
         }
 
-        if (now_us - last_report_us >= 500000) {
+        if (!s_enabled) {
+            line_state_known = false;
+            line_candidate_frames = 0;
+        } else if (result_updated) {
+            if (!line_state_known) {
+                line_state_known = true;
+                last_line_valid = line_valid;
+                line_candidate_valid = line_valid;
+                line_candidate_frames = 0;
+            } else if (line_valid == last_line_valid) {
+                line_candidate_valid = line_valid;
+                line_candidate_frames = 0;
+            } else {
+                if (line_valid == line_candidate_valid) {
+                    line_candidate_frames++;
+                } else {
+                    line_candidate_valid = line_valid;
+                    line_candidate_frames = 1;
+                }
+                if (line_candidate_frames >= LINE_EVENT_CONFIRM_FRAMES) {
+                    last_line_valid = line_valid;
+                    line_candidate_frames = 0;
+                    if (line_valid) {
+                        ESP_LOGW(TAG, "LINE FOUND conf=%d", result.confidence);
+                    } else {
+                        ESP_LOGW(
+                            TAG,
+                            "LINE LOST: state=%s holding A=%d B=%d D=%d; X=stop",
+                            state_name(state), current_a_duty,
+                            current_b_duty, current_d_duty);
+                    }
+                }
+            }
+        }
+
+        if (now_us - last_report_us >=
+            (int64_t)FOLLOW_STATUS_INTERVAL_MS * 1000) {
             ESP_LOGI(TAG,
-                     "FOLLOW_STATUS enabled=%d state=%s line=%d confidence=%d path=%d big=%d turn=%d angle=%d turn_conf=%d corner=%d,%d lateral=%d heading=%d error=%d filtered=%d near=%d far=%d base=%d correction=%d wheel_a=%d wheel_d=%d fresh=%d",
-                     s_enabled, state_name(state), result.found,
-                     result.confidence, result.path_point_count,
-                     result.big_turn, result.turn_direction,
-                     result.turn_angle_deg, result.turn_confidence,
-                     result.corner_x, result.corner_y,
-                     result.lateral_error, result.heading_error,
-                     result.steering_error, filtered_error,
-                     result.near_x, result.far_x,
-                     current_base, current_correction,
-                     current_a_duty, current_d_duty,
-                     frame_fresh);
+                     "FOLLOW en=%d state=%s line=%d conf=%d corner=%d,%d angle=%d dir=%d base=%d A=%d B=%d D=%d advance=%ld/%ld fresh=%d",
+                     s_enabled, state_name(state), line_valid,
+                     result.confidence, result.corner_x, result.corner_y,
+                     result.turn_angle_deg, result.turn_direction,
+                     current_base, current_a_duty, current_b_duty,
+                     current_d_duty, (long)advance_a_counts,
+                     (long)advance_d_counts, frame_fresh);
             last_report_us = now_us;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -543,6 +717,8 @@ esp_err_t camera_line_follow_init(void)
                             "PWM channel failed");
     }
     stop_motors();
+    ESP_RETURN_ON_ERROR(configure_encoders(), TAG,
+                        "encoder initialization failed");
 
     const esp_err_t uart_error = uart_driver_install(UART_NUM_0, 1024, 0, 0,
                                                       NULL, 0);
@@ -554,6 +730,13 @@ esp_err_t camera_line_follow_init(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGW(TAG, "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG,0/1");
+    ESP_LOGW(TAG,
+             "TEST MODE: line loss holds the last command; X/SPACE to stop");
+    ESP_LOGI(TAG,
+             "Profile: track=%d min=%d max=%d trigger_y=%d advance=%d@%d spin=%d reacquire=%d",
+             FOLLOW_BASE_DUTY, FOLLOW_INNER_MIN_DUTY, FOLLOW_MAX_DUTY,
+             TURN_TRIGGER_Y, TURN_ADVANCE_COUNTS, TURN_ADVANCE_DUTY,
+             TURN_SPIN_DUTY, REACQUIRE_SPIN_DUTY);
     return ESP_OK;
 }
 

@@ -107,6 +107,15 @@ static void draw_cross(uint8_t *pixels, size_t width, size_t height,
     }
 }
 
+static void draw_corner_marker(uint8_t *pixels, size_t width, size_t height,
+                               int x, int y, uint16_t color)
+{
+    for (int offset = -4; offset <= 4; ++offset) {
+        set_pixel(pixels, width, height, x + offset, y, color);
+        set_pixel(pixels, width, height, x, y + offset, color);
+    }
+}
+
 static void draw_line(uint8_t *pixels, size_t width, size_t height,
                       int x0, int y0, int x1, int y1, uint16_t color)
 {
@@ -616,6 +625,7 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
     const uint16_t near_fit_color = 0xffe0;
     const uint16_t far_fit_color = 0xfd20;
     const uint16_t corner_color = 0x001f;
+    const uint16_t trigger_color = 0x07ff;
     memset(s_mask, 0, width * height);
     if (result->found) {
         for (size_t index = 0; index < best_pixel_count; ++index) {
@@ -642,8 +652,6 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
                       path[result->path_point_count - 1].x,
                       path[result->path_point_count - 1].y,
                       far_fit_color);
-            draw_cross(pixels, width, height,
-                       result->corner_x, result->corner_y, corner_color);
         }
     }
     horizontal_line(pixels, width, height, ROI_Y_MIN,
@@ -652,4 +660,10 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
                     ROI_X_MIN, ROI_X_MAX - 1, roi_color);
     vertical_line(pixels, width, height, (int)width / 2,
                   ROI_Y_MIN, ROI_Y_MAX - 1, target_color);
+    horizontal_line(pixels, width, height, LINE_VISION_TURN_TRIGGER_Y,
+                    ROI_X_MIN, ROI_X_MAX - 1, trigger_color);
+    if (result->found && result->big_turn) {
+        draw_corner_marker(pixels, width, height,
+                           result->corner_x, result->corner_y, corner_color);
+    }
 }

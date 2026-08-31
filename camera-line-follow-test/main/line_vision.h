@@ -6,6 +6,8 @@
 
 #include "esp_err.h"
 
+#define LINE_VISION_TURN_TRIGGER_Y 21
+
 typedef struct {
     bool found;
     bool big_turn;

@@ -63,7 +63,6 @@ static portMUX_TYPE s_slot_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t s_received_frames;
 static volatile uint32_t s_displayed_frames;
 static volatile uint32_t s_dropped_frames;
-static volatile uint32_t s_line_frames;
 static bool s_capture_core_reported;
 static uint8_t s_rgb_debug_pixels[RGB_DEBUG_BYTES];
 static uint8_t s_rgb_debug_mask[RGB_DEBUG_MASK_BYTES];
@@ -278,7 +277,6 @@ static void frame_display_task(void *argument)
     int64_t last_rgb_debug_us = 0;
     int64_t last_tft_preview_us = 0;
     int64_t latest_frame_age_ms = 0;
-    int64_t maximum_frame_age_ms = 0;
 
     while (true) {
         if (xQueueReceive(s_frame_queue, &slot_index, portMAX_DELAY) != pdPASS) {
@@ -321,9 +319,6 @@ static void frame_display_task(void *argument)
             line_vision_process(s_decoded_frame, output.width, output.height,
                                 &vision_result);
             camera_line_follow_submit(&vision_result);
-            if (vision_result.found) {
-                s_line_frames++;
-            }
             processed_frames++;
             const int64_t debug_now_us = esp_timer_get_time();
             if (debug_now_us - last_tft_preview_us >=
@@ -353,21 +348,15 @@ static void frame_display_task(void *argument)
 
         const int64_t now_us = esp_timer_get_time();
         latest_frame_age_ms = (now_us - captured_at_us) / 1000;
-        if (latest_frame_age_ms > maximum_frame_age_ms) {
-            maximum_frame_age_ms = latest_frame_age_ms;
-        }
-        if (now_us - last_report_us >= 1000000) {
+        if (now_us - last_report_us >= 3000000) {
             ESP_LOGI(TAG,
-                     "FRAME_STATUS received=%lu processed=%lu displayed=%lu dropped=%lu line=%lu age=%lldms max_age=%lldms",
+                     "FRAME rx=%lu processed=%lu lcd=%lu dropped=%lu age=%lldms",
                      (unsigned long)s_received_frames,
                      (unsigned long)processed_frames,
                      (unsigned long)s_displayed_frames,
                      (unsigned long)s_dropped_frames,
-                     (unsigned long)s_line_frames,
-                     (long long)latest_frame_age_ms,
-                     (long long)maximum_frame_age_ms);
+                     (long long)latest_frame_age_ms);
             last_report_us = now_us;
-            maximum_frame_age_ms = latest_frame_age_ms;
         }
         /* Let IDLE1 run even when the input queue remains continuously full. */
         vTaskDelay(1);
