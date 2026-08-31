@@ -121,12 +121,14 @@ static void emit_rgb_debug_frame(const uint8_t *raw_pixels,
         line_vision_get_rgb_thresholds();
     const int line_length = snprintf(
         s_rgb_debug_line, sizeof(s_rgb_debug_line),
-        "@RGB,%lu,%d,%d,%u,%u,%u,%d,%d,%d,%d,%d,%s,%s\n",
+        "@RGB,%lu,%d,%d,%u,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s\n",
         (unsigned long)++s_rgb_debug_sequence,
         RGB_DEBUG_WIDTH, RGB_DEBUG_HEIGHT,
         thresholds.red, thresholds.green, thresholds.blue,
         result->found, result->confidence, result->steering_error,
-        result->near_x, result->far_x,
+        result->near_x, result->far_x, result->big_turn,
+        result->turn_direction, result->turn_angle_deg,
+        result->turn_confidence, result->corner_y,
         s_rgb_debug_b64, s_mask_debug_b64);
     if (line_length > 0 && line_length < (int)sizeof(s_rgb_debug_line)) {
         uart_write_bytes(UART_NUM_0, s_rgb_debug_line, line_length);

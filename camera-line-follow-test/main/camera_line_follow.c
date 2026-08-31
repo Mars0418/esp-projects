@@ -45,6 +45,27 @@
 #define FOLLOW_MIN_CONFIDENCE 30
 #define STEERING_SIGN -1
 
+#define TURN_CONFIRM_FRAMES 3
+#define TURN_TRIGGER_Y 31
+#define TURN_APPROACH_DUTY 130
+#define TURN_APPROACH_TIMEOUT_MS 1800
+#define PIVOT_INNER_REVERSE_DUTY 165
+#define PIVOT_OUTER_FORWARD_DUTY 210
+#define PIVOT_MIN_TIME_MS 250
+#define PIVOT_MAX_TIME_MS 1200
+#define REACQUIRE_PIVOT_DUTY 145
+#define REACQUIRE_TIMEOUT_MS 1000
+#define REACQUIRE_STABLE_FRAMES 3
+#define REACQUIRE_LATERAL_LIMIT 350
+#define REACQUIRE_HEADING_LIMIT 550
+
+typedef enum {
+    FOLLOW_STATE_TRACK,
+    FOLLOW_STATE_APPROACH_TURN,
+    FOLLOW_STATE_PIVOT,
+    FOLLOW_STATE_REACQUIRE,
+} follow_state_t;
+
 typedef struct {
     gpio_num_t pwm;
     gpio_num_t in1;
@@ -110,6 +131,32 @@ static void drive_forward(int a_duty, int d_duty)
     motor_prepare(&s_motor_b, 0, 0);
     motor_prepare(&s_motor_d, -1, d_duty);
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+}
+
+static void drive_pivot(int physical_direction, int inner_duty, int outer_duty)
+{
+    if (physical_direction > 0) {
+        /* Right turn: right/A is inner and reverses, left/D drives forward. */
+        motor_prepare(&s_motor_a, 1, inner_duty);
+        motor_prepare(&s_motor_d, -1, outer_duty);
+    } else {
+        /* Left turn: left/D is inner and reverses, right/A drives forward. */
+        motor_prepare(&s_motor_a, -1, outer_duty);
+        motor_prepare(&s_motor_d, 1, inner_duty);
+    }
+    motor_prepare(&s_motor_b, 0, 0);
+    ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+}
+
+static const char *state_name(follow_state_t state)
+{
+    switch (state) {
+    case FOLLOW_STATE_TRACK: return "TRACK";
+    case FOLLOW_STATE_APPROACH_TURN: return "APPROACH";
+    case FOLLOW_STATE_PIVOT: return "PIVOT";
+    case FOLLOW_STATE_REACQUIRE: return "REACQUIRE";
+    default: return "UNKNOWN";
+    }
 }
 
 static void process_uart_line(void)
@@ -200,6 +247,14 @@ static void control_task(void *argument)
     int current_correction = 0;
     int current_a_duty = 0;
     int current_d_duty = 0;
+    follow_state_t state = FOLLOW_STATE_TRACK;
+    int turn_candidate_direction = 0;
+    int turn_candidate_frames = 0;
+    int latched_turn_direction = 0;
+    int stable_frames = 0;
+    int64_t state_started_us = 0;
+    int64_t last_turn_seen_us = 0;
+    bool was_enabled = false;
     int64_t last_report_us = 0;
     stop_motors();
 
@@ -219,8 +274,28 @@ static void control_task(void *argument)
             now_us - frame_us <= (int64_t)FOLLOW_FRAME_TIMEOUT_MS * 1000;
         const bool line_valid = result.found &&
                                 result.confidence >= FOLLOW_MIN_CONFIDENCE;
-        if (!s_enabled || !frame_fresh || !line_valid) {
+
+        if (s_enabled && !was_enabled) {
+            state = FOLLOW_STATE_TRACK;
+            state_started_us = now_us;
+            turn_candidate_direction = 0;
+            turn_candidate_frames = 0;
+            latched_turn_direction = 0;
+            stable_frames = 0;
+            last_turn_seen_us = 0;
+            filtered_error = 0;
+            integral_error = 0;
+            filter_initialized = false;
+        }
+        was_enabled = s_enabled;
+
+        if (!s_enabled || !frame_fresh) {
             stop_motors();
+            if (!frame_fresh && s_enabled) {
+                s_enabled = false;
+                was_enabled = false;
+                ESP_LOGE(TAG, "CAMERA FRAME STALE: safety stop");
+            }
             filtered_error = 0;
             integral_error = 0;
             filter_initialized = false;
@@ -228,68 +303,205 @@ static void control_task(void *argument)
             current_correction = 0;
             current_a_duty = 0;
             current_d_duty = 0;
+            state = FOLLOW_STATE_TRACK;
         } else if (sequence != processed_sequence) {
-            const int signed_error = STEERING_SIGN * result.steering_error;
-            int previous_filtered_error = filtered_error;
-            if (!filter_initialized) {
-                filtered_error = signed_error;
-                previous_filtered_error = filtered_error;
-                filter_initialized = true;
-            } else {
-                filtered_error =
-                    (3 * filtered_error + signed_error) / 4;
+            const bool corner_valid = result.big_turn &&
+                                      result.turn_confidence >= 50 &&
+                                      result.turn_direction != 0;
+            if (corner_valid) {
+                last_turn_seen_us = now_us;
             }
-            const int derivative = filtered_error - previous_filtered_error;
-            const int control_error = abs(filtered_error) <=
-                                              FOLLOW_ERROR_DEADBAND
-                                          ? 0
-                                          : filtered_error;
-            if (control_error == 0) {
-                integral_error = integral_error * 3 / 4;
-            } else {
-                if ((control_error > 0 && integral_error < 0) ||
-                    (control_error < 0 && integral_error > 0)) {
-                    integral_error /= 2;
+
+            if (state == FOLLOW_STATE_TRACK) {
+                if (corner_valid) {
+                    if (turn_candidate_direction == result.turn_direction) {
+                        turn_candidate_frames++;
+                    } else {
+                        turn_candidate_direction = result.turn_direction;
+                        turn_candidate_frames = 1;
+                    }
+                    if (turn_candidate_frames >= TURN_CONFIRM_FRAMES) {
+                        latched_turn_direction =
+                            STEERING_SIGN * turn_candidate_direction;
+                        state = FOLLOW_STATE_APPROACH_TURN;
+                        state_started_us = now_us;
+                        ESP_LOGW(TAG,
+                                 "TURN CONFIRMED visual=%d physical=%d angle=%d corner_y=%d",
+                                 turn_candidate_direction,
+                                 latched_turn_direction,
+                                 result.turn_angle_deg, result.corner_y);
+                    }
+                } else {
+                    turn_candidate_frames = 0;
+                    turn_candidate_direction = 0;
                 }
-                integral_error = clamp_int(
-                    integral_error + control_error,
-                    -FOLLOW_INTEGRAL_LIMIT, FOLLOW_INTEGRAL_LIMIT);
+            } else if (state == FOLLOW_STATE_APPROACH_TURN) {
+                if (corner_valid &&
+                    STEERING_SIGN * result.turn_direction ==
+                        latched_turn_direction &&
+                    result.corner_y <= TURN_TRIGGER_Y) {
+                    state = FOLLOW_STATE_PIVOT;
+                    state_started_us = now_us;
+                    stable_frames = 0;
+                    ESP_LOGW(TAG,
+                             "PIVOT START: corner reached y=%d angle=%d direction=%d",
+                             result.corner_y, result.turn_angle_deg,
+                             latched_turn_direction);
+                } else if ((!line_valid && last_turn_seen_us > 0 &&
+                            now_us - last_turn_seen_us <= 500000) ||
+                           now_us - state_started_us >=
+                               (int64_t)TURN_APPROACH_TIMEOUT_MS * 1000) {
+                    state = FOLLOW_STATE_PIVOT;
+                    state_started_us = now_us;
+                    stable_frames = 0;
+                    ESP_LOGW(TAG,
+                             "PIVOT START: confirmed corner passed near ROI");
+                }
+            } else if (state == FOLLOW_STATE_PIVOT ||
+                       state == FOLLOW_STATE_REACQUIRE) {
+                const bool aligned = line_valid && !result.big_turn &&
+                    abs(result.lateral_error) <= REACQUIRE_LATERAL_LIMIT &&
+                    abs(result.heading_error) <= REACQUIRE_HEADING_LIMIT;
+                stable_frames = aligned ? stable_frames + 1 : 0;
             }
-            const int target_correction = clamp_int(
-                control_error * 70 / 1000 + integral_error / 1000 +
-                    derivative * 3 / 1000,
-                -FOLLOW_CORRECTION_MAX, FOLLOW_CORRECTION_MAX);
-            const int correction = clamp_int(
-                target_correction,
-                current_correction - FOLLOW_CORRECTION_STEP,
-                current_correction + FOLLOW_CORRECTION_STEP);
-            const int confidence_base = result.confidence < 50
-                                            ? FOLLOW_LOW_CONFIDENCE_DUTY
-                                            : FOLLOW_BASE_DUTY;
-            const int turn_slowdown =
-                clamp_int(abs(control_error) * 20 / 1000, 0, 20);
-            const int base = confidence_base - turn_slowdown;
-            const int a_duty = clamp_int(base - correction,
-                                         FOLLOW_INNER_MIN_DUTY,
-                                         FOLLOW_MAX_DUTY);
-            const int d_duty = clamp_int(base + correction,
-                                         FOLLOW_INNER_MIN_DUTY,
-                                         FOLLOW_MAX_DUTY);
-            current_base = base;
-            current_correction = correction;
-            current_a_duty = a_duty;
-            current_d_duty = d_duty;
-            drive_forward(a_duty, d_duty);
+
+            if ((state == FOLLOW_STATE_TRACK ||
+                 state == FOLLOW_STATE_APPROACH_TURN) && line_valid) {
+                const int signed_error =
+                    STEERING_SIGN * result.steering_error;
+                int previous_filtered_error = filtered_error;
+                if (!filter_initialized) {
+                    filtered_error = signed_error;
+                    previous_filtered_error = filtered_error;
+                    filter_initialized = true;
+                } else {
+                    filtered_error =
+                        (3 * filtered_error + signed_error) / 4;
+                }
+                const int derivative =
+                    filtered_error - previous_filtered_error;
+                const int control_error =
+                    abs(filtered_error) <= FOLLOW_ERROR_DEADBAND
+                        ? 0
+                        : filtered_error;
+                if (control_error == 0) {
+                    integral_error = integral_error * 3 / 4;
+                } else {
+                    if ((control_error > 0 && integral_error < 0) ||
+                        (control_error < 0 && integral_error > 0)) {
+                        integral_error /= 2;
+                    }
+                    integral_error = clamp_int(
+                        integral_error + control_error,
+                        -FOLLOW_INTEGRAL_LIMIT, FOLLOW_INTEGRAL_LIMIT);
+                }
+                const int target_correction = clamp_int(
+                    control_error * 70 / 1000 + integral_error / 1000 +
+                        derivative * 3 / 1000,
+                    -FOLLOW_CORRECTION_MAX, FOLLOW_CORRECTION_MAX);
+                const int correction = clamp_int(
+                    target_correction,
+                    current_correction - FOLLOW_CORRECTION_STEP,
+                    current_correction + FOLLOW_CORRECTION_STEP);
+                const int confidence_base =
+                    state == FOLLOW_STATE_APPROACH_TURN
+                        ? TURN_APPROACH_DUTY
+                        : (result.confidence < 50
+                               ? FOLLOW_LOW_CONFIDENCE_DUTY
+                               : FOLLOW_BASE_DUTY);
+                const int turn_slowdown =
+                    clamp_int(abs(control_error) * 20 / 1000, 0, 20);
+                const int base = confidence_base - turn_slowdown;
+                const int inner_min =
+                    state == FOLLOW_STATE_APPROACH_TURN
+                        ? 75
+                        : FOLLOW_INNER_MIN_DUTY;
+                const int a_duty = clamp_int(base - correction,
+                                             inner_min,
+                                             FOLLOW_MAX_DUTY);
+                const int d_duty = clamp_int(base + correction,
+                                             inner_min,
+                                             FOLLOW_MAX_DUTY);
+                current_base = base;
+                current_correction = correction;
+                current_a_duty = a_duty;
+                current_d_duty = d_duty;
+                drive_forward(a_duty, d_duty);
+            } else if ((state == FOLLOW_STATE_TRACK ||
+                        state == FOLLOW_STATE_APPROACH_TURN) &&
+                       !line_valid) {
+                stop_motors();
+                current_base = 0;
+                current_correction = 0;
+                current_a_duty = 0;
+                current_d_duty = 0;
+            }
             processed_sequence = sequence;
+        }
+
+        if (s_enabled && frame_fresh && state == FOLLOW_STATE_PIVOT) {
+            drive_pivot(latched_turn_direction,
+                        PIVOT_INNER_REVERSE_DUTY,
+                        PIVOT_OUTER_FORWARD_DUTY);
+            current_base = 0;
+            current_correction = latched_turn_direction;
+            if (latched_turn_direction > 0) {
+                current_a_duty = -PIVOT_INNER_REVERSE_DUTY;
+                current_d_duty = PIVOT_OUTER_FORWARD_DUTY;
+            } else {
+                current_a_duty = PIVOT_OUTER_FORWARD_DUTY;
+                current_d_duty = -PIVOT_INNER_REVERSE_DUTY;
+            }
+            const int64_t pivot_age_us = now_us - state_started_us;
+            if ((pivot_age_us >= (int64_t)PIVOT_MIN_TIME_MS * 1000 &&
+                 stable_frames >= REACQUIRE_STABLE_FRAMES) ||
+                pivot_age_us >= (int64_t)PIVOT_MAX_TIME_MS * 1000) {
+                state = FOLLOW_STATE_REACQUIRE;
+                state_started_us = now_us;
+                stable_frames = 0;
+                ESP_LOGW(TAG, "PIVOT -> REACQUIRE");
+            }
+        } else if (s_enabled && frame_fresh &&
+                   state == FOLLOW_STATE_REACQUIRE) {
+            drive_pivot(latched_turn_direction,
+                        REACQUIRE_PIVOT_DUTY,
+                        REACQUIRE_PIVOT_DUTY);
+            if (latched_turn_direction > 0) {
+                current_a_duty = -REACQUIRE_PIVOT_DUTY;
+                current_d_duty = REACQUIRE_PIVOT_DUTY;
+            } else {
+                current_a_duty = REACQUIRE_PIVOT_DUTY;
+                current_d_duty = -REACQUIRE_PIVOT_DUTY;
+            }
+            if (stable_frames >= REACQUIRE_STABLE_FRAMES) {
+                state = FOLLOW_STATE_TRACK;
+                state_started_us = now_us;
+                turn_candidate_frames = 0;
+                turn_candidate_direction = 0;
+                latched_turn_direction = 0;
+                filtered_error = 0;
+                integral_error = 0;
+                filter_initialized = false;
+                ESP_LOGW(TAG, "LINE REACQUIRED: normal tracking resumed");
+            } else if (now_us - state_started_us >=
+                       (int64_t)REACQUIRE_TIMEOUT_MS * 1000) {
+                s_enabled = false;
+                was_enabled = false;
+                stop_motors();
+                ESP_LOGE(TAG, "REACQUIRE TIMEOUT: safety stop");
+            }
         }
 
         if (now_us - last_report_us >= 500000) {
             ESP_LOGI(TAG,
-                     "FOLLOW_STATUS enabled=%d line=%d confidence=%d points=%d lateral=%d heading=%d error=%d filtered=%d integral=%d near=%d far=%d base=%d correction=%d wheel_a=%d wheel_d=%d fresh=%d",
-                     s_enabled, result.found, result.confidence,
-                     result.vector_point_count,
+                     "FOLLOW_STATUS enabled=%d state=%s line=%d confidence=%d path=%d big=%d turn=%d angle=%d turn_conf=%d corner=%d,%d lateral=%d heading=%d error=%d filtered=%d near=%d far=%d base=%d correction=%d wheel_a=%d wheel_d=%d fresh=%d",
+                     s_enabled, state_name(state), result.found,
+                     result.confidence, result.path_point_count,
+                     result.big_turn, result.turn_direction,
+                     result.turn_angle_deg, result.turn_confidence,
+                     result.corner_x, result.corner_y,
                      result.lateral_error, result.heading_error,
-                     result.steering_error, filtered_error, integral_error,
+                     result.steering_error, filtered_error,
                      result.near_x, result.far_x,
                      current_base, current_correction,
                      current_a_duty, current_d_duty,

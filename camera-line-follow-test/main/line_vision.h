@@ -8,12 +8,19 @@
 
 typedef struct {
     bool found;
+    bool big_turn;
     int near_x;
     int far_x;
     int lateral_error;
     int heading_error;
     int steering_error;
+    int turn_direction;
+    int turn_angle_deg;
+    int turn_confidence;
+    int corner_x;
+    int corner_y;
     int vector_point_count;
+    int path_point_count;
     int confidence;
     int threshold;
     int contrast;
