@@ -35,11 +35,14 @@
 #define RGB_DEBUG_HEIGHT      24
 #define RGB_DEBUG_INTERVAL_US 500000
 #define TFT_PREVIEW_INTERVAL_US 500000
+#define TUNER_INTERVAL_US     500000
+#define CALIBRATION_INTERVAL_US 1000000
 #define RGB_DEBUG_PIXELS      (RGB_DEBUG_WIDTH * RGB_DEBUG_HEIGHT)
 #define RGB_DEBUG_BYTES       (RGB_DEBUG_PIXELS * 2)
 #define RGB_DEBUG_MASK_BYTES  ((RGB_DEBUG_PIXELS + 7) / 8)
 #define RGB_DEBUG_B64_BYTES   (((RGB_DEBUG_BYTES + 2) / 3) * 4 + 1)
 #define MASK_DEBUG_B64_BYTES  (((RGB_DEBUG_MASK_BYTES + 2) / 3) * 4 + 1)
+#define TUNER_MASK_BYTES      ((DECODED_WIDTH * DECODED_HEIGHT + 7) / 8)
 
 typedef struct {
     uint8_t *data;
@@ -70,6 +73,11 @@ static unsigned char s_rgb_debug_b64[RGB_DEBUG_B64_BYTES];
 static unsigned char s_mask_debug_b64[MASK_DEBUG_B64_BYTES];
 static char s_rgb_debug_line[2560];
 static uint32_t s_rgb_debug_sequence;
+static uint8_t *s_tuner_mask;
+static char s_tuner_header[256];
+static uint32_t s_tuner_sequence;
+static char s_calibration_header[96];
+static uint32_t s_calibration_sequence;
 static int s_stream_width = 640;
 static int s_stream_height = 480;
 static int s_stream_fps = 15;
@@ -132,6 +140,65 @@ static void emit_rgb_debug_frame(const uint8_t *raw_pixels,
     if (line_length > 0 && line_length < (int)sizeof(s_rgb_debug_line)) {
         uart_write_bytes(UART_NUM_0, s_rgb_debug_line, line_length);
     }
+}
+
+static void emit_tuner_frame(const uint8_t *raw_pixels,
+                             size_t width, size_t height,
+                             const line_vision_result_t *result)
+{
+    const size_t pixel_count = width * height;
+    const size_t mask_bytes = (pixel_count + 7) / 8;
+    if (width != DECODED_WIDTH || height != DECODED_HEIGHT ||
+        mask_bytes > TUNER_MASK_BYTES) {
+        return;
+    }
+
+    memset(s_tuner_mask, 0, mask_bytes);
+    for (size_t index = 0; index < pixel_count; ++index) {
+        if (line_vision_pixel_selected(index)) {
+            s_tuner_mask[index / 8] |= (uint8_t)(1U << (index % 8));
+        }
+    }
+
+    const line_vision_rgb_thresholds_t thresholds =
+        line_vision_get_rgb_thresholds();
+    const int header_length = snprintf(
+        s_tuner_header, sizeof(s_tuner_header),
+        "@RGB565,%lu,%u,%u,%u,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u\n",
+        (unsigned long)++s_tuner_sequence,
+        (unsigned)width, (unsigned)height,
+        thresholds.red, thresholds.green, thresholds.blue,
+        result->found, result->confidence, result->steering_error,
+        result->near_x, result->far_x, result->big_turn,
+        result->turn_direction, result->turn_angle_deg,
+        result->turn_confidence, result->corner_y,
+        (unsigned)(pixel_count * 2), (unsigned)mask_bytes);
+    if (header_length <= 0 || header_length >= (int)sizeof(s_tuner_header)) {
+        return;
+    }
+
+    uart_write_bytes(UART_NUM_0, s_tuner_header, header_length);
+    uart_write_bytes(UART_NUM_0, raw_pixels, pixel_count * 2);
+    uart_write_bytes(UART_NUM_0, s_tuner_mask, mask_bytes);
+}
+
+static void emit_calibration_jpeg(const mjpeg_slot_t *slot)
+{
+    if (slot->format != UVC_FRAME_FORMAT_MJPEG || slot->length < 4) {
+        return;
+    }
+    const int header_length = snprintf(
+        s_calibration_header, sizeof(s_calibration_header),
+        "@CALJPEG,%lu,%u,%u,%u\n",
+        (unsigned long)++s_calibration_sequence,
+        (unsigned)slot->width, (unsigned)slot->height,
+        (unsigned)slot->length);
+    if (header_length <= 0 ||
+        header_length >= (int)sizeof(s_calibration_header)) {
+        return;
+    }
+    uart_write_bytes(UART_NUM_0, s_calibration_header, header_length);
+    uart_write_bytes(UART_NUM_0, slot->data, slot->length);
 }
 
 static void usb_library_task(void *argument)
@@ -275,6 +342,8 @@ static void frame_display_task(void *argument)
     uint32_t processed_frames = 0;
     int64_t last_report_us = esp_timer_get_time();
     int64_t last_rgb_debug_us = 0;
+    int64_t last_tuner_us = 0;
+    int64_t last_calibration_us = 0;
     int64_t last_tft_preview_us = 0;
     int64_t latest_frame_age_ms = 0;
 
@@ -283,6 +352,19 @@ static void frame_display_task(void *argument)
             continue;
         }
         const int64_t captured_at_us = s_slots[slot_index].captured_at_us;
+
+        if (camera_line_follow_calibration_enabled()) {
+            const int64_t calibration_now_us = esp_timer_get_time();
+            if (s_slots[slot_index].format == UVC_FRAME_FORMAT_MJPEG &&
+                calibration_now_us - last_calibration_us >=
+                    CALIBRATION_INTERVAL_US) {
+                emit_calibration_jpeg(&s_slots[slot_index]);
+                last_calibration_us = esp_timer_get_time();
+            }
+            release_mjpeg_slot(slot_index);
+            vTaskDelay(1);
+            continue;
+        }
 
         esp_jpeg_image_output_t output = {0};
         esp_err_t decode_error;
@@ -311,7 +393,8 @@ static void frame_display_task(void *argument)
         if (decode_error == ESP_OK && output.width == DECODED_WIDTH &&
             output.height == DECODED_HEIGHT) {
             const bool rgb_debug = camera_line_follow_debug_enabled();
-            if (rgb_debug) {
+            const bool tuner = camera_line_follow_tuner_enabled();
+            if (rgb_debug || tuner) {
                 memcpy(s_debug_raw_frame, s_decoded_frame,
                        DECODED_BUFFER_BYTES);
             }
@@ -321,7 +404,7 @@ static void frame_display_task(void *argument)
             camera_line_follow_submit(&vision_result);
             processed_frames++;
             const int64_t debug_now_us = esp_timer_get_time();
-            if (debug_now_us - last_tft_preview_us >=
+            if (!tuner && debug_now_us - last_tft_preview_us >=
                     TFT_PREVIEW_INTERVAL_US) {
                 const esp_err_t display_error =
                     camera_display_show_rotated_rgb565(
@@ -334,7 +417,12 @@ static void frame_display_task(void *argument)
                 }
                 last_tft_preview_us = debug_now_us;
             }
-            if (rgb_debug &&
+            if (tuner &&
+                debug_now_us - last_tuner_us >= TUNER_INTERVAL_US) {
+                emit_tuner_frame(s_debug_raw_frame, output.width,
+                                 output.height, &vision_result);
+                last_tuner_us = debug_now_us;
+            } else if (rgb_debug &&
                 debug_now_us - last_rgb_debug_us >= RGB_DEBUG_INTERVAL_US) {
                 emit_rgb_debug_frame(s_debug_raw_frame, output.width,
                                      output.height, &vision_result);
@@ -411,6 +499,11 @@ static esp_err_t initialize_frame_pipeline(void)
                                          MALLOC_CAP_SPIRAM |
                                          MALLOC_CAP_8BIT);
     if (s_debug_raw_frame == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_tuner_mask = heap_caps_malloc(TUNER_MASK_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_tuner_mask == NULL) {
         return ESP_ERR_NO_MEM;
     }
     s_jpeg_work_buffer = heap_caps_malloc(JPEG_WORK_BUFFER_BYTES,

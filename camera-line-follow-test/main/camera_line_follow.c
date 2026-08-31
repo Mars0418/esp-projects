@@ -51,6 +51,9 @@
 #define FOLLOW_STATUS_INTERVAL_MS 2000
 #define LINE_EVENT_CONFIRM_FRAMES 3
 #define STEERING_SIGN -1
+#define NORMAL_UART_BAUD 115200
+#define TUNER_UART_BAUD 921600
+#define TUNER_TX_DRAIN_TIMEOUT_MS 700
 
 #define TURN_CONFIRM_FRAMES 3
 #define TURN_CANDIDATE_X_TOLERANCE 24
@@ -111,6 +114,8 @@ static int64_t s_latest_frame_us;
 static uint32_t s_result_sequence;
 static bool s_enabled;
 static volatile bool s_debug_enabled;
+static volatile bool s_tuner_enabled;
+static volatile bool s_calibration_enabled;
 static char s_uart_line[64];
 static size_t s_uart_line_length;
 
@@ -279,7 +284,63 @@ static void process_uart_line(void)
         line_vision_set_rgb_thresholds((uint8_t)red, (uint8_t)green,
                                        (uint8_t)blue);
         ESP_LOGI(TAG, "RGB_THRESHOLDS r=%d g=%d b=%d", red, green, blue);
+    } else if (sscanf(s_uart_line, "TUNER,%d", &enabled) == 1) {
+        const bool tuner_enabled = enabled != 0;
+        if (tuner_enabled) {
+            s_enabled = false;
+            stop_motors();
+            s_debug_enabled = false;
+            s_tuner_enabled = false;
+            s_calibration_enabled = false;
+            esp_log_level_set("*", ESP_LOG_NONE);
+            uart_wait_tx_done(UART_NUM_0,
+                              pdMS_TO_TICKS(TUNER_TX_DRAIN_TIMEOUT_MS));
+            ESP_ERROR_CHECK(uart_set_baudrate(UART_NUM_0,
+                                               TUNER_UART_BAUD));
+            s_tuner_enabled = true;
+        } else {
+            s_tuner_enabled = false;
+            uart_wait_tx_done(UART_NUM_0,
+                              pdMS_TO_TICKS(TUNER_TX_DRAIN_TIMEOUT_MS));
+            ESP_ERROR_CHECK(uart_set_baudrate(UART_NUM_0,
+                                               NORMAL_UART_BAUD));
+            esp_log_level_set("*", ESP_LOG_INFO);
+            ESP_LOGI(TAG, "TUNER disabled; UART restored to %d",
+                     NORMAL_UART_BAUD);
+        }
+    } else if (sscanf(s_uart_line, "CALIB,%d", &enabled) == 1) {
+        const bool calibration_enabled = enabled != 0;
+        if (calibration_enabled) {
+            s_enabled = false;
+            stop_motors();
+            s_debug_enabled = false;
+            s_tuner_enabled = false;
+            s_calibration_enabled = false;
+            esp_log_level_set("*", ESP_LOG_NONE);
+            uart_wait_tx_done(UART_NUM_0,
+                              pdMS_TO_TICKS(TUNER_TX_DRAIN_TIMEOUT_MS));
+            ESP_ERROR_CHECK(uart_set_baudrate(UART_NUM_0,
+                                               TUNER_UART_BAUD));
+            s_calibration_enabled = true;
+        } else {
+            s_calibration_enabled = false;
+            uart_wait_tx_done(UART_NUM_0,
+                              pdMS_TO_TICKS(TUNER_TX_DRAIN_TIMEOUT_MS));
+            ESP_ERROR_CHECK(uart_set_baudrate(UART_NUM_0,
+                                               NORMAL_UART_BAUD));
+            esp_log_level_set("*", ESP_LOG_INFO);
+            ESP_LOGI(TAG, "CALIB disabled; UART restored to %d",
+                     NORMAL_UART_BAUD);
+        }
     } else if (sscanf(s_uart_line, "DEBUG,%d", &enabled) == 1) {
+        if (s_tuner_enabled || s_calibration_enabled) {
+            s_tuner_enabled = false;
+            s_calibration_enabled = false;
+            uart_wait_tx_done(UART_NUM_0,
+                              pdMS_TO_TICKS(TUNER_TX_DRAIN_TIMEOUT_MS));
+            ESP_ERROR_CHECK(uart_set_baudrate(UART_NUM_0,
+                                               NORMAL_UART_BAUD));
+        }
         s_debug_enabled = enabled != 0;
         if (s_debug_enabled) {
             ESP_LOGI(TAG, "RGB_DEBUG enabled=1; normal logs paused");
@@ -291,9 +352,10 @@ static void process_uart_line(void)
     } else if (strcmp(s_uart_line, "STATUS") == 0) {
         const line_vision_rgb_thresholds_t thresholds =
             line_vision_get_rgb_thresholds();
-        ESP_LOGI(TAG, "RGB_THRESHOLDS r=%u g=%u b=%u debug=%d",
+        ESP_LOGI(TAG,
+                 "RGB_THRESHOLDS r=%u g=%u b=%u debug=%d tuner=%d calib=%d",
                  thresholds.red, thresholds.green, thresholds.blue,
-                 s_debug_enabled);
+                 s_debug_enabled, s_tuner_enabled, s_calibration_enabled);
     }
     s_uart_line_length = 0;
 }
@@ -305,6 +367,11 @@ static void handle_uart_command(void)
     for (int index = 0; index < count; ++index) {
         const uint8_t value = input[index];
         if (value == 'f' || value == 'F') {
+            if (s_tuner_enabled || s_calibration_enabled) {
+                s_enabled = false;
+                stop_motors();
+                continue;
+            }
             line_vision_result_t result;
             int64_t frame_us;
             portENTER_CRITICAL(&s_result_lock);
@@ -807,7 +874,8 @@ esp_err_t camera_line_follow_init(void)
                                 6, NULL, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGW(TAG, "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG,0/1");
+    ESP_LOGW(TAG,
+             "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG,0/1 TUNER,0/1 CALIB,0/1");
     ESP_LOGW(TAG,
              "TEST MODE: line loss holds the last command; X/SPACE to stop");
     ESP_LOGI(TAG,
@@ -839,4 +907,14 @@ void camera_line_follow_camera_disconnected(void)
 bool camera_line_follow_debug_enabled(void)
 {
     return s_debug_enabled;
+}
+
+bool camera_line_follow_tuner_enabled(void)
+{
+    return s_tuner_enabled;
+}
+
+bool camera_line_follow_calibration_enabled(void)
+{
+    return s_calibration_enabled;
 }

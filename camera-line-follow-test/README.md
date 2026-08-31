@@ -73,6 +73,37 @@ UART0 使用 GPIO43/44、115200 baud。发送 `F` 启动，`X` 或空格停车�
 PWM 和 ADVANCE 编码器计数；
 `FRAME` 每 3 秒报告帧吞吐、丢帧和帧龄。
 
+### 交互式 RGB 阈值调节
+
+电脑端工具 `camera_threshold_tuner.py` 会同时显示完整 160x120 RGB565 原图和固件最终
+选中的 160x120 黑线连通域，并通过三个滑块实时发送 `RGB,r,g,b`。在仓库根目录运行：
+
+```powershell
+.\start_camera_threshold_tuner.ps1
+```
+
+也可以预选串口：
+
+```powershell
+.\start_camera_threshold_tuner.ps1 -Port COM15
+```
+
+连接时工具会先发送 `X` 保持电机停止，再发送 `TUNER,1`，将调参会话临时切换到
+921600 baud；退出时发送 `TUNER,0`，恢复普通日志使用的 115200 baud 并释放串口。
+完整 RGB565 图和二值 mask 使用带长度帧头的二进制协议，目标刷新率约 2fps。UART
+可以同时收发，滑块命令不会阻止 ESP32 上传画面；同一时刻不能再打开
+`idf.py monitor` 或其他串口助手。调参模式会暂停 TFT 刷新并始终保持电机停止。
+
+### 高分辨率棋盘格标定
+
+电脑端 `camera_extrinsic_calibrator.py` 使用独立的 `CALIB,1` 安全模式。该模式保持
+全部电机停止，暂停 TFT 和巡线处理，约每秒发送一张摄像头原始 640x480 MJPEG；退出
+后恢复 115200 baud。普通巡线分辨率仍是 160x120，不会长期增加视觉计算量。
+
+横向/纵向内角数指整块标定板上的完整内角数量，不是当前画面中可见的数量。每张被
+采纳的标定照片必须包含全部内角。完整操作和导出格式见仓库根目录
+`CAMERA_CALIBRATION.md`。
+
 ## 构建与测试
 
 ```powershell

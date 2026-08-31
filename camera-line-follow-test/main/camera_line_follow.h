@@ -9,3 +9,5 @@ esp_err_t camera_line_follow_init(void);
 void camera_line_follow_submit(const line_vision_result_t *result);
 void camera_line_follow_camera_disconnected(void);
 bool camera_line_follow_debug_enabled(void);
+bool camera_line_follow_tuner_enabled(void);
+bool camera_line_follow_calibration_enabled(void);
