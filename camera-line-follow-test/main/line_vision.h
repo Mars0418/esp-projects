@@ -6,7 +6,8 @@
 
 #include "esp_err.h"
 
-#define LINE_VISION_TURN_TRIGGER_Y 21
+/* The original 80x60 trigger was y=21. Vision now runs at 160x120. */
+#define LINE_VISION_TURN_TRIGGER_Y 42
 
 typedef struct {
     bool found;
@@ -16,6 +17,11 @@ typedef struct {
     int lateral_error;
     int heading_error;
     int steering_error;
+    bool steering_band_valid;
+    int steering_band_left_percent;
+    int steering_band_right_percent;
+    int steering_band_error;
+    int steering_band_pixel_count;
     int turn_direction;
     int turn_angle_deg;
     int turn_confidence;

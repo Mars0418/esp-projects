@@ -27,8 +27,8 @@
 #define MJPEG_SLOT_COUNT      2
 #define FRAME_QUEUE_LENGTH    1
 #define MJPEG_SLOT_CAPACITY   (256 * 1024)
-#define DECODED_WIDTH         80
-#define DECODED_HEIGHT        60
+#define DECODED_WIDTH         160
+#define DECODED_HEIGHT        120
 #define DECODED_BUFFER_BYTES  (DECODED_WIDTH * DECODED_HEIGHT * 2)
 #define JPEG_WORK_BUFFER_BYTES 8192
 #define RGB_DEBUG_WIDTH       32
@@ -74,7 +74,7 @@ static int s_stream_width = 640;
 static int s_stream_height = 480;
 static int s_stream_fps = 15;
 static enum uvc_frame_format s_stream_format = UVC_FRAME_FORMAT_MJPEG;
-static esp_jpeg_image_scale_t s_decode_scale = JPEG_IMAGE_SCALE_1_8;
+static esp_jpeg_image_scale_t s_decode_scale = JPEG_IMAGE_SCALE_1_4;
 
 static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot);
 
@@ -425,7 +425,8 @@ static esp_err_t initialize_frame_pipeline(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG,
-             "PIPELINE USB/control=core0 decode/vision=core1 queue=latest");
+             "PIPELINE USB/control=core0 decode/vision=core1 frame=%dx%d queue=latest",
+             DECODED_WIDTH, DECODED_HEIGHT);
     return ESP_OK;
 }
 
@@ -443,10 +444,10 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 30, JPEG_IMAGE_SCALE_0},
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 15, JPEG_IMAGE_SCALE_0},
         {UVC_FRAME_FORMAT_YUYV, 320, 240, 15, JPEG_IMAGE_SCALE_0},
-        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, JPEG_IMAGE_SCALE_1_4},
-        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 15, JPEG_IMAGE_SCALE_1_4},
-        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_8},
-        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_8},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, JPEG_IMAGE_SCALE_1_2},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 15, JPEG_IMAGE_SCALE_1_2},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_4},
     };
     uvc_error_t result = UVC_ERROR_INVALID_MODE;
     for (size_t profile = 0;

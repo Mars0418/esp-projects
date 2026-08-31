@@ -39,14 +39,13 @@
 #define ENCODER_COUNTS_PER_REV 406
 
 #define PWM_MAX_DUTY 1023
-#define FOLLOW_BASE_DUTY 150
-#define FOLLOW_LOW_CONFIDENCE_DUTY 140
-#define FOLLOW_INNER_MIN_DUTY 120
-#define FOLLOW_MAX_DUTY 170
+#define FOLLOW_BASE_DUTY 160
+#define FOLLOW_LOW_CONFIDENCE_DUTY 150
+#define FOLLOW_INNER_MIN_DUTY 140
+#define FOLLOW_MAX_DUTY 190
 #define FOLLOW_CORRECTION_MAX 20
 #define FOLLOW_CORRECTION_STEP 5
 #define FOLLOW_ERROR_DEADBAND 45
-#define FOLLOW_INTEGRAL_LIMIT 1500
 #define FOLLOW_FRAME_TIMEOUT_MS 600
 #define FOLLOW_MIN_CONFIDENCE 30
 #define FOLLOW_STATUS_INTERVAL_MS 2000
@@ -54,20 +53,24 @@
 #define STEERING_SIGN -1
 
 #define TURN_CONFIRM_FRAMES 3
+#define TURN_CANDIDATE_X_TOLERANCE 24
+#define TURN_CANDIDATE_Y_TOLERANCE 20
+#define TURN_TRACK_Y_TOLERANCE 18
+#define TURN_LOST_TRIGGER_MARGIN 18
+#define TURN_LOST_GRACE_MS 300
 /* Raw ROI y=12..57 runs from near to far; lower y is closer to the car. */
 #define TURN_TRIGGER_Y LINE_VISION_TURN_TRIGGER_Y
-#define TURN_APPROACH_DUTY 140
+#define TURN_APPROACH_DUTY 160
 #define TURN_APPROACH_TIMEOUT_MS 2500
-#define TURN_ADVANCE_DUTY 80
-#define TURN_ADVANCE_COUNTS (ENCODER_COUNTS_PER_REV * 3 / 2)
-#define TURN_ADVANCE_TIMEOUT_MS 3000
-#define TURN_SPIN_DUTY 80
+#define TURN_ADVANCE_DUTY 150
+#define TURN_ADVANCE_COUNTS (ENCODER_COUNTS_PER_REV * 4)
+#define TURN_ADVANCE_TIMEOUT_MS 10000
+#define TURN_SPIN_DUTY 95
 #define PIVOT_MIN_TIME_MS 250
 #define PIVOT_MAX_TIME_MS 1200
-#define REACQUIRE_SPIN_DUTY 80
+#define REACQUIRE_SPIN_DUTY 95
 #define REACQUIRE_STABLE_FRAMES 3
-#define REACQUIRE_LATERAL_LIMIT 350
-#define REACQUIRE_HEADING_LIMIT 550
+#define REACQUIRE_STEERING_LIMIT 250
 
 typedef enum {
     FOLLOW_STATE_TRACK,
@@ -339,12 +342,29 @@ static void handle_uart_command(void)
     }
 }
 
+static void start_advance(follow_state_t *state, int64_t *state_started_us,
+                          int32_t *start_a_count, int32_t *start_d_count,
+                          int32_t *a_counts, int32_t *d_counts,
+                          int corner_y, int instant_direction,
+                          int locked_direction, const char *reason)
+{
+    *state = FOLLOW_STATE_ADVANCE_TO_TURN;
+    *state_started_us = esp_timer_get_time();
+    *start_a_count = s_encoder_a.count;
+    *start_d_count = s_encoder_d.count;
+    *a_counts = 0;
+    *d_counts = 0;
+    ESP_LOGW(TAG,
+             "TURN TRIGGER reason=%s y=%d instant=%d locked=%d; ADVANCE target=%d",
+             reason, corner_y, instant_direction, locked_direction,
+             TURN_ADVANCE_COUNTS);
+}
+
 static void control_task(void *argument)
 {
     (void)argument;
     uint32_t processed_sequence = 0;
     int filtered_error = 0;
-    int integral_error = 0;
     bool filter_initialized = false;
     int current_base = 0;
     int current_correction = 0;
@@ -354,7 +374,12 @@ static void control_task(void *argument)
     follow_state_t state = FOLLOW_STATE_TRACK;
     int turn_candidate_direction = 0;
     int turn_candidate_frames = 0;
+    int turn_candidate_x = -1;
+    int turn_candidate_y = -1;
     int latched_turn_direction = 0;
+    int last_corner_x = -1;
+    int last_corner_y = -1;
+    int64_t last_corner_seen_us = 0;
     int stable_frames = 0;
     int64_t state_started_us = 0;
     int32_t advance_start_a_count = 0;
@@ -392,10 +417,14 @@ static void control_task(void *argument)
             state_started_us = now_us;
             turn_candidate_direction = 0;
             turn_candidate_frames = 0;
+            turn_candidate_x = -1;
+            turn_candidate_y = -1;
             latched_turn_direction = 0;
+            last_corner_x = -1;
+            last_corner_y = -1;
+            last_corner_seen_us = 0;
             stable_frames = 0;
             filtered_error = 0;
-            integral_error = 0;
             filter_initialized = false;
             advance_start_a_count = s_encoder_a.count;
             advance_start_d_count = s_encoder_d.count;
@@ -412,7 +441,6 @@ static void control_task(void *argument)
                 ESP_LOGE(TAG, "CAMERA FRAME STALE: safety stop");
             }
             filtered_error = 0;
-            integral_error = 0;
             filter_initialized = false;
             current_base = 0;
             current_correction = 0;
@@ -428,32 +456,44 @@ static void control_task(void *argument)
                 result.corner_x >= 0 && result.corner_y >= 0;
             if (state == FOLLOW_STATE_TRACK) {
                 if (corner_valid) {
-                    if (turn_candidate_direction == result.turn_direction) {
+                    const bool same_candidate =
+                        turn_candidate_frames > 0 &&
+                        turn_candidate_direction == result.turn_direction &&
+                        abs(turn_candidate_x - result.corner_x) <=
+                            TURN_CANDIDATE_X_TOLERANCE &&
+                        abs(turn_candidate_y - result.corner_y) <=
+                            TURN_CANDIDATE_Y_TOLERANCE;
+                    if (same_candidate) {
                         turn_candidate_frames++;
                     } else {
                         turn_candidate_direction = result.turn_direction;
                         turn_candidate_frames = 1;
                     }
+                    turn_candidate_x = result.corner_x;
+                    turn_candidate_y = result.corner_y;
                     if (turn_candidate_frames >= TURN_CONFIRM_FRAMES) {
                         latched_turn_direction =
                             STEERING_SIGN * turn_candidate_direction;
                         state_started_us = now_us;
+                        last_corner_x = result.corner_x;
+                        last_corner_y = result.corner_y;
+                        last_corner_seen_us = now_us;
                         ESP_LOGW(TAG,
-                                 "TURN CONFIRMED visual=%d physical=%d angle=%d corner_y=%d",
+                                 "TURN CONFIRMED visual=%d physical=%d frames=%d angle=%d corner=%d,%d",
                                  turn_candidate_direction,
                                  latched_turn_direction,
-                                 result.turn_angle_deg, result.corner_y);
+                                 turn_candidate_frames,
+                                 result.turn_angle_deg,
+                                 result.corner_x, result.corner_y);
                         if (result.corner_y <= TURN_TRIGGER_Y) {
-                            state = FOLLOW_STATE_ADVANCE_TO_TURN;
-                            advance_start_a_count = s_encoder_a.count;
-                            advance_start_d_count = s_encoder_d.count;
-                            advance_a_counts = 0;
-                            advance_d_counts = 0;
-                            ESP_LOGW(TAG,
-                                     "TURN TRIGGER y=%d locked_dir=%d; ADVANCE target=%d",
-                                     result.corner_y,
-                                     latched_turn_direction,
-                                     TURN_ADVANCE_COUNTS);
+                            start_advance(
+                                &state, &state_started_us,
+                                &advance_start_a_count,
+                                &advance_start_d_count,
+                                &advance_a_counts, &advance_d_counts,
+                                result.corner_y,
+                                STEERING_SIGN * result.turn_direction,
+                                latched_turn_direction, "visible");
                         } else {
                             state = FOLLOW_STATE_APPROACH_TURN;
                         }
@@ -461,76 +501,92 @@ static void control_task(void *argument)
                 } else {
                     turn_candidate_frames = 0;
                     turn_candidate_direction = 0;
+                    turn_candidate_x = -1;
+                    turn_candidate_y = -1;
                 }
             } else if (state == FOLLOW_STATE_APPROACH_TURN) {
-                /* Direction was already confirmed; later noisy direction
-                 * estimates must not cancel the locked turn. */
-                if (corner_position_valid &&
-                    result.corner_y <= TURN_TRIGGER_Y) {
-                    state = FOLLOW_STATE_ADVANCE_TO_TURN;
-                    state_started_us = now_us;
-                    advance_start_a_count = s_encoder_a.count;
-                    advance_start_d_count = s_encoder_d.count;
-                    advance_a_counts = 0;
-                    advance_d_counts = 0;
-                    ESP_LOGW(TAG,
-                             "TURN TRIGGER y=%d instant_dir=%d locked_dir=%d; ADVANCE target=%d",
-                             result.corner_y,
-                             STEERING_SIGN * result.turn_direction,
-                             latched_turn_direction,
-                             TURN_ADVANCE_COUNTS);
+                /* Follow the already confirmed near corner. A later corner
+                 * is farther down the path and must not replace this one. */
+                const bool tracked_corner =
+                    corner_valid && corner_position_valid &&
+                    (last_corner_y < 0 ||
+                     result.corner_y <=
+                         last_corner_y + TURN_TRACK_Y_TOLERANCE);
+                if (tracked_corner) {
+                    last_corner_x = result.corner_x;
+                    last_corner_y = result.corner_y;
+                    last_corner_seen_us = now_us;
+                }
+
+                if (tracked_corner && result.corner_y <= TURN_TRIGGER_Y) {
+                    start_advance(
+                        &state, &state_started_us,
+                        &advance_start_a_count, &advance_start_d_count,
+                        &advance_a_counts, &advance_d_counts,
+                        result.corner_y,
+                        STEERING_SIGN * result.turn_direction,
+                        latched_turn_direction, "visible");
+                } else if (last_corner_seen_us > 0 &&
+                           last_corner_y <=
+                               TURN_TRIGGER_Y + TURN_LOST_TRIGGER_MARGIN &&
+                           now_us - last_corner_seen_us >=
+                               (int64_t)TURN_LOST_GRACE_MS * 1000) {
+                    start_advance(
+                        &state, &state_started_us,
+                        &advance_start_a_count, &advance_start_d_count,
+                        &advance_a_counts, &advance_d_counts,
+                        last_corner_y, 0, latched_turn_direction,
+                        "lost-near-line");
                 } else if (now_us - state_started_us >=
                            (int64_t)TURN_APPROACH_TIMEOUT_MS * 1000) {
                     state = FOLLOW_STATE_TRACK;
                     state_started_us = now_us;
                     turn_candidate_direction = 0;
                     turn_candidate_frames = 0;
+                    turn_candidate_x = -1;
+                    turn_candidate_y = -1;
                     latched_turn_direction = 0;
+                    last_corner_x = -1;
+                    last_corner_y = -1;
+                    last_corner_seen_us = 0;
                     ESP_LOGW(TAG,
                              "APPROACH TIMEOUT: corner did not reach y<=%d; resume TRACK",
                              TURN_TRIGGER_Y);
                 }
-            } else if (state == FOLLOW_STATE_PIVOT ||
-                       state == FOLLOW_STATE_REACQUIRE) {
-                const bool aligned = line_valid && !result.big_turn &&
-                    abs(result.lateral_error) <= REACQUIRE_LATERAL_LIMIT &&
-                    abs(result.heading_error) <= REACQUIRE_HEADING_LIMIT;
+            } else if (state == FOLLOW_STATE_REACQUIRE) {
+                const int previous_stable_frames = stable_frames;
+                const bool aligned =
+                    line_valid &&
+                    abs(result.steering_error) <= REACQUIRE_STEERING_LIMIT;
                 stable_frames = aligned ? stable_frames + 1 : 0;
+                if (aligned && previous_stable_frames == 0) {
+                    ESP_LOGW(TAG,
+                             "REACQUIRE CANDIDATE: pause to confirm steer=%d big=%d",
+                             result.steering_error, result.big_turn);
+                } else if (!aligned && previous_stable_frames > 0) {
+                    ESP_LOGW(TAG,
+                             "REACQUIRE CANDIDATE LOST: resume spin steer=%d line=%d",
+                             result.steering_error, line_valid);
+                }
             }
 
             if ((state == FOLLOW_STATE_TRACK ||
                  state == FOLLOW_STATE_APPROACH_TURN) && line_valid) {
                 const int signed_error =
                     STEERING_SIGN * result.steering_error;
-                int previous_filtered_error = filtered_error;
                 if (!filter_initialized) {
                     filtered_error = signed_error;
-                    previous_filtered_error = filtered_error;
                     filter_initialized = true;
                 } else {
                     filtered_error =
-                        (3 * filtered_error + signed_error) / 4;
+                        (filtered_error + 3 * signed_error) / 4;
                 }
-                const int derivative =
-                    filtered_error - previous_filtered_error;
                 const int control_error =
                     abs(filtered_error) <= FOLLOW_ERROR_DEADBAND
                         ? 0
                         : filtered_error;
-                if (control_error == 0) {
-                    integral_error = integral_error * 3 / 4;
-                } else {
-                    if ((control_error > 0 && integral_error < 0) ||
-                        (control_error < 0 && integral_error > 0)) {
-                        integral_error /= 2;
-                    }
-                    integral_error = clamp_int(
-                        integral_error + control_error,
-                        -FOLLOW_INTEGRAL_LIMIT, FOLLOW_INTEGRAL_LIMIT);
-                }
                 const int target_correction = clamp_int(
-                    control_error * 70 / 1000 + integral_error / 1000 +
-                        derivative * 3 / 1000,
+                    control_error * FOLLOW_CORRECTION_MAX / 1000,
                     -FOLLOW_CORRECTION_MAX, FOLLOW_CORRECTION_MAX);
                 const int correction = clamp_int(
                     target_correction,
@@ -616,20 +672,35 @@ static void control_task(void *argument)
             }
         } else if (s_enabled && frame_fresh &&
                    state == FOLLOW_STATE_REACQUIRE) {
-            drive_three_wheel_spin(latched_turn_direction,
-                                   REACQUIRE_SPIN_DUTY);
-            signed_spin_duties(latched_turn_direction,
-                               REACQUIRE_SPIN_DUTY,
-                               &current_a_duty, &current_b_duty,
-                               &current_d_duty);
+            if (stable_frames > 0) {
+                /* Stop on the first plausible line so rotation cannot sweep
+                 * past it while waiting for three confirmation frames. */
+                stop_motors();
+                current_base = 0;
+                current_correction = 0;
+                current_a_duty = 0;
+                current_b_duty = 0;
+                current_d_duty = 0;
+            } else {
+                drive_three_wheel_spin(latched_turn_direction,
+                                       REACQUIRE_SPIN_DUTY);
+                signed_spin_duties(latched_turn_direction,
+                                   REACQUIRE_SPIN_DUTY,
+                                   &current_a_duty, &current_b_duty,
+                                   &current_d_duty);
+            }
             if (stable_frames >= REACQUIRE_STABLE_FRAMES) {
                 state = FOLLOW_STATE_TRACK;
                 state_started_us = now_us;
                 turn_candidate_frames = 0;
                 turn_candidate_direction = 0;
+                turn_candidate_x = -1;
+                turn_candidate_y = -1;
                 latched_turn_direction = 0;
+                last_corner_x = -1;
+                last_corner_y = -1;
+                last_corner_seen_us = 0;
                 filtered_error = 0;
-                integral_error = 0;
                 filter_initialized = false;
                 ESP_LOGW(TAG, "LINE REACQUIRED: normal tracking resumed");
             }
@@ -673,10 +744,17 @@ static void control_task(void *argument)
         if (now_us - last_report_us >=
             (int64_t)FOLLOW_STATUS_INTERVAL_MS * 1000) {
             ESP_LOGI(TAG,
-                     "FOLLOW en=%d state=%s line=%d conf=%d corner=%d,%d angle=%d dir=%d base=%d A=%d B=%d D=%d advance=%ld/%ld fresh=%d",
+                     "FOLLOW en=%d state=%s line=%d conf=%d band=%d/%d band_err=%d steer=%d corner=%d,%d angle=%d dir=%d locked=%d last=%d,%d stable=%d base=%d A=%d B=%d D=%d advance=%ld/%ld fresh=%d",
                      s_enabled, state_name(state), line_valid,
-                     result.confidence, result.corner_x, result.corner_y,
+                     result.confidence,
+                     result.steering_band_left_percent,
+                     result.steering_band_right_percent,
+                     result.steering_band_error,
+                     result.steering_error,
+                     result.corner_x, result.corner_y,
                      result.turn_angle_deg, result.turn_direction,
+                     latched_turn_direction, last_corner_x, last_corner_y,
+                     stable_frames,
                      current_base, current_a_duty, current_b_duty,
                      current_d_duty, (long)advance_a_counts,
                      (long)advance_d_counts, frame_fresh);

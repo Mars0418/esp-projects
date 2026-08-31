@@ -9,25 +9,36 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-#define ROI_X_MIN 3
-#define ROI_X_MAX 77
+#define ROI_X_MIN 6
+#define ROI_X_MAX 154
 /* Camera/TFT mounting makes increasing raw y point farther ahead. */
-#define ROI_Y_MIN 12
-#define ROI_Y_MAX 58
-#define NEAR_Y_MAX 28
-#define CENTER_X_MIN 16
-#define CENTER_X_MAX 64
+#define ROI_Y_MIN 24
+#define ROI_Y_MAX 116
+#define NEAR_Y_MAX 56
+#define CENTER_X_MIN 32
+#define CENTER_X_MAX 128
 
-#define PATH_SAMPLE_COUNT 14
+#define PATH_SAMPLE_COUNT 20
 #define MIN_PATH_SAMPLES 7
 #define MIN_SEGMENT_SAMPLES 3
+#define CORNER_LOCAL_RADIUS 4
+#define CORNER_MIN_VECTOR_LENGTH_SQUARED 25
 #define BIG_TURN_MIN_ANGLE_DEG 45
 #define BIG_TURN_MIN_IMPROVEMENT_PERCENT 25
-#define COMPONENT_AREA_SCORE_CAP 75
+#define COMPONENT_AREA_SCORE_CAP 300
+#define MIN_COMPONENT_AREA 24
+#define MIN_COMPONENT_SPAN 8
+#define MIN_COMPONENT_NEAR_PIXELS 6
+#define MIN_COMPONENT_CENTER_PIXELS 6
+#define ANCHOR_Y_TOLERANCE 4
 
 #define DEFAULT_RED_THRESHOLD 105
 #define DEFAULT_GREEN_THRESHOLD 105
 #define DEFAULT_BLUE_THRESHOLD 105
+
+/* Desired line position relative to the 160-pixel image center. Calibrate
+ * this after placing the chassis at the desired lateral offset. */
+#define STEERING_TARGET_X_OFFSET_PX 0
 
 typedef struct {
     int x;
@@ -52,6 +63,12 @@ static int clamp_int(int value, int minimum, int maximum)
     if (value < minimum) return minimum;
     if (value > maximum) return maximum;
     return value;
+}
+
+static int steering_target_x(size_t width)
+{
+    return clamp_int((int)width / 2 + STEERING_TARGET_X_OFFSET_PX,
+                     ROI_X_MIN, ROI_X_MAX - 1);
 }
 
 static void pixel_rgb(const uint8_t *pixels, size_t index,
@@ -252,7 +269,7 @@ static int find_near_anchor(size_t width, size_t best_pixel_count,
     for (size_t index = 0; index < best_pixel_count; ++index) {
         const int pixel = s_best_component[index];
         const int y = pixel / (int)width;
-        if (y <= best_min_y + 2) {
+        if (y <= best_min_y + ANCHOR_Y_TOLERANCE) {
             x_sum += pixel % (int)width;
             count++;
         }
@@ -264,7 +281,7 @@ static int find_near_anchor(size_t width, size_t best_pixel_count,
     for (size_t index = 0; index < best_pixel_count; ++index) {
         const int pixel = s_best_component[index];
         const int y = pixel / (int)width;
-        if (y > best_min_y + 2) continue;
+        if (y > best_min_y + ANCHOR_Y_TOLERANCE) continue;
         const int distance = abs(pixel % (int)width - target_x) +
                              2 * (y - best_min_y);
         if (distance < best_distance) {
@@ -353,56 +370,118 @@ static int trace_component_path(size_t width, size_t height,
     return sample_count;
 }
 
+static void calculate_steering_band(size_t width, size_t height,
+                                    size_t best_pixel_count,
+                                    line_vision_result_t *result)
+{
+    const int band_y_min = (int)height / 5;
+    const int band_y_max = (int)height * 2 / 5;
+    const int center_x = steering_target_x(width);
+    const int half_width = center_x > (int)width - 1 - center_x
+                               ? center_x
+                               : (int)width - 1 - center_x;
+    int left_pixels = 0;
+    int right_pixels = 0;
+    int64_t weighted_offset = 0;
+
+    for (size_t index = 0; index < best_pixel_count; ++index) {
+        const int pixel = s_best_component[index];
+        const int x = pixel % (int)width;
+        const int y = pixel / (int)width;
+        if (y < band_y_min || y >= band_y_max) continue;
+
+        if (x < center_x) {
+            left_pixels++;
+        } else {
+            right_pixels++;
+        }
+        /* This is a distance-weighted left/right occupancy balance. */
+        weighted_offset += x - center_x;
+    }
+
+    const int pixel_count = left_pixels + right_pixels;
+    result->steering_band_pixel_count = pixel_count;
+    if (pixel_count < 6) return;
+
+    result->steering_band_valid = true;
+    result->steering_band_left_percent =
+        (left_pixels * 100 + pixel_count / 2) / pixel_count;
+    result->steering_band_right_percent =
+        100 - result->steering_band_left_percent;
+    result->steering_band_error = clamp_int(
+        (int)(weighted_offset * 1000 / ((int64_t)pixel_count * half_width)),
+        -1000, 1000);
+}
+
 static void detect_corner(const path_point_t *points, int count,
                           line_vision_result_t *result)
 {
     if (count < MIN_PATH_SAMPLES) return;
-    const int64_t single_residual = segment_residual(points, 0, count - 1);
-    int best_split = -1;
-    int64_t best_residual = INT64_MAX;
+
+    /* Evaluate local direction changes from near to far. A global two-line
+     * fit tends to select the second bend when two corners are visible. */
     for (int split = MIN_SEGMENT_SAMPLES - 1;
          split <= count - MIN_SEGMENT_SAMPLES; ++split) {
-        const int64_t residual = segment_residual(points, 0, split) +
-                                 segment_residual(points, split, count - 1);
-        if (residual < best_residual) {
-            best_residual = residual;
-            best_split = split;
+        const int first = split - CORNER_LOCAL_RADIUS > 0
+                              ? split - CORNER_LOCAL_RADIUS
+                              : 0;
+        const int last = split + CORNER_LOCAL_RADIUS < count - 1
+                             ? split + CORNER_LOCAL_RADIUS
+                             : count - 1;
+        if (split - first + 1 < MIN_SEGMENT_SAMPLES ||
+            last - split + 1 < MIN_SEGMENT_SAMPLES) {
+            continue;
         }
+
+        const int64_t single_residual =
+            segment_residual(points, first, last);
+        const int64_t split_residual =
+            segment_residual(points, first, split) +
+            segment_residual(points, split, last);
+        if (single_residual <= 0) continue;
+
+        int near_dx;
+        int near_dy;
+        int far_dx;
+        int far_dy;
+        segment_vector(points, first, split, &near_dx, &near_dy);
+        segment_vector(points, split, last, &far_dx, &far_dy);
+        const int64_t near_length_squared =
+            (int64_t)near_dx * near_dx + (int64_t)near_dy * near_dy;
+        const int64_t far_length_squared =
+            (int64_t)far_dx * far_dx + (int64_t)far_dy * far_dy;
+        if (near_length_squared < CORNER_MIN_VECTOR_LENGTH_SQUARED ||
+            far_length_squared < CORNER_MIN_VECTOR_LENGTH_SQUARED) {
+            continue;
+        }
+
+        const int64_t cross =
+            (int64_t)near_dx * far_dy - (int64_t)near_dy * far_dx;
+        const int64_t dot =
+            (int64_t)near_dx * far_dx + (int64_t)near_dy * far_dy;
+        const int angle_deg = (int)lroundf(
+            atan2f((float)llabs(cross), (float)dot) *
+            180.0f / 3.14159265f);
+        const int improvement = clamp_int(
+            (int)((single_residual - split_residual) * 100 /
+                  single_residual),
+            0, 100);
+        const int direction = cross < 0 ? 1 : (cross > 0 ? -1 : 0);
+        if (angle_deg < BIG_TURN_MIN_ANGLE_DEG ||
+            improvement < BIG_TURN_MIN_IMPROVEMENT_PERCENT ||
+            direction == 0) {
+            continue;
+        }
+
+        result->turn_angle_deg = angle_deg;
+        result->turn_direction = direction;
+        result->corner_x = points[split].x;
+        result->corner_y = points[split].y;
+        result->turn_confidence = clamp_int(
+            (angle_deg - 20) * 2 + improvement / 2, 0, 100);
+        result->big_turn = true;
+        return;
     }
-    if (best_split < 0 || single_residual <= 0) return;
-
-    int near_dx;
-    int near_dy;
-    int far_dx;
-    int far_dy;
-    segment_vector(points, 0, best_split, &near_dx, &near_dy);
-    segment_vector(points, best_split, count - 1, &far_dx, &far_dy);
-    const int64_t near_length_squared =
-        (int64_t)near_dx * near_dx + (int64_t)near_dy * near_dy;
-    const int64_t far_length_squared =
-        (int64_t)far_dx * far_dx + (int64_t)far_dy * far_dy;
-    if (near_length_squared < 16 || far_length_squared < 16) return;
-
-    const int64_t cross =
-        (int64_t)near_dx * far_dy - (int64_t)near_dy * far_dx;
-    const int64_t dot =
-        (int64_t)near_dx * far_dx + (int64_t)near_dy * far_dy;
-    const int angle_deg = (int)lroundf(
-        atan2f((float)llabs(cross), (float)dot) * 180.0f / 3.14159265f);
-    const int improvement = clamp_int(
-        (int)((single_residual - best_residual) * 100 /
-              (single_residual > 0 ? single_residual : 1)),
-        0, 100);
-
-    result->turn_angle_deg = angle_deg;
-    result->turn_direction = cross < 0 ? 1 : (cross > 0 ? -1 : 0);
-    result->corner_x = points[best_split].x;
-    result->corner_y = points[best_split].y;
-    result->turn_confidence = clamp_int(
-        (angle_deg - 20) * 2 + improvement / 2, 0, 100);
-    result->big_turn = angle_deg >= BIG_TURN_MIN_ANGLE_DEG &&
-                       improvement >= BIG_TURN_MIN_IMPROVEMENT_PERCENT &&
-                       result->turn_direction != 0;
 }
 
 esp_err_t line_vision_init(size_t width, size_t height)
@@ -551,9 +630,12 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
             const int vertical_span = max_y - min_y + 1;
             const int score = area + near_count * 8 +
                               vertical_span * 10 + center_count * 2;
-            if (area >= 8 && area < (int)sample_count * 2 / 5 &&
-                vertical_span >= 4 && near_count >= 3 &&
-                center_count >= 3 && score > best_score) {
+            if (area >= MIN_COMPONENT_AREA &&
+                area < (int)sample_count * 2 / 5 &&
+                vertical_span >= MIN_COMPONENT_SPAN &&
+                near_count >= MIN_COMPONENT_NEAR_PIXELS &&
+                center_count >= MIN_COMPONENT_CENTER_PIXELS &&
+                score > best_score) {
                 best_score = score;
                 best_area = area;
                 best_min_y = min_y;
@@ -569,6 +651,7 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
 
     path_point_t path[PATH_SAMPLE_COUNT] = {0};
     if (best_score > 0) {
+        calculate_steering_band(width, height, best_pixel_count, result);
         result->path_point_count = trace_component_path(
             width, height, best_pixel_count, best_min_y, path);
         result->vector_point_count = result->path_point_count;
@@ -583,9 +666,13 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
             int near_dx;
             int near_dy;
             segment_vector(path, 0, near_last, &near_dx, &near_dy);
-            const int image_center = (int)width / 2;
+            const int image_center = steering_target_x(width);
+            const int image_half_width =
+                image_center > (int)width - 1 - image_center
+                    ? image_center
+                    : (int)width - 1 - image_center;
             result->lateral_error = clamp_int(
-                (result->near_x - image_center) * 1000 / image_center,
+                (result->near_x - image_center) * 1000 / image_half_width,
                 -1000, 1000);
             result->heading_error = near_dy == 0
                                         ? (near_dx >= 0 ? 1000 : -1000)
@@ -596,6 +683,9 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
                 (65 * result->lateral_error + 35 * result->heading_error) /
                     100,
                 -1000, 1000);
+            if (result->steering_band_valid) {
+                result->steering_error = result->steering_band_error;
+            }
             detect_corner(path, result->path_point_count, result);
         }
 
@@ -604,9 +694,9 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
             span * 35 / (ROI_Y_MAX - ROI_Y_MIN), 0, 35);
         const int area_confidence = clamp_int(
             best_area * 20 / COMPONENT_AREA_SCORE_CAP, 0, 20);
-        const int near_confidence = best_near_count >= 5 ? 20 : 10;
+        const int near_confidence = best_near_count >= 10 ? 20 : 10;
         const int center_confidence = clamp_int(
-            best_center_count * 10 / 10, 0, 10);
+            best_center_count * 10 / 20, 0, 10);
         const int path_confidence = clamp_int(
             result->path_point_count * 15 / PATH_SAMPLE_COUNT, 0, 15);
         result->confidence = clamp_int(
@@ -626,6 +716,7 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
     const uint16_t far_fit_color = 0xfd20;
     const uint16_t corner_color = 0x001f;
     const uint16_t trigger_color = 0x07ff;
+    const uint16_t steering_band_color = 0x7bef;
     memset(s_mask, 0, width * height);
     if (result->found) {
         for (size_t index = 0; index < best_pixel_count; ++index) {
@@ -658,8 +749,12 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
                     ROI_X_MIN, ROI_X_MAX - 1, roi_color);
     horizontal_line(pixels, width, height, ROI_Y_MAX - 1,
                     ROI_X_MIN, ROI_X_MAX - 1, roi_color);
-    vertical_line(pixels, width, height, (int)width / 2,
+    vertical_line(pixels, width, height, steering_target_x(width),
                   ROI_Y_MIN, ROI_Y_MAX - 1, target_color);
+    horizontal_line(pixels, width, height, (int)height / 5,
+                    ROI_X_MIN, ROI_X_MAX - 1, steering_band_color);
+    horizontal_line(pixels, width, height, (int)height * 2 / 5,
+                    ROI_X_MIN, ROI_X_MAX - 1, steering_band_color);
     horizontal_line(pixels, width, height, LINE_VISION_TURN_TRIGGER_Y,
                     ROI_X_MIN, ROI_X_MAX - 1, trigger_color);
     if (result->found && result->big_turn) {
