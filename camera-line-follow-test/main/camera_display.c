@@ -19,7 +19,7 @@
 #define TFT_WIDTH      128
 #define TFT_HEIGHT     160
 #define TFT_SPI_HZ     (20 * 1000 * 1000)
-#define TFT_SPI_CHUNK  4096
+#define TFT_SPI_CHUNK  8192
 
 static const char *TAG = "CAMERA_TFT";
 static spi_device_handle_t s_tft;
@@ -71,7 +71,10 @@ static esp_err_t tft_pixel_data(const void *data, size_t length)
             .length = chunk * 8,
             .tx_buffer = bytes + offset,
         };
-        result = spi_device_polling_transmit(s_tft, &transaction);
+        /* The framebuffer is DMA-capable. Interrupt-driven transfers let
+         * the higher-priority USB camera task run on core 0 while SPI is
+         * shifting the pixels, instead of busy-waiting for every chunk. */
+        result = spi_device_transmit(s_tft, &transaction);
         if (result != ESP_OK) {
             break;
         }
@@ -215,17 +218,28 @@ esp_err_t camera_display_show_rotated_rgb565(const uint8_t *pixels,
                         height <= TFT_WIDTH, ESP_ERR_INVALID_ARG, TAG,
                         "invalid camera frame dimensions");
 
-    const size_t x_offset = (TFT_WIDTH - height) / 2;
-    const size_t y_offset = (TFT_HEIGHT - width) / 2;
+    size_t scale = TFT_WIDTH / height;
+    const size_t vertical_scale = TFT_HEIGHT / width;
+    if (vertical_scale < scale) scale = vertical_scale;
+    if (scale == 0) scale = 1;
+    const size_t x_offset = (TFT_WIDTH - height * scale) / 2;
+    const size_t y_offset = (TFT_HEIGHT - width * scale) / 2;
+    memset(s_framebuffer, 0, TFT_WIDTH * TFT_HEIGHT * 2);
     for (size_t source_y = 0; source_y < height; ++source_y) {
         for (size_t source_x = 0; source_x < width; ++source_x) {
-            const size_t destination_x = x_offset + height - 1 - source_y;
-            const size_t destination_y = y_offset + source_x;
             const size_t source_offset = 2 * (source_y * width + source_x);
-            const size_t destination_offset =
-                2 * (destination_y * TFT_WIDTH + destination_x);
-            s_framebuffer[destination_offset] = pixels[source_offset];
-            s_framebuffer[destination_offset + 1] = pixels[source_offset + 1];
+            const uint16_t color =
+                ((uint16_t)pixels[source_offset] << 8) |
+                pixels[source_offset + 1];
+            const size_t rotated_x = height - 1 - source_y;
+            const size_t rotated_y = source_x;
+            for (size_t scale_y = 0; scale_y < scale; ++scale_y) {
+                for (size_t scale_x = 0; scale_x < scale; ++scale_x) {
+                    set_pixel(x_offset + rotated_x * scale + scale_x,
+                              y_offset + rotated_y * scale + scale_y,
+                              color);
+                }
+            }
         }
     }
     return tft_send_frame();
