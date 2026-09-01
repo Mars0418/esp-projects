@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$Port = "",
-    [switch]$SelfTest
+    [string]$Output = "camera-datasets",
+    [ValidateRange(0, 2147483647)]
+    [int]$Count = 0
 )
 
 Set-StrictMode -Version Latest
@@ -13,7 +15,6 @@ $pythonCommands = Get-Command python -CommandType Application -All `
 if ($pythonCommands) {
     $candidates += $pythonCommands | ForEach-Object { $_.Source }
 }
-
 if ($env:CONDA_PREFIX) {
     $candidates += Join-Path $env:CONDA_PREFIX "python.exe"
 }
@@ -42,8 +43,7 @@ foreach ($candidate in @($candidates | Select-Object -Unique)) {
     try {
         $ErrorActionPreference = "Continue"
         $dependencyOutput = & $candidate -c `
-            "import cv2, numpy, PIL, serial, tkinter; assert hasattr(serial, 'Serial')" `
-            2>&1
+            "import serial; assert hasattr(serial, 'Serial')" 2>&1
         $dependencyExitCode = $LASTEXITCODE
     } catch {
         $dependencyExitCode = 1
@@ -57,18 +57,15 @@ foreach ($candidate in @($candidates | Select-Object -Unique)) {
 }
 
 if (-not $selectedPython) {
-    throw "No Python environment with OpenCV, NumPy, Pillow, pyserial and tkinter was found."
+    throw "No Python environment with pyserial was found."
 }
 
-$toolPath = Join-Path $PSScriptRoot "camera_extrinsic_calibrator.py"
-$toolArguments = @($toolPath)
+$toolPath = Join-Path $PSScriptRoot "camera_training_collector.py"
+$arguments = @($toolPath, "--output", $Output, "--count", $Count)
 if ($Port) {
-    $toolArguments += @("--port", $Port.ToUpperInvariant())
-}
-if ($SelfTest) {
-    $toolArguments += "--self-test"
+    $arguments += @("--port", $Port.ToUpperInvariant())
 }
 
 Write-Host "Using Python at $selectedPython"
-& $selectedPython @toolArguments
+& $selectedPython @arguments
 exit $LASTEXITCODE

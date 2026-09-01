@@ -31,7 +31,9 @@ from serial.tools import list_ports
 CALIBRATION_MAGIC = b"@CALJPEG,"
 CALIBRATION_BAUD = 921600
 MAX_JPEG_BYTES = 256 * 1024
+CALIBRATION_IMAGE_SIZE = (640, 480)
 RUNTIME_IMAGE_SIZE = (160, 120)
+IMAGE_ROTATION_DEGREES = 180
 
 
 @dataclass(frozen=True)
@@ -295,6 +297,11 @@ def detect_chessboard(
     return normalize_corner_order(corners, pattern_size)
 
 
+def rotate_to_first_person(image: np.ndarray) -> np.ndarray:
+    """Convert the upside-down sensor image to the vehicle's forward view."""
+    return cv2.rotate(image, cv2.ROTATE_180)
+
+
 def calibrate_intrinsics(
     image_points: list[np.ndarray],
     image_size: tuple[int, int],
@@ -546,7 +553,7 @@ def calibration_to_dict(
         @ runtime_to_calibration
     )
     return {
-        "format_version": 1,
+        "format_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "coordinate_system": {
             "origin": "vehicle center estimate",
@@ -562,6 +569,12 @@ def calibration_to_dict(
             "runtime_width": RUNTIME_IMAGE_SIZE[0],
             "runtime_height": RUNTIME_IMAGE_SIZE[1],
             "runtime_mapping": "edge-aligned full-frame scaling",
+            "orientation": "vehicle_first_person",
+            "sensor_to_first_person_rotation_degrees": IMAGE_ROTATION_DEGREES,
+            "runtime_raw_sensor_to_first_person": {
+                "x": "runtime_width - 1 - x_raw",
+                "y": "runtime_height - 1 - y_raw",
+            },
         },
         "checkerboard": {
             "inner_columns": intrinsic.pattern_size[0],
@@ -657,7 +670,7 @@ class CalibrationApp:
         self.columns_var = tk.IntVar(value=10)
         self.rows_var = tk.IntVar(value=7)
         self.square_size_var = tk.DoubleVar(value=25.0)
-        self.bottom_distance_var = tk.DoubleVar(value=180.0)
+        self.bottom_distance_var = tk.DoubleVar(value=80.0)
         self.connection_var = tk.StringVar(value="未连接")
         self.detection_var = tk.StringVar(value="等待图像")
         self.samples_var = tk.StringVar(value="内参样本：0")
@@ -833,7 +846,14 @@ class CalibrationApp:
                 f"JPEG 尺寸不一致：header={frame.width}x{frame.height}"
             )
             return
-        rgb = cv2.cvtColor(decoded_bgr, cv2.COLOR_BGR2RGB)
+        if (frame.width, frame.height) != CALIBRATION_IMAGE_SIZE:
+            self.connection_var.set(
+                f"标定必须使用 {CALIBRATION_IMAGE_SIZE[0]}x"
+                f"{CALIBRATION_IMAGE_SIZE[1]}，当前为 {frame.width}x{frame.height}"
+            )
+            return
+        first_person_bgr = rotate_to_first_person(decoded_bgr)
+        rgb = cv2.cvtColor(first_person_bgr, cv2.COLOR_BGR2RGB)
         self.latest_rgb = rgb
         self.latest_image_size = (frame.width, frame.height)
         try:
@@ -848,11 +868,11 @@ class CalibrationApp:
             cv2.drawChessboardCorners(overlay, pattern, corners, True)
             self.detection_var.set(
                 f"已识别 {pattern[0]} x {pattern[1]} 个内角；"
-                f"原图={frame.width}x{frame.height} sequence={frame.sequence}"
+                f"第一视角={frame.width}x{frame.height} sequence={frame.sequence}"
             )
         else:
             self.detection_var.set(
-                f"未识别棋盘格；原图={frame.width}x{frame.height} "
+                f"未识别棋盘格；第一视角={frame.width}x{frame.height} "
                 f"sequence={frame.sequence}"
             )
         if self.ground is not None:
@@ -1063,12 +1083,13 @@ def run_self_test() -> None:
         camera_matrix,
         distortion,
     )
+    bottom_center_distance_mm = 80.0
     ground = calibrate_ground_plane(
         corners.astype(np.float32),
         intrinsic,
         pattern_size,
         square_size,
-        180.0,
+        bottom_center_distance_mm,
     )
     bottom_raw = np.asarray(ground.bottom_reference_pixel).reshape(1, 1, 2)
     bottom_undistorted = cv2.undistortPoints(
@@ -1081,8 +1102,15 @@ def run_self_test() -> None:
         ground.homography_undistorted_pixel_to_vehicle_mm,
         bottom_undistorted,
     )[0]
-    if not np.allclose(bottom_vehicle, [0.0, 180.0], atol=1e-4):
+    if not np.allclose(
+        bottom_vehicle, [0.0, bottom_center_distance_mm], atol=1e-4
+    ):
         raise AssertionError(f"bottom reference mismatch: {bottom_vehicle}")
+    test_image = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+    if not np.array_equal(
+        rotate_to_first_person(test_image), test_image[::-1, ::-1]
+    ):
+        raise AssertionError("180-degree first-person rotation failed")
     x_mm, y_mm, valid = build_ground_lookup_table(intrinsic, ground)
     if x_mm.shape != (120, 160) or y_mm.shape != (120, 160):
         raise AssertionError("lookup table shape mismatch")

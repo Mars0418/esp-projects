@@ -17,3 +17,8 @@ course-materials/
 *.pyc
 __pycache__/
 .DS_Store
+
+# Local camera captures, derived datasets, and trained artifacts
+camera-datasets*/
+camera-training-export/
+camera-models/

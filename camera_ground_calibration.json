@@ -1,0 +1,154 @@
+{
+  "format_version": 2,
+  "created_utc": "2026-09-01T03:27:19.583801+00:00",
+  "coordinate_system": {
+    "origin": "vehicle center estimate",
+    "x_positive": "right in top view",
+    "y_positive": "forward/up in top view",
+    "heading_positive": "counter-clockwise",
+    "units": "millimeters"
+  },
+  "image": {
+    "calibration_width": 640,
+    "calibration_height": 480,
+    "calibration_pixel_format": "MJPEG decoded on PC",
+    "runtime_width": 160,
+    "runtime_height": 120,
+    "runtime_mapping": "edge-aligned full-frame scaling",
+    "orientation": "vehicle_first_person",
+    "sensor_to_first_person_rotation_degrees": 180,
+    "runtime_raw_sensor_to_first_person": {
+      "x": "runtime_width - 1 - x_raw",
+      "y": "runtime_height - 1 - y_raw"
+    }
+  },
+  "checkerboard": {
+    "inner_columns": 10,
+    "inner_rows": 7,
+    "square_size_mm": 25.0
+  },
+  "intrinsic": {
+    "sample_count": 23,
+    "rms_error_px": 0.4694338058141092,
+    "mean_reprojection_error_px": 0.05530638434235856,
+    "camera_matrix": [
+      [
+        260.8518930757396,
+        0.0,
+        315.54555420163217
+      ],
+      [
+        0.0,
+        272.35742922509576,
+        209.34836546795106
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "runtime_camera_matrix": [
+      [
+        64.90680907518404,
+        0.0,
+        78.51602991871599
+      ],
+      [
+        0.0,
+        67.66291039203841,
+        52.00930165070183
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "distortion_coefficients": [
+      0.07782426250573185,
+      -0.08770005022980089,
+      -0.017084224531112073,
+      -0.0005294657504962105,
+      0.01816482802239582
+    ]
+  },
+  "ground_extrinsic": {
+    "bottom_center_distance_mm": 80.0,
+    "bottom_reference_pixel": [
+      319.5,
+      479.0
+    ],
+    "bottom_reference_board_mm": [
+      -8.940946582980876,
+      -21.117288148151548
+    ],
+    "reprojection_error_px": 0.05320810350265883,
+    "homography_undistorted_pixel_to_vehicle_ground_mm": [
+      [
+        5.453037448992546,
+        0.03926190963909165,
+        -1763.1314036284898
+      ],
+      [
+        0.1968731698822476,
+        -1.9739024503249734,
+        1825.39441215132
+      ],
+      [
+        0.000991285253087717,
+        0.02054617341664865,
+        0.9999999999999999
+      ]
+    ],
+    "homography_vehicle_ground_mm_to_undistorted_pixel": [
+      [
+        0.17484135585280589,
+        0.16060778576029452,
+        15.095730482227951
+      ],
+      [
+        -0.0071418510093868865,
+        -0.031890511871968445,
+        45.620740377050765
+      ],
+      [
+        -2.6579948332018088e-05,
+        0.0004960198577119058,
+        0.04770418180559056
+      ]
+    ],
+    "runtime_homography_undistorted_pixel_to_vehicle_ground_mm": [
+      [
+        21.91503729500778,
+        0.15803743459768824,
+        -1763.1314036284898
+      ],
+      [
+        0.7912072676399762,
+        -7.945372047946742,
+        1825.39441215132
+      ],
+      [
+        0.0039838445076921455,
+        0.0827026644249975,
+        0.9999999999999999
+      ]
+    ],
+    "rotation_vector_board_to_camera": [
+      2.3595216729796427,
+      0.00976118079148874,
+      -0.04717180676243272
+    ],
+    "translation_vector_board_to_camera_mm": [
+      11.535532709431127,
+      114.44649154618835,
+      138.99523818462208
+    ],
+    "camera_position_vehicle_mm": [
+      3.3699902151169034,
+      84.23592788816704,
+      179.5403249998226
+    ]
+  }
+}

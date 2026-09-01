@@ -5,6 +5,9 @@ dedicated `CALIB,1` safe state in `camera-line-follow-test`. The motors remain
 stopped, TFT refresh and line processing pause, and the camera's original
 640x480 MJPEG frames are sent at about 1 fps over 921600 baud. Normal line
 following continues to use 160x120 images outside calibration mode.
+The camera sensor is mounted upside down, so every calibration frame is rotated
+180 degrees before preview, corner detection and calibration. All exported
+pixel coordinates therefore use the vehicle's first-person orientation.
 
 ## Parameters
 
@@ -15,8 +18,8 @@ following continues to use 160x120 images outside calibration mode.
   The outer board edge may approach or leave the image, but no inner corner can
   be cropped.
 - The square edge is 25 mm for the current board.
-- `bottom-center distance` defaults to 180 mm. It defines the ground point at
-  pixel `(79.5, 119)` as `(x, y) = (0, 180 mm)` relative to the estimated
+- `bottom-center distance` defaults to 80 mm. It defines the ground point at
+  pixel `(79.5, 119)` as `(x, y) = (0, 80 mm)` relative to the estimated
   vehicle center. Replace it after measuring the chassis.
 
 The coordinate system is top-view `+x` right and `+y` forward. The calibration
@@ -54,16 +57,18 @@ The dependency and calibration-math self-test does not require hardware:
 4. Select `Calculate intrinsics`. Prefer RMS below 1 pixel; lower is better.
 5. Lay the checkerboard flat on the ground, with its near edge parallel to the
    image bottom and covering as much of the driving region as practical.
-6. Set the provisional bottom-center distance, currently `180` mm, then select
+6. Set the bottom-center distance, currently `80` mm, then select
    `Calibrate ground extrinsics`.
 7. Export the result.
 
 Export creates:
 
-- `camera_ground_calibration.json`: high-resolution and scaled 160x120 camera
-  matrices, distortion, pose and ground homographies.
+- `camera_ground_calibration.json`: 640x480 first-person calibration parameters
+  and their edge-aligned scaled 160x120 camera matrices and homographies.
 - `camera_ground_calibration_pixel_lut.npz`: 160x120 `x_mm`, `y_mm` and `valid`
   arrays for direct per-pixel lookup.
 
-Calibration is tied to the exact 160x120 crop, resize and camera mounting pose.
+Intrinsics and ground extrinsics are solved at 640x480. Scaling happens only
+when the 160x120 runtime matrix, homography and lookup table are exported.
+Calibration is tied to this full-frame scaling and the camera mounting pose.
 Changing the camera mount or image pipeline requires recalibration.

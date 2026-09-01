@@ -74,6 +74,10 @@ class TunerHeader:
 
 TUNER_MAGIC = b"@RGB565,"
 TUNER_BAUD = 921600
+ROI_X_MIN = 27
+ROI_X_MAX = 133
+ROI_Y_MIN = 8
+ROI_Y_MAX = 116
 
 
 def parse_tuner_header(line: bytes) -> TunerHeader:
@@ -169,17 +173,26 @@ def rgb565_to_rgb888(rgb565: bytes) -> bytes:
     return bytes(rgb888)
 
 
-def build_recognition_overlay(rgb888: bytes, mask: bytes) -> bytes:
-    overlay = bytearray(len(rgb888))
-    for pixel in range(len(rgb888) // 3):
-        destination = pixel * 3
+def build_binary_detection(mask: bytes, pixel_count: int) -> bytes:
+    detection = bytearray(b"\xff\xff\xff" * pixel_count)
+    for pixel in range(pixel_count):
         if mask[pixel // 8] & (1 << (pixel % 8)):
-            overlay[destination : destination + 3] = b"\x00\xff\x40"
-        else:
-            overlay[destination] = rgb888[destination] * 2 // 5
-            overlay[destination + 1] = rgb888[destination + 1] * 2 // 5
-            overlay[destination + 2] = rgb888[destination + 2] * 2 // 5
-    return bytes(overlay)
+            destination = pixel * 3
+            detection[destination : destination + 3] = b"\x00\x00\x00"
+    return bytes(detection)
+
+
+def build_cropped_preview(rgb888: bytes, width: int, height: int) -> bytes:
+    preview = bytearray(b"\xff\xff\xff" * (width * height))
+    x_min = min(max(ROI_X_MIN, 0), width)
+    x_max = min(max(ROI_X_MAX, x_min), width)
+    y_min = min(max(ROI_Y_MIN, 0), height)
+    y_max = min(max(ROI_Y_MAX, y_min), height)
+    for y in range(y_min, y_max):
+        start = (y * width + x_min) * 3
+        end = (y * width + x_max) * 3
+        preview[start:end] = rgb888[start:end]
+    return bytes(preview)
 
 
 class SerialWorker:
@@ -358,6 +371,8 @@ class ThresholdTunerApp:
 
         self._build_ui()
         self.refresh_ports()
+        if initial_port:
+            root.after(1500, self.toggle_connection)
         root.after(40, self._poll_events)
 
     def _build_ui(self) -> None:
@@ -382,8 +397,12 @@ class ThresholdTunerApp:
             row=0, column=4, padx=(10, 0)
         )
 
-        self.raw_label = self._image_panel(outer, "相机原图", 1, 0)
-        self.overlay_label = self._image_panel(outer, "固件识别结果", 1, 1)
+        self.raw_label = self._image_panel(
+            outer, "相机原图（ROI 外为白色）", 1, 0
+        )
+        self.overlay_label = self._image_panel(
+            outer, "黑线检测结果（ROI 外为白色）", 1, 1
+        )
 
         controls = ttk.LabelFrame(outer, text="RGB 黑色阈值", padding=10)
         controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -503,9 +522,14 @@ class ThresholdTunerApp:
 
     def _show_frame(self, frame: DebugFrame) -> None:
         rgb888 = rgb565_to_rgb888(frame.rgb565)
-        overlay = build_recognition_overlay(rgb888, frame.mask)
+        cropped_rgb888 = build_cropped_preview(
+            rgb888, frame.width, frame.height
+        )
+        overlay = build_binary_detection(frame.mask, frame.width * frame.height)
         scale = max(1, 320 // frame.width)
-        self.raw_photo = self._make_photo(rgb888, frame.width, frame.height, scale)
+        self.raw_photo = self._make_photo(
+            cropped_rgb888, frame.width, frame.height, scale
+        )
         self.overlay_photo = self._make_photo(
             overlay, frame.width, frame.height, scale
         )

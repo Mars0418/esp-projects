@@ -8,6 +8,7 @@
 
 /* The original 80x60 trigger was y=21. Vision now runs at 160x120. */
 #define LINE_VISION_TURN_TRIGGER_Y 42
+#define LINE_VISION_PATH_POINT_CAPACITY 20
 
 typedef struct {
     bool found;
@@ -29,6 +30,8 @@ typedef struct {
     int corner_y;
     int vector_point_count;
     int path_point_count;
+    uint8_t path_x[LINE_VISION_PATH_POINT_CAPACITY];
+    uint8_t path_y[LINE_VISION_PATH_POINT_CAPACITY];
     int confidence;
     int threshold;
     int contrast;

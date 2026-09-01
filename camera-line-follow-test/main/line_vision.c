@@ -9,16 +9,16 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-#define ROI_X_MIN 6
-#define ROI_X_MAX 154
+#define ROI_X_MIN 27
+#define ROI_X_MAX 133
 /* Camera/TFT mounting makes increasing raw y point farther ahead. */
-#define ROI_Y_MIN 24
+#define ROI_Y_MIN 8
 #define ROI_Y_MAX 116
 #define NEAR_Y_MAX 56
 #define CENTER_X_MIN 32
 #define CENTER_X_MAX 128
 
-#define PATH_SAMPLE_COUNT 20
+#define PATH_SAMPLE_COUNT LINE_VISION_PATH_POINT_CAPACITY
 #define MIN_PATH_SAMPLES 7
 #define MIN_SEGMENT_SAMPLES 3
 #define CORNER_LOCAL_RADIUS 4
@@ -57,6 +57,15 @@ static volatile uint32_t s_rgb_thresholds =
     (DEFAULT_RED_THRESHOLD << 16) |
     (DEFAULT_GREEN_THRESHOLD << 8) |
     DEFAULT_BLUE_THRESHOLD;
+
+static void memset_roi_rows(void *buffer, int value, size_t element_size,
+                            size_t width)
+{
+    uint8_t *bytes = buffer;
+    const size_t offset = (size_t)ROI_Y_MIN * width * element_size;
+    const size_t roi_bytes = (ROI_Y_MAX - ROI_Y_MIN) * width * element_size;
+    memset(bytes + offset, value, roi_bytes);
+}
 
 static int clamp_int(int value, int minimum, int maximum)
 {
@@ -171,7 +180,7 @@ static int histogram_percentile(const uint32_t histogram[256],
 static void morph_dilate_3x3(const uint8_t *source, uint8_t *destination,
                              size_t width, size_t height)
 {
-    memset(destination, 0, width * height);
+    memset_roi_rows(destination, 0, sizeof(destination[0]), width);
     for (int y = ROI_Y_MIN; y < ROI_Y_MAX; ++y) {
         for (int x = ROI_X_MIN; x < ROI_X_MAX; ++x) {
             bool selected = false;
@@ -195,7 +204,7 @@ static void morph_dilate_3x3(const uint8_t *source, uint8_t *destination,
 static void morph_erode_3x3(const uint8_t *source, uint8_t *destination,
                             size_t width, size_t height)
 {
-    memset(destination, 0, width * height);
+    memset_roi_rows(destination, 0, sizeof(destination[0]), width);
     for (int y = ROI_Y_MIN; y < ROI_Y_MAX; ++y) {
         for (int x = ROI_X_MIN; x < ROI_X_MAX; ++x) {
             bool keep = true;
@@ -296,12 +305,12 @@ static int trace_component_path(size_t width, size_t height,
                                 size_t best_pixel_count, int best_min_y,
                                 path_point_t samples[PATH_SAMPLE_COUNT])
 {
-    memset(s_mask, 0, width * height);
+    memset_roi_rows(s_mask, 0, sizeof(s_mask[0]), width);
     for (size_t index = 0; index < best_pixel_count; ++index) {
         s_mask[s_best_component[index]] = 1;
     }
-    memset(s_parent, 0xff, width * height * sizeof(s_parent[0]));
-    memset(s_distance, 0, width * height * sizeof(s_distance[0]));
+    memset_roi_rows(s_parent, 0xff, sizeof(s_parent[0]), width);
+    memset_roi_rows(s_distance, 0, sizeof(s_distance[0]), width);
 
     const int anchor = find_near_anchor(width, best_pixel_count, best_min_y);
     size_t head = 0;
@@ -504,6 +513,9 @@ esp_err_t line_vision_init(size_t width, size_t height)
     ESP_RETURN_ON_FALSE(s_mask && s_morph && s_queue && s_best_component &&
                             s_parent && s_distance,
                         ESP_ERR_NO_MEM, TAG, "vision buffers unavailable");
+    /* ROI-only clears are safe because no vision stage writes outside it. */
+    memset(s_mask, 0, s_pixel_capacity);
+    memset(s_morph, 0, s_pixel_capacity);
     const line_vision_rgb_thresholds_t thresholds =
         line_vision_get_rgb_thresholds();
     ESP_LOGI(TAG,
@@ -566,7 +578,7 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
     result->threshold = ((int)thresholds.red + thresholds.green +
                          thresholds.blue) / 3;
 
-    memset(s_mask, 0, width * height);
+    memset_roi_rows(s_mask, 0, sizeof(s_mask[0]), width);
     for (int y = ROI_Y_MIN; y < ROI_Y_MAX; ++y) {
         for (int x = ROI_X_MIN; x < ROI_X_MAX; ++x) {
             const size_t index = (size_t)y * width + x;
@@ -655,6 +667,10 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
         result->path_point_count = trace_component_path(
             width, height, best_pixel_count, best_min_y, path);
         result->vector_point_count = result->path_point_count;
+        for (int index = 0; index < result->path_point_count; ++index) {
+            result->path_x[index] = (uint8_t)path[index].x;
+            result->path_y[index] = (uint8_t)path[index].y;
+        }
         if (result->path_point_count >= 2) {
             result->near_x = path[0].x;
             result->far_x = path[result->path_point_count - 1].x;
@@ -717,7 +733,7 @@ void line_vision_process(uint8_t *pixels, size_t width, size_t height,
     const uint16_t corner_color = 0x001f;
     const uint16_t trigger_color = 0x07ff;
     const uint16_t steering_band_color = 0x7bef;
-    memset(s_mask, 0, width * height);
+    memset_roi_rows(s_mask, 0, sizeof(s_mask[0]), width);
     if (result->found) {
         for (size_t index = 0; index < best_pixel_count; ++index) {
             const size_t pixel_index = s_best_component[index];

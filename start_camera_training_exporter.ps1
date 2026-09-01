@@ -1,6 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$Port = "",
+    [string]$DatasetRoot = "",
+    [string[]]$Session = @(),
+    [string]$Output = "",
+    [string]$Calibration = "",
+    [string[]]$ValidationSession = @(),
+    [string[]]$TestSession = @(),
+    [switch]$WithoutLuma,
     [switch]$SelfTest
 )
 
@@ -13,24 +19,12 @@ $pythonCommands = Get-Command python -CommandType Application -All `
 if ($pythonCommands) {
     $candidates += $pythonCommands | ForEach-Object { $_.Source }
 }
-
 if ($env:CONDA_PREFIX) {
     $candidates += Join-Path $env:CONDA_PREFIX "python.exe"
 }
 if ($env:CONDA_EXE) {
     $condaRoot = Split-Path (Split-Path $env:CONDA_EXE -Parent) -Parent
     $candidates += Join-Path $condaRoot "python.exe"
-}
-
-if ($env:IDF_PYTHON_ENV_PATH) {
-    $candidates += Join-Path $env:IDF_PYTHON_ENV_PATH "Scripts\python.exe"
-}
-
-$idfPythonRoot = Join-Path $env:USERPROFILE ".espressif\python_env"
-if (Test-Path -LiteralPath $idfPythonRoot) {
-    $candidates += Get-ChildItem -LiteralPath $idfPythonRoot -Directory |
-        Sort-Object LastWriteTime -Descending |
-        ForEach-Object { Join-Path $_.FullName "Scripts\python.exe" }
 }
 
 $selectedPython = $null
@@ -41,9 +35,7 @@ foreach ($candidate in @($candidates | Select-Object -Unique)) {
     $savedErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $dependencyOutput = & $candidate -c `
-            "import cv2, numpy, PIL, serial, tkinter; assert hasattr(serial, 'Serial')" `
-            2>&1
+        $dependencyOutput = & $candidate -c "import numpy, PIL" 2>&1
         $dependencyExitCode = $LASTEXITCODE
     } catch {
         $dependencyExitCode = 1
@@ -57,18 +49,38 @@ foreach ($candidate in @($candidates | Select-Object -Unique)) {
 }
 
 if (-not $selectedPython) {
-    throw "No Python environment with OpenCV, NumPy, Pillow, pyserial and tkinter was found."
+    throw "No Python environment with NumPy and Pillow was found."
 }
 
-$toolPath = Join-Path $PSScriptRoot "camera_extrinsic_calibrator.py"
-$toolArguments = @($toolPath)
-if ($Port) {
-    $toolArguments += @("--port", $Port.ToUpperInvariant())
+$toolPath = Join-Path $PSScriptRoot "camera_training_exporter.py"
+$arguments = @($toolPath)
+if ($DatasetRoot) {
+    $arguments += @("--dataset-root", (Resolve-Path -LiteralPath $DatasetRoot).Path)
+}
+foreach ($item in $Session) {
+    $arguments += @("--session", (Resolve-Path -LiteralPath $item).Path)
+}
+if ($Output) {
+    $arguments += @("--output", $Output)
+}
+if ($Calibration) {
+    $arguments += @(
+        "--calibration", (Resolve-Path -LiteralPath $Calibration).Path
+    )
+}
+foreach ($item in $ValidationSession) {
+    $arguments += @("--validation-session", $item)
+}
+foreach ($item in $TestSession) {
+    $arguments += @("--test-session", $item)
+}
+if ($WithoutLuma) {
+    $arguments += "--without-luma"
 }
 if ($SelfTest) {
-    $toolArguments += "--self-test"
+    $arguments += "--self-test"
 }
 
 Write-Host "Using Python at $selectedPython"
-& $selectedPython @toolArguments
+& $selectedPython @arguments
 exit $LASTEXITCODE

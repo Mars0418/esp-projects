@@ -37,6 +37,7 @@
 #define TFT_PREVIEW_INTERVAL_US 500000
 #define TUNER_INTERVAL_US     500000
 #define CALIBRATION_INTERVAL_US 1000000
+#define STREAM_MODE_POLL_MS   100
 #define RGB_DEBUG_PIXELS      (RGB_DEBUG_WIDTH * RGB_DEBUG_HEIGHT)
 #define RGB_DEBUG_BYTES       (RGB_DEBUG_PIXELS * 2)
 #define RGB_DEBUG_MASK_BYTES  ((RGB_DEBUG_PIXELS + 7) / 8)
@@ -75,6 +76,7 @@ static char s_rgb_debug_line[2560];
 static uint32_t s_rgb_debug_sequence;
 static uint8_t *s_tuner_mask;
 static char s_tuner_header[256];
+static char s_tuner_result_line[640];
 static uint32_t s_tuner_sequence;
 static char s_calibration_header[96];
 static uint32_t s_calibration_sequence;
@@ -162,10 +164,11 @@ static void emit_tuner_frame(const uint8_t *raw_pixels,
 
     const line_vision_rgb_thresholds_t thresholds =
         line_vision_get_rgb_thresholds();
+    const uint32_t sequence = ++s_tuner_sequence;
     const int header_length = snprintf(
         s_tuner_header, sizeof(s_tuner_header),
         "@RGB565,%lu,%u,%u,%u,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u\n",
-        (unsigned long)++s_tuner_sequence,
+        (unsigned long)sequence,
         (unsigned)width, (unsigned)height,
         thresholds.red, thresholds.green, thresholds.blue,
         result->found, result->confidence, result->steering_error,
@@ -180,6 +183,46 @@ static void emit_tuner_frame(const uint8_t *raw_pixels,
     uart_write_bytes(UART_NUM_0, s_tuner_header, header_length);
     uart_write_bytes(UART_NUM_0, raw_pixels, pixel_count * 2);
     uart_write_bytes(UART_NUM_0, s_tuner_mask, mask_bytes);
+
+    const int path_count = result->path_point_count < 0
+                               ? 0
+                               : (result->path_point_count >
+                                          LINE_VISION_PATH_POINT_CAPACITY
+                                      ? LINE_VISION_PATH_POINT_CAPACITY
+                                      : result->path_point_count);
+    int result_length = snprintf(
+        s_tuner_result_line, sizeof(s_tuner_result_line),
+        "@RESULT,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        (unsigned long)sequence,
+        result->found, result->big_turn, result->near_x, result->far_x,
+        result->lateral_error, result->heading_error, result->steering_error,
+        result->steering_band_valid, result->steering_band_left_percent,
+        result->steering_band_right_percent, result->steering_band_error,
+        result->steering_band_pixel_count, result->turn_direction,
+        result->turn_angle_deg, result->turn_confidence,
+        result->corner_x, result->corner_y, result->vector_point_count,
+        path_count, result->confidence, result->threshold, result->contrast,
+        result->component_area);
+    if (result_length <= 0 ||
+        result_length >= (int)sizeof(s_tuner_result_line)) {
+        return;
+    }
+    for (int index = 0; index < path_count; ++index) {
+        const int appended = snprintf(
+            s_tuner_result_line + result_length,
+            sizeof(s_tuner_result_line) - result_length,
+            ",%u,%u", result->path_x[index], result->path_y[index]);
+        if (appended <= 0 ||
+            appended >= (int)sizeof(s_tuner_result_line) - result_length) {
+            return;
+        }
+        result_length += appended;
+    }
+    if (result_length + 1 >= (int)sizeof(s_tuner_result_line)) {
+        return;
+    }
+    s_tuner_result_line[result_length++] = '\n';
+    uart_write_bytes(UART_NUM_0, s_tuner_result_line, result_length);
 }
 
 static void emit_calibration_jpeg(const mjpeg_slot_t *slot)
@@ -523,17 +566,19 @@ static esp_err_t initialize_frame_pipeline(void)
     return ESP_OK;
 }
 
-static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
-                                          uvc_stream_ctrl_t *control)
+typedef struct {
+    enum uvc_frame_format format;
+    int width;
+    int height;
+    int fps;
+    esp_jpeg_image_scale_t scale;
+} camera_profile_t;
+
+static uvc_error_t negotiate_camera_stream(uvc_device_handle_t *device_handle,
+                                           uvc_stream_ctrl_t *control,
+                                           bool calibration_mode)
 {
-    typedef struct {
-        enum uvc_frame_format format;
-        int width;
-        int height;
-        int fps;
-        esp_jpeg_image_scale_t scale;
-    } camera_profile_t;
-    static const camera_profile_t profiles[] = {
+    static const camera_profile_t runtime_profiles[] = {
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 30, JPEG_IMAGE_SCALE_0},
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 15, JPEG_IMAGE_SCALE_0},
         {UVC_FRAME_FORMAT_YUYV, 320, 240, 15, JPEG_IMAGE_SCALE_0},
@@ -542,9 +587,22 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
         {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_4},
         {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_4},
     };
+    static const camera_profile_t calibration_profiles[] = {
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_4},
+    };
+    const camera_profile_t *profiles = calibration_mode
+                                           ? calibration_profiles
+                                           : runtime_profiles;
+    const size_t profile_count = calibration_mode
+                                     ? sizeof(calibration_profiles) /
+                                           sizeof(calibration_profiles[0])
+                                     : sizeof(runtime_profiles) /
+                                           sizeof(runtime_profiles[0]);
     uvc_error_t result = UVC_ERROR_INVALID_MODE;
-    for (size_t profile = 0;
-         profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
+    ESP_LOGI(TAG, "Negotiating %s camera stream",
+             calibration_mode ? "calibration 640x480 MJPEG" : "runtime");
+    for (size_t profile = 0; profile < profile_count; ++profile) {
         for (int attempt = 1; attempt <= 2; ++attempt) {
             ESP_LOGI(TAG, "Trying %s %dx%d at %d fps (attempt %d)",
                      profiles[profile].format == UVC_FRAME_FORMAT_YUYV
@@ -570,6 +628,29 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
         }
     }
     return result;
+}
+
+static bool wait_for_disconnect_or_mode_change(bool calibration_mode)
+{
+    while (true) {
+        const EventBits_t bits = xEventGroupWaitBits(
+            s_uvc_events, UVC_DEVICE_DISCONNECTED, pdTRUE, pdFALSE,
+            pdMS_TO_TICKS(STREAM_MODE_POLL_MS));
+        if ((bits & UVC_DEVICE_DISCONNECTED) != 0) {
+            return true;
+        }
+        if (camera_line_follow_calibration_enabled() != calibration_mode) {
+            return false;
+        }
+    }
+}
+
+static void discard_queued_frames(void)
+{
+    int slot_index;
+    while (xQueueReceive(s_frame_queue, &slot_index, 0) == pdPASS) {
+        release_mjpeg_slot(slot_index);
+    }
 }
 
 void app_main(void)
@@ -631,28 +712,43 @@ void app_main(void)
         }
 
         ESP_LOGI(TAG, "CAMERA_STATUS=UVC_OPEN");
-        result = negotiate_mjpeg_stream(device_handle, &stream_control);
-        if (result == UVC_SUCCESS) {
-            uvc_print_stream_ctrl(&stream_control, stderr);
-            result = uvc_start_streaming(device_handle, &stream_control,
-                                         camera_frame_callback, NULL, 0);
+        bool disconnected = false;
+        while (!disconnected) {
+            const bool calibration_mode =
+                camera_line_follow_calibration_enabled();
+            memset(&stream_control, 0, sizeof(stream_control));
+            result = negotiate_camera_stream(device_handle, &stream_control,
+                                             calibration_mode);
+            if (result == UVC_SUCCESS) {
+                uvc_print_stream_ctrl(&stream_control, stderr);
+                result = uvc_start_streaming(
+                    device_handle, &stream_control,
+                    camera_frame_callback, NULL, 0);
+            }
+
+            if (result == UVC_SUCCESS) {
+                ESP_LOGI(TAG, "CAMERA_STATUS=STREAMING_%dx%d_%dFPS_%s",
+                         s_stream_width, s_stream_height, s_stream_fps,
+                         s_stream_format == UVC_FRAME_FORMAT_YUYV
+                             ? "YUYV" : "MJPEG");
+                disconnected = wait_for_disconnect_or_mode_change(
+                    calibration_mode);
+                uvc_stop_streaming(device_handle);
+                discard_queued_frames();
+                if (!disconnected) {
+                    ESP_LOGI(TAG, "CAMERA_STATUS=RECONFIGURING_%s",
+                             camera_line_follow_calibration_enabled()
+                                 ? "CALIBRATION" : "RUNTIME");
+                }
+            } else {
+                ESP_LOGE(TAG, "CAMERA_STATUS=STREAM_FAILED error=%s",
+                         uvc_error_string(result));
+                disconnected = wait_for_disconnect_or_mode_change(
+                    calibration_mode);
+            }
         }
 
-        if (result == UVC_SUCCESS) {
-            ESP_LOGI(TAG, "CAMERA_STATUS=STREAMING_%dx%d_%dFPS_%s",
-                     s_stream_width, s_stream_height, s_stream_fps,
-                     s_stream_format == UVC_FRAME_FORMAT_YUYV
-                         ? "YUYV" : "MJPEG");
-            wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            camera_line_follow_camera_disconnected();
-            uvc_stop_streaming(device_handle);
-        } else {
-            ESP_LOGE(TAG, "CAMERA_STATUS=STREAM_FAILED error=%s",
-                     uvc_error_string(result));
-            wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            camera_line_follow_camera_disconnected();
-        }
-
+        camera_line_follow_camera_disconnected();
         camera_display_show_waiting();
         uvc_close(device_handle);
         uvc_unref_device(device);
