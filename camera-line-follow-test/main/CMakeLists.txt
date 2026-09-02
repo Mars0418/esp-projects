@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "line_vision.c" "main.c" "camera_display.c"
+    SRCS "ball_vision.c" "white_ball_vision.c" "black_marker_vision.c" "line_vision.c" "main.c" "camera_display.c"
          "camera_line_follow_band.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES usb esp_driver_gpio esp_driver_spi esp_driver_ledc

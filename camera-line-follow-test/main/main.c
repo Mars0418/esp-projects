@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ball_vision.h"
+#include "black_marker_vision.h"
 #include "camera_display.h"
 #include "camera_line_follow.h"
 #include "driver/uart.h"
@@ -28,8 +30,8 @@
 #define FRAME_QUEUE_LENGTH    1
 #define DISPLAY_QUEUE_LENGTH  1
 #define MJPEG_SLOT_CAPACITY   (256 * 1024)
-#define DECODED_WIDTH         80
-#define DECODED_HEIGHT        60
+#define DECODED_WIDTH         160
+#define DECODED_HEIGHT        120
 #define DECODED_BUFFER_BYTES  (DECODED_WIDTH * DECODED_HEIGHT * 2)
 #define JPEG_WORK_BUFFER_BYTES 8192
 #define RGB_DEBUG_WIDTH       32
@@ -454,14 +456,30 @@ static void frame_display_task(void *argument)
                 memcpy(s_debug_raw_frame, s_decoded_frame,
                        DECODED_BUFFER_BYTES);
             }
-            line_vision_result_t vision_result;
-            line_vision_process(s_decoded_frame, output.width, output.height,
-                                &vision_result);
+            ball_vision_result_t ball_result;
+            ball_vision_result_t white_ball_result;
+            black_marker_result_t marker_result;
+            ball_vision_process(s_decoded_frame, output.width, output.height,
+                                &ball_result);
+            white_ball_vision_process(s_decoded_frame, output.width,
+                                      output.height, &white_ball_result);
+            black_marker_vision_process(s_decoded_frame, output.width,
+                                        output.height, &marker_result);
+            ball_vision_draw_overlay(s_decoded_frame, output.width,
+                                     output.height, &ball_result);
+            ball_vision_draw_overlay_color(s_decoded_frame, output.width,
+                                           output.height, &white_ball_result,
+                                           0x07ff);
+            black_marker_vision_draw_overlay(s_decoded_frame, output.width,
+                                             output.height, &marker_result);
             const int64_t vision_done_us = esp_timer_get_time();
             decode_time_us += (uint64_t)(decode_done_us - decode_start_us);
             vision_time_us += (uint64_t)(vision_done_us - decode_done_us);
             timed_frames++;
-            camera_line_follow_submit(&vision_result, captured_at_us);
+            /* This firmware image is deliberately a visual ball-tracking
+             * test.  Do not run or submit line-following control here: the
+             * chassis remains in the safe-stop state while the TFT shows the
+             * adaptive red/white ball and black-goal boxes. */
             processed_frames++;
             const int64_t debug_now_us = esp_timer_get_time();
             if (!tuner && debug_now_us - last_tft_preview_us >=
@@ -472,13 +490,15 @@ static void frame_display_task(void *argument)
             }
             if (tuner &&
                 debug_now_us - last_tuner_us >= TUNER_INTERVAL_US) {
+                const line_vision_result_t empty_result = {0};
                 emit_tuner_frame(s_debug_raw_frame, output.width,
-                                 output.height, &vision_result);
+                                 output.height, &empty_result);
                 last_tuner_us = debug_now_us;
             } else if (rgb_debug &&
                 debug_now_us - last_rgb_debug_us >= RGB_DEBUG_INTERVAL_US) {
+                const line_vision_result_t empty_result = {0};
                 emit_rgb_debug_frame(s_debug_raw_frame, output.width,
-                                     output.height, &vision_result);
+                                     output.height, &empty_result);
                 last_rgb_debug_us = debug_now_us;
             }
         } else {
@@ -529,12 +549,10 @@ static void frame_display_task(void *argument)
             timed_frames = 0;
             last_report_us = now_us;
         }
-        /* Receiving 15 FPS naturally leaves this task blocked on the queue.
-         * Keep a sparse safety delay for IDLE1 without paying one 10 ms tick
-         * after every processed frame (CONFIG_FREERTOS_HZ is 100). */
-        if ((processed_frames & 31U) == 0U) {
-            vTaskDelay(1);
-        }
+        /* 160x120 JPEG decoding can keep CPU1 busy frame after frame.  Yield
+         * once per frame so IDLE1 can reset the task watchdog during a long
+         * ball-tracking test. */
+        vTaskDelay(1);
     }
 }
 
@@ -638,13 +656,12 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
         esp_jpeg_image_scale_t scale;
     } camera_profile_t;
     static const camera_profile_t profiles[] = {
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_4},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, JPEG_IMAGE_SCALE_1_2},
+        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 15, JPEG_IMAGE_SCALE_1_2},
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 30, JPEG_IMAGE_SCALE_0},
         {UVC_FRAME_FORMAT_YUYV, 160, 120, 15, JPEG_IMAGE_SCALE_0},
-        {UVC_FRAME_FORMAT_YUYV, 320, 240, 15, JPEG_IMAGE_SCALE_0},
-        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 30, JPEG_IMAGE_SCALE_1_4},
-        {UVC_FRAME_FORMAT_MJPEG, 320, 240, 15, JPEG_IMAGE_SCALE_1_4},
-        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 30, JPEG_IMAGE_SCALE_1_8},
-        {UVC_FRAME_FORMAT_MJPEG, 640, 480, 15, JPEG_IMAGE_SCALE_1_8},
     };
     uvc_error_t result = UVC_ERROR_INVALID_MODE;
     for (size_t profile = 0;
@@ -674,7 +691,7 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
 void app_main(void)
 {
     ESP_LOGI(TAG,
-             "USB camera line-following test; 80x60 fast control, 2x TFT preview");
+             "USB camera ball tracker; 160x120 adaptive box on TFT preview");
     ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=115200");
     ESP_LOGI(TAG, "Camera: D-=GPIO19 D+=GPIO20; motors start in SAFE STOP");
 
@@ -686,7 +703,9 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(camera_line_follow_init());
-    ESP_ERROR_CHECK(line_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
+    ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
+    ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
+    ESP_ERROR_CHECK(black_marker_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
     ESP_ERROR_CHECK(camera_display_init());
     ESP_ERROR_CHECK(camera_display_show_waiting());
     ESP_ERROR_CHECK(initialize_frame_pipeline());
