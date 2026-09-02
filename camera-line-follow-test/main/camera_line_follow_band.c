@@ -44,8 +44,7 @@
 #define ENCODER_D_PHASE_B_GPIO GPIO_NUM_1
 
 /* The chassis needs a short high-duty launch to overcome static friction. */
-#define FOLLOW_BASE_DUTY 195
-#define FOLLOW_TURN_APPROACH_DUTY 175
+#define FOLLOW_BASE_DUTY 170
 #define FOLLOW_LAUNCH_DUTY 220
 #define FOLLOW_LAUNCH_FRAMES 4
 #define FOLLOW_MIN_FORWARD_DUTY 150
@@ -71,8 +70,6 @@
 #define TURN_CLEAN_NEAR_DELTA_MAX 12
 #define FOOT_LOST_CONFIRM_FRAMES 2
 #define FOOT_LOST_STOP_FRAMES 3
-#define TURN_COMMIT_FORWARD_MS 40
-#define TURN_COMMIT_DUTY 165
 #define PIVOT_INNER_REVERSE_DUTY 135
 #define PIVOT_OUTER_FORWARD_DUTY 145
 #define PIVOT_SLOW_INNER_REVERSE_DUTY 130
@@ -90,6 +87,16 @@
 #define ULTRASONIC_MOTOR_QUIET_US 2000
 #define OBSTACLE_TRIGGER_MM 120
 #define OBSTACLE_CONFIRM_SAMPLES 3
+#define OBSTACLE_PRE_STRAFE_WAIT_MS 500
+#define OBSTACLE_PRE_STRAFE_BRAKE_MS 80
+#define OBSTACLE_ALIGN_HEADING_DEADBAND 120
+#define OBSTACLE_ALIGN_PRIMARY_MS 80
+#define OBSTACLE_ALIGN_COUNTER_MS 40
+#define OBSTACLE_ALIGN_SETTLE_MS 200
+#define OBSTACLE_ALIGN_BRAKE_MS 80
+#define OBSTACLE_ALIGN_PRIMARY_DUTY 145
+#define OBSTACLE_ALIGN_COUNTER_DUTY 140
+#define OBSTACLE_ALIGN_MAX_ATTEMPTS 3
 #define ENCODER_COUNTS_PER_REV 406
 #define OBSTACLE_LEFT_REVS_NUM 12
 #define OBSTACLE_LEFT_REVS_DEN 5
@@ -100,7 +107,6 @@
 #define OBSTACLE_LEFT_SLOWDOWN_COUNTS 300
 #define OBSTACLE_LEFT_POSITION_TOLERANCE 12
 #define OBSTACLE_LEFT_SYNC_CORRECTION_MAX 35
-#define OBSTACLE_STRAFE_IMBALANCE_ABORT 180
 #define OBSTACLE_STRAFE_BRAKE_MS 80
 #define OBSTACLE_SETTLE_SAMPLE_MS 50
 #define OBSTACLE_SETTLE_SAMPLES 3
@@ -108,7 +114,7 @@
 #define OBSTACLE_SETTLE_TIMEOUT_MS 1000
 #define OBSTACLE_FORWARD_DUTY 180
 #define OBSTACLE_FORWARD_TARGET_COUNTS \
-    (ENCODER_COUNTS_PER_REV * 3 / 2)
+    ((ENCODER_COUNTS_PER_REV * 9 + 2) / 5)
 #define OBSTACLE_FORWARD_SLOWDOWN_COUNTS 200
 #define OBSTACLE_FORWARD_POSITION_TOLERANCE 8
 #define OBSTACLE_FORWARD_MIN_DUTY 140
@@ -118,8 +124,8 @@
 #define OBSTACLE_FORWARD_BRAKE_MS 80
 #define OBSTACLE_FORWARD_TIMEOUT_MS 5000
 #define OBSTACLE_RIGHT_SEARCH_TIMEOUT_MS 8000
-#define OBSTACLE_REACQUIRE_CONFIRM_FRAMES 3
-#define OBSTACLE_CAMERA_CENTER_ERROR_MAX 180
+#define OBSTACLE_REACQUIRE_CONFIRM_FRAMES 2
+#define OBSTACLE_CAMERA_CENTER_ERROR_MAX 260
 #define OBSTACLE_RIGHT_SYNC_CORRECTION_MAX 35
 #define OBSTACLE_FINAL_LOST_FRAMES 3
 
@@ -185,11 +191,9 @@ typedef struct {
     int64_t turn_hint_us;
     int64_t turn_armed_us;
     int64_t turn_arm_ignore_until_us;
-    int64_t commit_started_us;
     int64_t pivot_started_us;
     bool initialized;
     bool turn_armed;
-    bool commit_active;
     bool pivot_active;
 } pursuit_controller_t;
 
@@ -209,6 +213,10 @@ enum {
 
 typedef enum {
     OBSTACLE_IDLE,
+    OBSTACLE_WAIT_BEFORE_LEFT,
+    OBSTACLE_ALIGN_PRIMARY,
+    OBSTACLE_ALIGN_COUNTER,
+    OBSTACLE_ALIGN_SETTLE,
     OBSTACLE_STRAFE_LEFT,
     OBSTACLE_STRAFE_LEFT_BRAKE,
     OBSTACLE_STRAFE_LEFT_SETTLE,
@@ -224,6 +232,8 @@ typedef enum {
 typedef struct {
     obstacle_state_t state;
     int near_samples;
+    int align_direction;
+    int align_attempts;
     int reacquire_frames;
     int final_lost_frames;
     int latest_distance_mm;
@@ -606,6 +616,10 @@ static const char *obstacle_state_name(obstacle_state_t state)
 {
     switch (state) {
     case OBSTACLE_IDLE: return "IDLE";
+    case OBSTACLE_WAIT_BEFORE_LEFT: return "WAIT_LEFT";
+    case OBSTACLE_ALIGN_PRIMARY: return "ALIGN_OUT";
+    case OBSTACLE_ALIGN_COUNTER: return "ALIGN_BACK";
+    case OBSTACLE_ALIGN_SETTLE: return "ALIGN_SETTLE";
     case OBSTACLE_STRAFE_LEFT: return "LEFT";
     case OBSTACLE_STRAFE_LEFT_BRAKE: return "LEFT_BRAKE";
     case OBSTACLE_STRAFE_LEFT_SETTLE: return "LEFT_SETTLE";
@@ -645,17 +659,6 @@ static void get_strafe_progress(const obstacle_controller_t *obstacle,
                 obstacle->strafe_start_count[WHEEL_D]);
 }
 
-static int progress_spread(const int progress[WHEEL_COUNT])
-{
-    int minimum = progress[0];
-    int maximum = progress[0];
-    for (size_t wheel = 1; wheel < WHEEL_COUNT; ++wheel) {
-        if (progress[wheel] < minimum) minimum = progress[wheel];
-        if (progress[wheel] > maximum) maximum = progress[wheel];
-    }
-    return maximum - minimum;
-}
-
 static int progress_average(const int progress[WHEEL_COUNT])
 {
     return (progress[WHEEL_A] + progress[WHEEL_B] +
@@ -689,6 +692,45 @@ static void start_obstacle_left(obstacle_controller_t *obstacle,
              OBSTACLE_LEFT_REAR_TARGET_COUNTS);
 }
 
+static void start_obstacle_wait(obstacle_controller_t *obstacle,
+                                int64_t now_us)
+{
+    obstacle->state = OBSTACLE_WAIT_BEFORE_LEFT;
+    obstacle->state_started_us = now_us;
+    obstacle->near_samples = 0;
+    brake_motors();
+    ESP_LOGW(TAG,
+             "OBSTACLE %dmm confirmed: STOP %dms before strafe left",
+             obstacle->latest_distance_mm,
+             OBSTACLE_PRE_STRAFE_WAIT_MS);
+}
+
+static void drive_obstacle_alignment_pivot(int direction, int duty)
+{
+    if (direction > 0) {
+        drive_wheels(-duty, duty);
+    } else {
+        drive_wheels(duty, -duty);
+    }
+}
+
+static void start_obstacle_alignment_pulse(
+    obstacle_controller_t *obstacle, int heading_error, int64_t now_us)
+{
+    obstacle->state = OBSTACLE_ALIGN_PRIMARY;
+    obstacle->state_started_us = now_us;
+    obstacle->align_direction =
+        STEERING_SIGN * heading_error > 0 ? 1 : -1;
+    obstacle->align_attempts++;
+    drive_obstacle_alignment_pivot(obstacle->align_direction,
+                                   OBSTACLE_ALIGN_PRIMARY_DUTY);
+    ESP_LOGW(TAG,
+             "OBSTACLE ALIGN attempt=%d heading=%d direction=%d pulse=%d/%dms",
+             obstacle->align_attempts, heading_error,
+             obstacle->align_direction, OBSTACLE_ALIGN_PRIMARY_MS,
+             OBSTACLE_ALIGN_COUNTER_MS);
+}
+
 static bool check_obstacle_trigger(obstacle_controller_t *obstacle,
                                    bool ultrasonic_sample_ready,
                                    int64_t now_us)
@@ -702,7 +744,7 @@ static bool check_obstacle_trigger(obstacle_controller_t *obstacle,
         obstacle->near_samples = 0;
     }
     if (obstacle->near_samples < OBSTACLE_CONFIRM_SAMPLES) return false;
-    start_obstacle_left(obstacle, now_us);
+    start_obstacle_wait(obstacle, now_us);
     return true;
 }
 
@@ -753,12 +795,6 @@ static void update_left_strafe(obstacle_controller_t *obstacle,
         (int)((now_us - obstacle->state_started_us) / 1000);
     if (average >= OBSTACLE_LEFT_REAR_TARGET_COUNTS -
                        OBSTACLE_LEFT_POSITION_TOLERANCE) {
-        if (progress_spread(progress) >
-            OBSTACLE_STRAFE_IMBALANCE_ABORT) {
-            fail_obstacle_action(obstacle,
-                                 "left strafe encoder imbalance");
-            return;
-        }
         obstacle->state = OBSTACLE_STRAFE_LEFT_BRAKE;
         obstacle->state_started_us = now_us;
         brake_motors();
@@ -882,14 +918,8 @@ static void update_right_search(obstacle_controller_t *obstacle,
         fail_obstacle_action(obstacle, "right strafe line timeout");
         return;
     }
-    if (progress_spread(progress) > OBSTACLE_STRAFE_IMBALANCE_ABORT) {
-        fail_obstacle_action(obstacle,
-                             "right strafe encoder imbalance");
-        return;
-    }
-
     if (new_frame) {
-        const bool centered = line_valid && result->foot_track_centered &&
+        const bool centered = line_valid && result->foot_track_valid &&
             abs(result->foot_lateral_error) <=
                 OBSTACLE_CAMERA_CENTER_ERROR_MAX;
         obstacle->reacquire_frames = centered
@@ -956,6 +986,80 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
     switch (obstacle->state) {
     case OBSTACLE_IDLE:
         return false;
+    case OBSTACLE_WAIT_BEFORE_LEFT:
+        if (elapsed_ms >= OBSTACLE_PRE_STRAFE_WAIT_MS) {
+            if (line_valid && result->foot_track_valid &&
+                abs(result->heading_error) >
+                    OBSTACLE_ALIGN_HEADING_DEADBAND) {
+                start_obstacle_alignment_pulse(
+                    obstacle, result->heading_error, now_us);
+            } else {
+                ESP_LOGW(TAG,
+                         "OBSTACLE ALIGN skipped heading=%d line=%d foot=%d",
+                         result->heading_error, line_valid,
+                         result->foot_track_valid);
+                start_obstacle_left(obstacle, now_us);
+            }
+        } else if (elapsed_ms < OBSTACLE_PRE_STRAFE_BRAKE_MS) {
+            brake_motors();
+        } else {
+            stop_motors();
+        }
+        return true;
+    case OBSTACLE_ALIGN_PRIMARY:
+        if (elapsed_ms >= OBSTACLE_ALIGN_PRIMARY_MS) {
+            obstacle->state = OBSTACLE_ALIGN_COUNTER;
+            obstacle->state_started_us = now_us;
+            drive_obstacle_alignment_pivot(
+                -obstacle->align_direction,
+                OBSTACLE_ALIGN_COUNTER_DUTY);
+        } else {
+            drive_obstacle_alignment_pivot(
+                obstacle->align_direction,
+                OBSTACLE_ALIGN_PRIMARY_DUTY);
+        }
+        return true;
+    case OBSTACLE_ALIGN_COUNTER:
+        if (elapsed_ms >= OBSTACLE_ALIGN_COUNTER_MS) {
+            obstacle->state = OBSTACLE_ALIGN_SETTLE;
+            obstacle->state_started_us = now_us;
+            brake_motors();
+        } else {
+            drive_obstacle_alignment_pivot(
+                -obstacle->align_direction,
+                OBSTACLE_ALIGN_COUNTER_DUTY);
+        }
+        return true;
+    case OBSTACLE_ALIGN_SETTLE:
+        if (elapsed_ms < OBSTACLE_ALIGN_BRAKE_MS) {
+            brake_motors();
+            return true;
+        }
+        stop_motors();
+        if (elapsed_ms < OBSTACLE_ALIGN_SETTLE_MS) return true;
+        if (!line_valid || !result->foot_track_valid) {
+            ESP_LOGW(TAG,
+                     "OBSTACLE ALIGN line unavailable after attempt=%d; continue",
+                     obstacle->align_attempts);
+            start_obstacle_left(obstacle, now_us);
+        } else if (abs(result->heading_error) <=
+                       OBSTACLE_ALIGN_HEADING_DEADBAND) {
+            ESP_LOGW(TAG,
+                     "OBSTACLE ALIGN complete attempt=%d heading=%d",
+                     obstacle->align_attempts, result->heading_error);
+            start_obstacle_left(obstacle, now_us);
+        } else if (obstacle->align_attempts >=
+                       OBSTACLE_ALIGN_MAX_ATTEMPTS) {
+            ESP_LOGW(TAG,
+                     "OBSTACLE ALIGN limit heading=%d attempts=%d; continue",
+                     result->heading_error,
+                     obstacle->align_attempts);
+            start_obstacle_left(obstacle, now_us);
+        } else {
+            start_obstacle_alignment_pulse(
+                obstacle, result->heading_error, now_us);
+        }
+        return true;
     case OBSTACLE_STRAFE_LEFT:
         update_left_strafe(obstacle, now_us);
         return true;
@@ -1161,15 +1265,11 @@ static void apply_tracking_control(int unsigned_error, int base_duty,
 }
 
 static void apply_follow_control(const line_vision_result_t *result,
-                                 pursuit_controller_t *controller,
-                                 int64_t now_us)
+                                 pursuit_controller_t *controller)
 {
     /* Only the component connected to the vehicle-facing foot gate steers.
      * Far pixels record turn direction but never become the steering target. */
-    const int base_duty = turn_hint_recent(controller, now_us)
-                              ? FOLLOW_TURN_APPROACH_DUTY
-                              : FOLLOW_BASE_DUTY;
-    apply_tracking_control(result->foot_lateral_error, base_duty,
+    apply_tracking_control(result->foot_lateral_error, FOLLOW_BASE_DUTY,
                            controller);
 }
 
@@ -1222,21 +1322,6 @@ static bool arm_turn(const line_vision_result_t *result,
     return true;
 }
 
-static void start_turn_commit(pursuit_controller_t *controller,
-                              int64_t now_us)
-{
-    controller->turn_armed = false;
-    controller->commit_active = true;
-    controller->commit_started_us = now_us;
-    controller->a_command = TURN_COMMIT_DUTY;
-    controller->d_command = TURN_COMMIT_DUTY;
-    drive_wheels(controller->a_command, controller->d_command);
-    ESP_LOGW(TAG,
-             "TURN COMMIT direction=%d foot-exit straight=%dms duty=%d",
-             controller->turn_direction, TURN_COMMIT_FORWARD_MS,
-             TURN_COMMIT_DUTY);
-}
-
 static void drive_pivot(pursuit_controller_t *controller, int64_t now_us)
 {
     const bool slow_search = controller->pivot_started_us > 0 &&
@@ -1261,7 +1346,6 @@ static void drive_pivot(pursuit_controller_t *controller, int64_t now_us)
 static void start_pivot(pursuit_controller_t *controller, int64_t now_us)
 {
     controller->turn_armed = false;
-    controller->commit_active = false;
     controller->pivot_active = true;
     controller->pivot_started_us = now_us;
     controller->reacquire_frames = 0;
@@ -1504,7 +1588,7 @@ static void control_task(void *argument)
                         controller.tracking_frames = FOLLOW_LAUNCH_FRAMES;
                         controller.turn_arm_ignore_until_us = now_us +
                             (int64_t)TURN_REARM_COOLDOWN_MS * 1000;
-                        apply_follow_control(&result, &controller, now_us);
+                        apply_follow_control(&result, &controller);
                         ESP_LOGW(TAG,
                                  "PIVOT COMPLETE direction=%d after %lldms foot=%d center=%d heading=%d",
                                  completed_direction, (long long)pivot_ms,
@@ -1522,17 +1606,6 @@ static void control_task(void *argument)
                         drive_pivot(&controller, now_us);
                     }
                 }
-            } else if (controller.commit_active) {
-                const int64_t commit_ms =
-                    (now_us - controller.commit_started_us) / 1000;
-                if (commit_ms >= TURN_COMMIT_FORWARD_MS) {
-                    start_pivot(&controller, now_us);
-                } else {
-                    controller.a_command = TURN_COMMIT_DUTY;
-                    controller.d_command = TURN_COMMIT_DUTY;
-                    drive_wheels(controller.a_command,
-                                 controller.d_command);
-                }
             } else if (foot_valid) {
                 controller.foot_lost_frames = 0;
                 if (controller.turn_armed) {
@@ -1541,24 +1614,24 @@ static void control_task(void *argument)
                      * corner varies, so a time-based expiry can discard the
                      * correct direction immediately before arrival. */
                     apply_tracking_control(result.foot_lateral_error,
-                                           FOLLOW_TURN_APPROACH_DUTY,
+                                           FOLLOW_BASE_DUTY,
                                            &controller);
                 } else {
                     update_clean_straight(&result, &controller);
                     if (now_us < controller.turn_arm_ignore_until_us) {
                         clear_pending_turn_hint(&controller);
-                        apply_follow_control(&result, &controller, now_us);
+                        apply_follow_control(&result, &controller);
                     } else {
                         update_turn_hint(&result, &controller, now_us);
                     }
                     if (now_us >= controller.turn_arm_ignore_until_us &&
                         arm_turn(&result, &controller, now_us)) {
                         apply_tracking_control(result.foot_lateral_error,
-                                               FOLLOW_TURN_APPROACH_DUTY,
+                                               FOLLOW_BASE_DUTY,
                                                &controller);
                     } else if (now_us >=
                                controller.turn_arm_ignore_until_us) {
-                        apply_follow_control(&result, &controller, now_us);
+                        apply_follow_control(&result, &controller);
                     }
                 }
             } else {
@@ -1573,7 +1646,14 @@ static void control_task(void *argument)
                              line_valid, result.foot_pixel_count,
                              result.foot_center_pixel_count,
                              result.foot_path_length_pixels);
-                    start_turn_commit(&controller, now_us);
+                    start_pivot(&controller, now_us);
+                } else if (controller.turn_armed) {
+                    controller.a_command = 0;
+                    controller.d_command = 0;
+                    brake_motors();
+                    ESP_LOGI(TAG,
+                             "FOOT EDGE candidate direction=%d: braking for confirmation",
+                             controller.turn_direction);
                 } else if (controller.foot_lost_frames <
                                FOOT_LOST_STOP_FRAMES &&
                            controller.initialized) {
@@ -1599,8 +1679,7 @@ static void control_task(void *argument)
             const char *state = obstacle.state != OBSTACLE_IDLE
                 ? obstacle_state_name(obstacle.state)
                 : (controller.pivot_active ? "PIVOT" :
-                    (controller.commit_active ? "COMMIT" :
-                     (controller.turn_armed ? "READY" : "FOLLOW")));
+                    (controller.turn_armed ? "READY" : "FOLLOW"));
             ESP_LOGI(TAG,
                      "RUN en=%d state=%s line=%d foot=%d err=%d corr=%d pwm=%d/%d dist=%dmm age=%lldms",
                      s_enabled,
@@ -1665,16 +1744,21 @@ esp_err_t camera_line_follow_init(void)
     ESP_LOGW(TAG,
              "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG/TUNER/CALIB,0/1");
     ESP_LOGI(TAG,
-             "Foot-track controller: gate=center-half/12rows follow=%d approach=%d correction<=%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",
-             FOLLOW_BASE_DUTY, FOLLOW_TURN_APPROACH_DUTY,
+             "Foot-track controller: gate=center-half/12rows follow=%d correction<=%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",
+             FOLLOW_BASE_DUTY,
              FOLLOW_CORRECTION_MAX, PIVOT_INNER_REVERSE_DUTY,
              PIVOT_OUTER_FORWARD_DUTY, PIVOT_REACQUIRE_FRAMES,
              TURN_HINT_ERROR,
              TURN_HINT_FAR_WEIGHT, FOOT_LOST_CONFIRM_FRAMES,
              PIVOT_MAX_MS);
     ESP_LOGI(TAG,
-             "Obstacle bypass: trigger<=%dmm x%d left=%dcounts forward=%dcounts right-center<=%d final-lost=%dframes",
+             "Obstacle bypass: trigger<=%dmm x%d wait=%dms align<=%d pulse=%d/%dms x%d left=%dcounts forward=%dcounts right-center<=%d final-lost=%dframes",
              OBSTACLE_TRIGGER_MM, OBSTACLE_CONFIRM_SAMPLES,
+             OBSTACLE_PRE_STRAFE_WAIT_MS,
+             OBSTACLE_ALIGN_HEADING_DEADBAND,
+             OBSTACLE_ALIGN_PRIMARY_MS,
+             OBSTACLE_ALIGN_COUNTER_MS,
+             OBSTACLE_ALIGN_MAX_ATTEMPTS,
              OBSTACLE_LEFT_REAR_TARGET_COUNTS,
              OBSTACLE_FORWARD_TARGET_COUNTS,
              OBSTACLE_CAMERA_CENTER_ERROR_MAX,
