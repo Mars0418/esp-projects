@@ -43,12 +43,18 @@
 #define ENCODER_D_PHASE_A_GPIO GPIO_NUM_2
 #define ENCODER_D_PHASE_B_GPIO GPIO_NUM_1
 
-/* The chassis needs a short high-duty launch to overcome static friction. */
 #define FOLLOW_BASE_DUTY 170
-#define FOLLOW_LAUNCH_DUTY 220
-#define FOLLOW_LAUNCH_FRAMES 4
 #define FOLLOW_MIN_FORWARD_DUTY 150
 #define FOLLOW_MAX_FORWARD_DUTY 270
+#define FOLLOW_SPEED_PI_UPDATE_MS 150
+#define FOLLOW_SPEED_MIN_TARGET_NUM 3
+#define FOLLOW_SPEED_MIN_TARGET_DEN 4
+#define FOLLOW_SPEED_PI_KP_DIV 4
+#define FOLLOW_SPEED_PI_KI_DIV 120
+#define FOLLOW_SPEED_PI_INTEGRAL_MAX 3000
+#define FOLLOW_SPEED_PI_OUTPUT_MAX 50
+#define FOLLOW_SPEED_STALL_DELTA_MAX 6
+#define FOLLOW_SPEED_STALL_KICK 30
 #define FOLLOW_PROPORTIONAL_GAIN 180
 #define FOLLOW_CORRECTION_MAX 120
 #define FOLLOW_CORRECTION_STEP 24
@@ -114,7 +120,7 @@
 #define OBSTACLE_SETTLE_TIMEOUT_MS 1000
 #define OBSTACLE_FORWARD_DUTY 180
 #define OBSTACLE_FORWARD_TARGET_COUNTS \
-    ((ENCODER_COUNTS_PER_REV * 9 + 2) / 5)
+    ((ENCODER_COUNTS_PER_REV * 17 + 5) / 10)
 #define OBSTACLE_FORWARD_SLOWDOWN_COUNTS 200
 #define OBSTACLE_FORWARD_POSITION_TOLERANCE 8
 #define OBSTACLE_FORWARD_MIN_DUTY 140
@@ -181,7 +187,12 @@ typedef struct {
     int correction;
     int a_command;
     int d_command;
-    int tracking_frames;
+    int speed_pi_integral_a;
+    int speed_pi_integral_d;
+    int speed_pi_output_a;
+    int speed_pi_output_d;
+    int speed_delta_a;
+    int speed_delta_d;
     int hint_candidate_direction;
     int hint_candidate_frames;
     int clean_straight_frames;
@@ -192,6 +203,9 @@ typedef struct {
     int64_t turn_armed_us;
     int64_t turn_arm_ignore_until_us;
     int64_t pivot_started_us;
+    int64_t speed_pi_last_update_us;
+    int32_t speed_pi_previous_a;
+    int32_t speed_pi_previous_d;
     bool initialized;
     bool turn_armed;
     bool pivot_active;
@@ -1147,9 +1161,77 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
     }
 }
 
+static void reset_follow_speed_pi(pursuit_controller_t *controller,
+                                  int64_t now_us)
+{
+    controller->speed_pi_last_update_us = now_us;
+    controller->speed_pi_previous_a = s_encoders[WHEEL_A].count;
+    controller->speed_pi_previous_d = s_encoders[WHEEL_D].count;
+    controller->speed_pi_integral_a = 0;
+    controller->speed_pi_integral_d = 0;
+    controller->speed_pi_output_a = 0;
+    controller->speed_pi_output_d = 0;
+    controller->speed_delta_a = 0;
+    controller->speed_delta_d = 0;
+}
+
 static void reset_controller(pursuit_controller_t *controller)
 {
     memset(controller, 0, sizeof(*controller));
+    reset_follow_speed_pi(controller, esp_timer_get_time());
+}
+
+static int update_follow_speed_pi_wheel(int request, int delta,
+                                        int *integral)
+{
+    const int target = request * FOLLOW_SPEED_MIN_TARGET_NUM /
+                       FOLLOW_SPEED_MIN_TARGET_DEN;
+    const int error = target - delta;
+    if (error > 0) {
+        *integral = clamp_int(
+            *integral + error, 0, FOLLOW_SPEED_PI_INTEGRAL_MAX);
+    } else {
+        *integral /= 2;
+    }
+    int output = error > 0
+        ? error / FOLLOW_SPEED_PI_KP_DIV +
+              *integral / FOLLOW_SPEED_PI_KI_DIV
+        : *integral / FOLLOW_SPEED_PI_KI_DIV;
+    output = clamp_int(output, 0, FOLLOW_SPEED_PI_OUTPUT_MAX);
+    if (delta <= FOLLOW_SPEED_STALL_DELTA_MAX &&
+        output < FOLLOW_SPEED_STALL_KICK) {
+        output = FOLLOW_SPEED_STALL_KICK;
+    }
+    return output;
+}
+
+static void update_follow_speed_pi(pursuit_controller_t *controller,
+                                   int a_request, int d_request,
+                                   int64_t now_us)
+{
+    if (a_request <= 0 || d_request <= 0) {
+        reset_follow_speed_pi(controller, now_us);
+        return;
+    }
+    if (now_us - controller->speed_pi_last_update_us <
+        (int64_t)FOLLOW_SPEED_PI_UPDATE_MS * 1000) return;
+
+    const int32_t count_a = s_encoders[WHEEL_A].count;
+    const int32_t count_d = s_encoders[WHEEL_D].count;
+    controller->speed_delta_a =
+        abs(count_a - controller->speed_pi_previous_a);
+    controller->speed_delta_d =
+        abs(count_d - controller->speed_pi_previous_d);
+    controller->speed_pi_previous_a = count_a;
+    controller->speed_pi_previous_d = count_d;
+    controller->speed_pi_last_update_us = now_us;
+
+    controller->speed_pi_output_a = update_follow_speed_pi_wheel(
+        a_request, controller->speed_delta_a,
+        &controller->speed_pi_integral_a);
+    controller->speed_pi_output_d = update_follow_speed_pi_wheel(
+        d_request, controller->speed_delta_d,
+        &controller->speed_pi_integral_d);
 }
 
 static bool turn_hint_recent(const pursuit_controller_t *controller,
@@ -1218,13 +1300,6 @@ static void update_turn_hint(const line_vision_result_t *result,
 static void apply_tracking_control(int unsigned_error, int base_duty,
                                    pursuit_controller_t *controller)
 {
-    const int effective_base_duty =
-        controller->tracking_frames < FOLLOW_LAUNCH_FRAMES
-            ? FOLLOW_LAUNCH_DUTY
-            : base_duty;
-    if (controller->tracking_frames < FOLLOW_LAUNCH_FRAMES) {
-        controller->tracking_frames++;
-    }
     const int signed_error = STEERING_SIGN * unsigned_error;
     if (!controller->initialized) {
         controller->filtered_error = signed_error;
@@ -1255,11 +1330,19 @@ static void apply_tracking_control(int unsigned_error, int base_duty,
         controller->correction - FOLLOW_CORRECTION_STEP,
         controller->correction + FOLLOW_CORRECTION_STEP);
 
+    const int nominal_a = clamp_int(
+        base_duty - controller->correction,
+        FOLLOW_MIN_FORWARD_DUTY, FOLLOW_MAX_FORWARD_DUTY);
+    const int nominal_d = clamp_int(
+        base_duty + controller->correction,
+        FOLLOW_MIN_FORWARD_DUTY, FOLLOW_MAX_FORWARD_DUTY);
+    update_follow_speed_pi(controller, nominal_a, nominal_d,
+                           esp_timer_get_time());
     controller->a_command = clamp_int(
-        effective_base_duty - controller->correction,
+        nominal_a + controller->speed_pi_output_a,
         FOLLOW_MIN_FORWARD_DUTY, FOLLOW_MAX_FORWARD_DUTY);
     controller->d_command = clamp_int(
-        effective_base_duty + controller->correction,
+        nominal_d + controller->speed_pi_output_d,
         FOLLOW_MIN_FORWARD_DUTY, FOLLOW_MAX_FORWARD_DUTY);
     drive_wheels(controller->a_command, controller->d_command);
 }
@@ -1585,7 +1668,6 @@ static void control_task(void *argument)
                         const int completed_direction =
                             controller.turn_direction;
                         reset_controller(&controller);
-                        controller.tracking_frames = FOLLOW_LAUNCH_FRAMES;
                         controller.turn_arm_ignore_until_us = now_us +
                             (int64_t)TURN_REARM_COOLDOWN_MS * 1000;
                         apply_follow_control(&result, &controller);
@@ -1681,13 +1763,17 @@ static void control_task(void *argument)
                 : (controller.pivot_active ? "PIVOT" :
                     (controller.turn_armed ? "READY" : "FOLLOW"));
             ESP_LOGI(TAG,
-                     "RUN en=%d state=%s line=%d foot=%d err=%d corr=%d pwm=%d/%d dist=%dmm age=%lldms",
+                     "RUN en=%d state=%s line=%d foot=%d err=%d corr=%d pwm=%d/%d boost=%d/%d enc=%d/%d dist=%dmm age=%lldms",
                      s_enabled,
                      state,
                      line_valid, result.foot_track_valid,
                      controller.filtered_error,
                      controller.correction,
                      controller.a_command, controller.d_command,
+                     controller.speed_pi_output_a,
+                     controller.speed_pi_output_d,
+                     controller.speed_delta_a,
+                     controller.speed_delta_d,
                      obstacle.latest_distance_mm,
                      (long long)age_ms);
             last_report_us = now_us;
@@ -1744,9 +1830,11 @@ esp_err_t camera_line_follow_init(void)
     ESP_LOGW(TAG,
              "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG/TUNER/CALIB,0/1");
     ESP_LOGI(TAG,
-             "Foot-track controller: gate=center-half/12rows follow=%d correction<=%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",
+             "Foot-track controller: gate=center-half/12rows follow=%d correction<=%d antistall=%dms/+%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",
              FOLLOW_BASE_DUTY,
-             FOLLOW_CORRECTION_MAX, PIVOT_INNER_REVERSE_DUTY,
+             FOLLOW_CORRECTION_MAX, FOLLOW_SPEED_PI_UPDATE_MS,
+             FOLLOW_SPEED_PI_OUTPUT_MAX,
+             PIVOT_INNER_REVERSE_DUTY,
              PIVOT_OUTER_FORWARD_DUTY, PIVOT_REACQUIRE_FRAMES,
              TURN_HINT_ERROR,
              TURN_HINT_FAR_WEIGHT, FOOT_LOST_CONFIRM_FRAMES,
