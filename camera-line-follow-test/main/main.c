@@ -510,18 +510,15 @@ static void frame_display_task(void *argument)
                                                    ? vision_time_us / timed_frames
                                                    : 0;
             ESP_LOGI(TAG,
-                     "FRAME rx=%lu processed=%lu lcd=%lu dropped=%lu age=%lldms fps=rx%lu.%lu/proc%lu.%lu/lcd%lu.%lu cost=decode%luus/vision%luus",
-                     (unsigned long)received_now,
-                     (unsigned long)processed_frames,
-                     (unsigned long)displayed_now,
-                     (unsigned long)dropped_now,
-                     (long long)latest_frame_age_ms,
+                     "VIDEO fps=%lu.%lu/%lu.%lu/%lu.%lu drop=%lu age=%lldms cost=%lu/%luus",
                      (unsigned long)(rx_fps_x10 / 10),
                      (unsigned long)(rx_fps_x10 % 10),
                      (unsigned long)(processed_fps_x10 / 10),
                      (unsigned long)(processed_fps_x10 % 10),
                      (unsigned long)(lcd_fps_x10 / 10),
                      (unsigned long)(lcd_fps_x10 % 10),
+                     (unsigned long)dropped_now,
+                     (long long)latest_frame_age_ms,
                      (unsigned long)decode_average_us,
                      (unsigned long)vision_average_us);
             last_received_report = received_now;
@@ -653,11 +650,6 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
     for (size_t profile = 0;
          profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
         for (int attempt = 1; attempt <= 2; ++attempt) {
-            ESP_LOGI(TAG, "Trying %s %dx%d at %d fps (attempt %d)",
-                     profiles[profile].format == UVC_FRAME_FORMAT_YUYV
-                         ? "YUYV" : "MJPEG",
-                     profiles[profile].width, profiles[profile].height,
-                     profiles[profile].fps, attempt);
             result = uvc_get_stream_ctrl_format_size(device_handle, control,
                                                       profiles[profile].format,
                                                       profiles[profile].width,
@@ -741,7 +733,6 @@ void app_main(void)
         ESP_LOGI(TAG, "CAMERA_STATUS=UVC_OPEN");
         result = negotiate_mjpeg_stream(device_handle, &stream_control);
         if (result == UVC_SUCCESS) {
-            uvc_print_stream_ctrl(&stream_control, stderr);
             result = uvc_start_streaming(device_handle, &stream_control,
                                          camera_frame_callback, NULL, 0);
         }

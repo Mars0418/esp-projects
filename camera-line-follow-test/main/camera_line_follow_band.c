@@ -11,6 +11,7 @@
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -32,6 +33,16 @@
 #define MOTOR_D_IN2 GPIO_NUM_41
 #define MOTOR_D_CHANNEL LEDC_CHANNEL_2
 
+#define ULTRASONIC_TRIG_GPIO GPIO_NUM_48
+#define ULTRASONIC_ECHO_GPIO GPIO_NUM_39
+
+#define ENCODER_A_PHASE_A_GPIO GPIO_NUM_16
+#define ENCODER_A_PHASE_B_GPIO GPIO_NUM_17
+#define ENCODER_B_PHASE_A_GPIO GPIO_NUM_8
+#define ENCODER_B_PHASE_B_GPIO GPIO_NUM_18
+#define ENCODER_D_PHASE_A_GPIO GPIO_NUM_2
+#define ENCODER_D_PHASE_B_GPIO GPIO_NUM_1
+
 /* The chassis needs a short high-duty launch to overcome static friction. */
 #define FOLLOW_BASE_DUTY 195
 #define FOLLOW_TURN_APPROACH_DUTY 175
@@ -48,13 +59,13 @@
 #define FOLLOW_INTEGRAL_DIVISOR 800
 #define FOLLOW_MIN_CONFIDENCE 20
 #define FOLLOW_FRAME_TIMEOUT_MS 600
-#define TURN_HINT_ERROR 280
+#define TURN_HINT_ERROR 650
 #define TURN_HINT_FAR_WEIGHT 40
 #define TURN_HINT_CONFIRM_FRAMES 2
 #define TURN_HINT_MAX_AGE_MS 1200
 #define TURN_GEOMETRY_MIN_CONFIDENCE 50
 #define TURN_GEOMETRY_STRONG_CONFIDENCE 75
-#define TURN_GEOMETRY_MIN_ANGLE 25
+#define TURN_GEOMETRY_MIN_ANGLE 45
 #define TURN_REARM_COOLDOWN_MS 500
 #define TURN_CLEAN_STRAIGHT_FRAMES 3
 #define TURN_CLEAN_NEAR_DELTA_MAX 12
@@ -71,6 +82,81 @@
 #define PIVOT_REACQUIRE_FRAMES 2
 #define FOLLOW_STATUS_INTERVAL_MS 2000
 #define STEERING_SIGN -1
+
+/* Reuse the calibrated infrared-version obstacle bypass. Camera following
+ * holds the chassis on the incoming line before an obstacle is detected. */
+#define ULTRASONIC_SAMPLE_INTERVAL_MS 80
+#define ULTRASONIC_ECHO_TIMEOUT_US 25000
+#define ULTRASONIC_MOTOR_QUIET_US 2000
+#define OBSTACLE_TRIGGER_MM 120
+#define OBSTACLE_CONFIRM_SAMPLES 3
+#define ENCODER_COUNTS_PER_REV 406
+#define OBSTACLE_LEFT_REVS_NUM 12
+#define OBSTACLE_LEFT_REVS_DEN 5
+#define OBSTACLE_LEFT_REAR_TARGET_COUNTS \
+    ((ENCODER_COUNTS_PER_REV * OBSTACLE_LEFT_REVS_NUM + \
+      OBSTACLE_LEFT_REVS_DEN / 2) / OBSTACLE_LEFT_REVS_DEN)
+#define OBSTACLE_LEFT_STRAFE_TIMEOUT_MS 5000
+#define OBSTACLE_LEFT_SLOWDOWN_COUNTS 300
+#define OBSTACLE_LEFT_POSITION_TOLERANCE 12
+#define OBSTACLE_LEFT_SYNC_CORRECTION_MAX 35
+#define OBSTACLE_STRAFE_IMBALANCE_ABORT 180
+#define OBSTACLE_STRAFE_BRAKE_MS 80
+#define OBSTACLE_SETTLE_SAMPLE_MS 50
+#define OBSTACLE_SETTLE_SAMPLES 3
+#define OBSTACLE_SETTLE_MAX_DELTA 2
+#define OBSTACLE_SETTLE_TIMEOUT_MS 1000
+#define OBSTACLE_FORWARD_DUTY 180
+#define OBSTACLE_FORWARD_TARGET_COUNTS \
+    (ENCODER_COUNTS_PER_REV * 3 / 2)
+#define OBSTACLE_FORWARD_SLOWDOWN_COUNTS 200
+#define OBSTACLE_FORWARD_POSITION_TOLERANCE 8
+#define OBSTACLE_FORWARD_MIN_DUTY 140
+#define OBSTACLE_FORWARD_MAX_DUTY 230
+#define OBSTACLE_FORWARD_SYNC_CORRECTION_MAX 25
+#define OBSTACLE_FORWARD_IMBALANCE_ABORT 120
+#define OBSTACLE_FORWARD_BRAKE_MS 80
+#define OBSTACLE_FORWARD_TIMEOUT_MS 5000
+#define OBSTACLE_RIGHT_SEARCH_TIMEOUT_MS 8000
+#define OBSTACLE_REACQUIRE_CONFIRM_FRAMES 3
+#define OBSTACLE_CAMERA_CENTER_ERROR_MAX 180
+#define OBSTACLE_RIGHT_SYNC_CORRECTION_MAX 35
+#define OBSTACLE_FINAL_LOST_FRAMES 3
+
+#define KIWI_STRAFE_DIAGONAL_DUTY 150
+#define KIWI_STRAFE_REAR_DUTY 300
+#define KIWI_RIGHT_STRAFE_DIAGONAL_DUTY 100
+#define KIWI_RIGHT_STRAFE_REAR_DUTY 200
+#define KIWI_LEFT_A_DIRECTION -1
+#define KIWI_LEFT_B_DIRECTION -1
+#define KIWI_LEFT_D_DIRECTION 1
+#define STRAFE_SPEED_PI_UPDATE_MS 150
+#define STRAFE_SPEED_TARGET_NUM_LEFT 3
+#define STRAFE_SPEED_TARGET_DEN_LEFT 2
+#define STRAFE_SPEED_TARGET_NUM_RIGHT 3
+#define STRAFE_SPEED_TARGET_DEN_RIGHT 4
+#define STRAFE_SPEED_PI_KP_DIV 4
+#define STRAFE_SPEED_PI_KI_DIV 100
+#define STRAFE_SPEED_PI_INTEGRAL_MAX 4000
+#define STRAFE_SPEED_PI_OUTPUT_MAX 80
+#define STRAFE_DIAGONAL_MIN_DUTY 120
+#define STRAFE_DIAGONAL_MAX_DUTY 230
+#define STRAFE_REAR_MIN_DUTY 220
+#define STRAFE_REAR_MAX_DUTY 420
+#define STRAFE_LEFT_SLOW_DIAGONAL_MIN_DUTY 90
+#define STRAFE_LEFT_SLOW_REAR_MIN_DUTY 180
+#define STRAFE_RIGHT_DIAGONAL_MIN_DUTY 90
+#define STRAFE_RIGHT_DIAGONAL_MAX_DUTY 180
+#define STRAFE_RIGHT_REAR_MIN_DUTY 170
+#define STRAFE_RIGHT_REAR_MAX_DUTY 320
+
+#define FORWARD_SPEED_PI_UPDATE_MS 150
+#define FORWARD_SPEED_TARGET_NUM 3
+#define FORWARD_SPEED_TARGET_DEN 2
+#define FORWARD_SPEED_PI_KP_DIV 4
+#define FORWARD_SPEED_PI_KI_DIV 100
+#define FORWARD_SPEED_PI_INTEGRAL_MAX 1500
+#define FORWARD_SPEED_PI_OUTPUT_MAX 35
 
 #define NORMAL_UART_BAUD 115200
 #define TUNER_UART_BAUD 921600
@@ -107,6 +193,50 @@ typedef struct {
     bool pivot_active;
 } pursuit_controller_t;
 
+typedef struct {
+    gpio_num_t phase_a;
+    gpio_num_t phase_b;
+    volatile int32_t count;
+    volatile uint8_t previous_state;
+} encoder_t;
+
+enum {
+    WHEEL_A = 0,
+    WHEEL_B = 1,
+    WHEEL_D = 2,
+    WHEEL_COUNT = 3,
+};
+
+typedef enum {
+    OBSTACLE_IDLE,
+    OBSTACLE_STRAFE_LEFT,
+    OBSTACLE_STRAFE_LEFT_BRAKE,
+    OBSTACLE_STRAFE_LEFT_SETTLE,
+    OBSTACLE_FORWARD,
+    OBSTACLE_FORWARD_BRAKE,
+    OBSTACLE_FORWARD_SETTLE,
+    OBSTACLE_STRAFE_RIGHT_FIND_CENTER,
+    OBSTACLE_STRAFE_RIGHT_BRAKE,
+    OBSTACLE_STRAFE_RIGHT_SETTLE,
+    OBSTACLE_FINAL_FORWARD,
+} obstacle_state_t;
+
+typedef struct {
+    obstacle_state_t state;
+    int near_samples;
+    int reacquire_frames;
+    int final_lost_frames;
+    int latest_distance_mm;
+    int64_t next_ultrasonic_sample_us;
+    int64_t state_started_us;
+    int32_t strafe_start_count[WHEEL_COUNT];
+    int32_t forward_start_a_count;
+    int32_t forward_start_d_count;
+    int32_t settle_previous_count[WHEEL_COUNT];
+    int64_t settle_next_sample_us;
+    int settle_stable_samples;
+} obstacle_controller_t;
+
 static const char *TAG = "CAMERA_PURSUIT";
 static const motor_t s_motor_a = {
     MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, MOTOR_A_CHANNEL};
@@ -114,6 +244,26 @@ static const motor_t s_motor_b = {
     MOTOR_B_PWM, MOTOR_B_IN1, MOTOR_B_IN2, MOTOR_B_CHANNEL};
 static const motor_t s_motor_d = {
     MOTOR_D_PWM, MOTOR_D_IN1, MOTOR_D_IN2, MOTOR_D_CHANNEL};
+static const motor_t *const s_motors[WHEEL_COUNT] = {
+    &s_motor_a, &s_motor_b, &s_motor_d};
+static encoder_t s_encoders[WHEEL_COUNT] = {
+    {ENCODER_A_PHASE_A_GPIO, ENCODER_A_PHASE_B_GPIO, 0, 0},
+    {ENCODER_B_PHASE_A_GPIO, ENCODER_B_PHASE_B_GPIO, 0, 0},
+    {ENCODER_D_PHASE_A_GPIO, ENCODER_D_PHASE_B_GPIO, 0, 0},
+};
+
+static int64_t s_strafe_pi_last_update_us;
+static int32_t s_strafe_pi_previous[WHEEL_COUNT];
+static int s_strafe_pi_integral[WHEEL_COUNT];
+static int s_strafe_pi_output[WHEEL_COUNT];
+static int s_strafe_balance_output[WHEEL_COUNT];
+static int64_t s_forward_pi_last_update_us;
+static int32_t s_forward_pi_previous_a;
+static int32_t s_forward_pi_previous_d;
+static int s_forward_pi_integral_a;
+static int s_forward_pi_integral_d;
+static int s_forward_pi_output_a;
+static int s_forward_pi_output_d;
 
 static portMUX_TYPE s_result_lock = portMUX_INITIALIZER_UNLOCKED;
 static line_vision_result_t s_latest_result;
@@ -175,6 +325,270 @@ static void drive_wheels(int a_command, int d_command)
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
 }
 
+static const int8_t s_quadrature_delta[16] = {
+     0,  1, -1,  0,
+    -1,  0,  0,  1,
+     1,  0,  0, -1,
+     0, -1,  1,  0,
+};
+
+static uint8_t encoder_read_state(const encoder_t *encoder)
+{
+    return ((uint8_t)gpio_get_level(encoder->phase_a) << 1) |
+           (uint8_t)gpio_get_level(encoder->phase_b);
+}
+
+static void encoder_gpio_isr(void *argument)
+{
+    encoder_t *encoder = (encoder_t *)argument;
+    const uint8_t current_state = encoder_read_state(encoder);
+    const uint8_t transition =
+        (uint8_t)((encoder->previous_state << 2) | current_state);
+    encoder->count += s_quadrature_delta[transition];
+    encoder->previous_state = current_state;
+}
+
+static esp_err_t configure_encoders(void)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = (1ULL << ENCODER_A_PHASE_A_GPIO) |
+                        (1ULL << ENCODER_A_PHASE_B_GPIO) |
+                        (1ULL << ENCODER_B_PHASE_A_GPIO) |
+                        (1ULL << ENCODER_B_PHASE_B_GPIO) |
+                        (1ULL << ENCODER_D_PHASE_A_GPIO) |
+                        (1ULL << ENCODER_D_PHASE_B_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&config), TAG,
+                        "encoder GPIO config failed");
+    const esp_err_t service_error = gpio_install_isr_service(0);
+    if (service_error != ESP_OK && service_error != ESP_ERR_INVALID_STATE) {
+        return service_error;
+    }
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        s_encoders[wheel].count = 0;
+        s_encoders[wheel].previous_state =
+            encoder_read_state(&s_encoders[wheel]);
+        ESP_RETURN_ON_ERROR(
+            gpio_isr_handler_add(s_encoders[wheel].phase_a,
+                                 encoder_gpio_isr, &s_encoders[wheel]),
+            TAG, "encoder phase A handler failed");
+        ESP_RETURN_ON_ERROR(
+            gpio_isr_handler_add(s_encoders[wheel].phase_b,
+                                 encoder_gpio_isr, &s_encoders[wheel]),
+            TAG, "encoder phase B handler failed");
+    }
+    return ESP_OK;
+}
+
+static void configure_ultrasonic(void)
+{
+    set_output_low(ULTRASONIC_TRIG_GPIO);
+    const gpio_config_t echo_config = {
+        .pin_bit_mask = 1ULL << ULTRASONIC_ECHO_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&echo_config));
+}
+
+static int read_ultrasonic_distance_mm(void)
+{
+    int64_t deadline_us =
+        esp_timer_get_time() + ULTRASONIC_ECHO_TIMEOUT_US;
+    while (gpio_get_level(ULTRASONIC_ECHO_GPIO)) {
+        if (esp_timer_get_time() >= deadline_us) return -1;
+    }
+
+    ESP_ERROR_CHECK(gpio_set_level(ULTRASONIC_TRIG_GPIO, 0));
+    esp_rom_delay_us(2);
+    ESP_ERROR_CHECK(gpio_set_level(ULTRASONIC_TRIG_GPIO, 1));
+    esp_rom_delay_us(10);
+    ESP_ERROR_CHECK(gpio_set_level(ULTRASONIC_TRIG_GPIO, 0));
+
+    deadline_us = esp_timer_get_time() + ULTRASONIC_ECHO_TIMEOUT_US;
+    while (!gpio_get_level(ULTRASONIC_ECHO_GPIO)) {
+        if (esp_timer_get_time() >= deadline_us) return -1;
+    }
+    const int64_t echo_start_us = esp_timer_get_time();
+    deadline_us = echo_start_us + ULTRASONIC_ECHO_TIMEOUT_US;
+    while (gpio_get_level(ULTRASONIC_ECHO_GPIO)) {
+        if (esp_timer_get_time() >= deadline_us) return -1;
+    }
+    const int64_t echo_width_us = esp_timer_get_time() - echo_start_us;
+    return (int)((echo_width_us * 10 + 29) / 58);
+}
+
+static bool update_ultrasonic(obstacle_controller_t *obstacle,
+                              int64_t now_us)
+{
+    if (now_us < obstacle->next_ultrasonic_sample_us) return false;
+    obstacle->next_ultrasonic_sample_us = now_us +
+        (int64_t)ULTRASONIC_SAMPLE_INTERVAL_MS * 1000;
+
+    const bool driver_was_enabled =
+        gpio_get_level(DRIVER_STBY) != 0;
+    if (driver_was_enabled) {
+        ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 0));
+        esp_rom_delay_us(ULTRASONIC_MOTOR_QUIET_US);
+    }
+    obstacle->latest_distance_mm = read_ultrasonic_distance_mm();
+    if (driver_was_enabled) {
+        ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+    }
+    return true;
+}
+
+static void brake_motors(void)
+{
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        ESP_ERROR_CHECK(gpio_set_level(s_motors[wheel]->in1, 1));
+        ESP_ERROR_CHECK(gpio_set_level(s_motors[wheel]->in2, 1));
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,
+                                      s_motors[wheel]->channel, 1023));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,
+                                         s_motors[wheel]->channel));
+    }
+    ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+}
+
+static void reset_strafe_pi(int64_t now_us)
+{
+    s_strafe_pi_last_update_us = now_us;
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        s_strafe_pi_previous[wheel] = s_encoders[wheel].count;
+        s_strafe_pi_integral[wheel] = 0;
+        s_strafe_pi_output[wheel] = 0;
+        s_strafe_balance_output[wheel] = 0;
+    }
+}
+
+static void update_strafe_pi(bool left, int speed_percent,
+                             int64_t now_us)
+{
+    if (now_us - s_strafe_pi_last_update_us <
+        (int64_t)STRAFE_SPEED_PI_UPDATE_MS * 1000) return;
+
+    const int diagonal_request = left ? KIWI_STRAFE_DIAGONAL_DUTY
+                                      : KIWI_RIGHT_STRAFE_DIAGONAL_DUTY;
+    const int rear_request = left ? KIWI_STRAFE_REAR_DUTY
+                                  : KIWI_RIGHT_STRAFE_REAR_DUTY;
+    const int target_num = left ? STRAFE_SPEED_TARGET_NUM_LEFT
+                                : STRAFE_SPEED_TARGET_NUM_RIGHT;
+    const int target_den = left ? STRAFE_SPEED_TARGET_DEN_LEFT
+                                : STRAFE_SPEED_TARGET_DEN_RIGHT;
+    const int request[WHEEL_COUNT] = {
+        diagonal_request, rear_request, diagonal_request};
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        const int32_t count = s_encoders[wheel].count;
+        const int delta = abs(count - s_strafe_pi_previous[wheel]);
+        s_strafe_pi_previous[wheel] = count;
+        const int target = request[wheel] * speed_percent / 100 *
+                           target_num / target_den;
+        const int error = target - delta;
+        s_strafe_pi_integral[wheel] = clamp_int(
+            s_strafe_pi_integral[wheel] + error,
+            -STRAFE_SPEED_PI_INTEGRAL_MAX,
+            STRAFE_SPEED_PI_INTEGRAL_MAX);
+        s_strafe_pi_output[wheel] = clamp_int(
+            error / STRAFE_SPEED_PI_KP_DIV +
+                s_strafe_pi_integral[wheel] /
+                    STRAFE_SPEED_PI_KI_DIV,
+            -STRAFE_SPEED_PI_OUTPUT_MAX,
+            STRAFE_SPEED_PI_OUTPUT_MAX);
+    }
+    s_strafe_pi_last_update_us = now_us;
+}
+
+static void apply_strafe(bool left, int speed_percent)
+{
+    const int direction = left ? 1 : -1;
+    const int diagonal_request =
+        (left ? KIWI_STRAFE_DIAGONAL_DUTY
+              : KIWI_RIGHT_STRAFE_DIAGONAL_DUTY) * speed_percent / 100;
+    const int rear_request =
+        (left ? KIWI_STRAFE_REAR_DUTY
+              : KIWI_RIGHT_STRAFE_REAR_DUTY) * speed_percent / 100;
+    const int diagonal_min = left
+        ? (speed_percent < 100 ? STRAFE_LEFT_SLOW_DIAGONAL_MIN_DUTY
+                               : STRAFE_DIAGONAL_MIN_DUTY)
+        : STRAFE_RIGHT_DIAGONAL_MIN_DUTY;
+    const int rear_min = left
+        ? (speed_percent < 100 ? STRAFE_LEFT_SLOW_REAR_MIN_DUTY
+                               : STRAFE_REAR_MIN_DUTY)
+        : STRAFE_RIGHT_REAR_MIN_DUTY;
+    const int diagonal_max = left ? STRAFE_DIAGONAL_MAX_DUTY
+                                  : STRAFE_RIGHT_DIAGONAL_MAX_DUTY;
+    const int rear_max = left ? STRAFE_REAR_MAX_DUTY
+                              : STRAFE_RIGHT_REAR_MAX_DUTY;
+    const int a_duty = clamp_int(
+        diagonal_request + s_strafe_pi_output[WHEEL_A] +
+            s_strafe_balance_output[WHEEL_A],
+        diagonal_min, diagonal_max);
+    const int b_duty = clamp_int(
+        rear_request + s_strafe_pi_output[WHEEL_B] +
+            s_strafe_balance_output[WHEEL_B],
+        rear_min, rear_max);
+    const int d_duty = clamp_int(
+        diagonal_request + s_strafe_pi_output[WHEEL_D] +
+            s_strafe_balance_output[WHEEL_D],
+        diagonal_min, diagonal_max);
+    motor_prepare(&s_motor_a, direction * KIWI_LEFT_A_DIRECTION, a_duty);
+    motor_prepare(&s_motor_b, direction * KIWI_LEFT_B_DIRECTION, b_duty);
+    motor_prepare(&s_motor_d, direction * KIWI_LEFT_D_DIRECTION, d_duty);
+    ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, 1));
+}
+
+static void reset_forward_pi(int64_t now_us)
+{
+    s_forward_pi_last_update_us = now_us;
+    s_forward_pi_previous_a = s_encoders[WHEEL_A].count;
+    s_forward_pi_previous_d = s_encoders[WHEEL_D].count;
+    s_forward_pi_integral_a = 0;
+    s_forward_pi_integral_d = 0;
+    s_forward_pi_output_a = 0;
+    s_forward_pi_output_d = 0;
+}
+
+static void update_forward_pi(int a_request, int d_request,
+                              int64_t now_us)
+{
+    if (now_us - s_forward_pi_last_update_us <
+        (int64_t)FORWARD_SPEED_PI_UPDATE_MS * 1000) return;
+    const int32_t count_a = s_encoders[WHEEL_A].count;
+    const int32_t count_d = s_encoders[WHEEL_D].count;
+    const int delta_a = abs(count_a - s_forward_pi_previous_a);
+    const int delta_d = abs(count_d - s_forward_pi_previous_d);
+    s_forward_pi_previous_a = count_a;
+    s_forward_pi_previous_d = count_d;
+    s_forward_pi_last_update_us = now_us;
+    const int error_a = a_request * FORWARD_SPEED_TARGET_NUM /
+                            FORWARD_SPEED_TARGET_DEN - delta_a;
+    const int error_d = d_request * FORWARD_SPEED_TARGET_NUM /
+                            FORWARD_SPEED_TARGET_DEN - delta_d;
+    s_forward_pi_integral_a = clamp_int(
+        s_forward_pi_integral_a + error_a,
+        -FORWARD_SPEED_PI_INTEGRAL_MAX,
+        FORWARD_SPEED_PI_INTEGRAL_MAX);
+    s_forward_pi_integral_d = clamp_int(
+        s_forward_pi_integral_d + error_d,
+        -FORWARD_SPEED_PI_INTEGRAL_MAX,
+        FORWARD_SPEED_PI_INTEGRAL_MAX);
+    s_forward_pi_output_a = clamp_int(
+        error_a / FORWARD_SPEED_PI_KP_DIV +
+            s_forward_pi_integral_a / FORWARD_SPEED_PI_KI_DIV,
+        -FORWARD_SPEED_PI_OUTPUT_MAX, FORWARD_SPEED_PI_OUTPUT_MAX);
+    s_forward_pi_output_d = clamp_int(
+        error_d / FORWARD_SPEED_PI_KP_DIV +
+            s_forward_pi_integral_d / FORWARD_SPEED_PI_KI_DIV,
+        -FORWARD_SPEED_PI_OUTPUT_MAX, FORWARD_SPEED_PI_OUTPUT_MAX);
+}
+
 static bool result_ready(const line_vision_result_t *result,
                          int64_t frame_us, int64_t now_us)
 {
@@ -182,6 +596,451 @@ static bool result_ready(const line_vision_result_t *result,
            result->path_length_pixels >= 9 &&
            result->confidence >= FOLLOW_MIN_CONFIDENCE && frame_us > 0 &&
            now_us - frame_us <= (int64_t)FOLLOW_FRAME_TIMEOUT_MS * 1000;
+}
+
+static void reset_controller(pursuit_controller_t *controller);
+static void apply_tracking_control(int unsigned_error, int base_duty,
+                                   pursuit_controller_t *controller);
+
+static const char *obstacle_state_name(obstacle_state_t state)
+{
+    switch (state) {
+    case OBSTACLE_IDLE: return "IDLE";
+    case OBSTACLE_STRAFE_LEFT: return "LEFT";
+    case OBSTACLE_STRAFE_LEFT_BRAKE: return "LEFT_BRAKE";
+    case OBSTACLE_STRAFE_LEFT_SETTLE: return "LEFT_SETTLE";
+    case OBSTACLE_FORWARD: return "FORWARD";
+    case OBSTACLE_FORWARD_BRAKE: return "FORWARD_BRAKE";
+    case OBSTACLE_FORWARD_SETTLE: return "FORWARD_SETTLE";
+    case OBSTACLE_STRAFE_RIGHT_FIND_CENTER: return "RIGHT_FIND";
+    case OBSTACLE_STRAFE_RIGHT_BRAKE: return "RIGHT_BRAKE";
+    case OBSTACLE_STRAFE_RIGHT_SETTLE: return "RIGHT_SETTLE";
+    case OBSTACLE_FINAL_FORWARD: return "FINAL";
+    default: return "INVALID";
+    }
+}
+
+static void reset_obstacle_controller(obstacle_controller_t *obstacle,
+                                      int64_t now_us)
+{
+    memset(obstacle, 0, sizeof(*obstacle));
+    obstacle->state = OBSTACLE_IDLE;
+    obstacle->latest_distance_mm = -1;
+    obstacle->next_ultrasonic_sample_us = now_us;
+    reset_strafe_pi(now_us);
+    reset_forward_pi(now_us);
+}
+
+static void get_strafe_progress(const obstacle_controller_t *obstacle,
+                                int progress[WHEEL_COUNT])
+{
+    progress[WHEEL_A] =
+        2 * abs(s_encoders[WHEEL_A].count -
+                obstacle->strafe_start_count[WHEEL_A]);
+    progress[WHEEL_B] =
+        abs(s_encoders[WHEEL_B].count -
+            obstacle->strafe_start_count[WHEEL_B]);
+    progress[WHEEL_D] =
+        2 * abs(s_encoders[WHEEL_D].count -
+                obstacle->strafe_start_count[WHEEL_D]);
+}
+
+static int progress_spread(const int progress[WHEEL_COUNT])
+{
+    int minimum = progress[0];
+    int maximum = progress[0];
+    for (size_t wheel = 1; wheel < WHEEL_COUNT; ++wheel) {
+        if (progress[wheel] < minimum) minimum = progress[wheel];
+        if (progress[wheel] > maximum) maximum = progress[wheel];
+    }
+    return maximum - minimum;
+}
+
+static int progress_average(const int progress[WHEEL_COUNT])
+{
+    return (progress[WHEEL_A] + progress[WHEEL_B] +
+            progress[WHEEL_D]) / WHEEL_COUNT;
+}
+
+static void fail_obstacle_action(obstacle_controller_t *obstacle,
+                                 const char *reason)
+{
+    stop_motors();
+    s_enabled = false;
+    obstacle->state = OBSTACLE_IDLE;
+    ESP_LOGE(TAG, "OBSTACLE failed: %s; stopped", reason);
+}
+
+static void start_obstacle_left(obstacle_controller_t *obstacle,
+                                int64_t now_us)
+{
+    stop_motors();
+    obstacle->state = OBSTACLE_STRAFE_LEFT;
+    obstacle->state_started_us = now_us;
+    obstacle->near_samples = 0;
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        obstacle->strafe_start_count[wheel] = s_encoders[wheel].count;
+    }
+    reset_strafe_pi(now_us);
+    apply_strafe(true, 100);
+    ESP_LOGW(TAG,
+             "OBSTACLE %dmm confirmed: STRAFE LEFT target=%d counts",
+             obstacle->latest_distance_mm,
+             OBSTACLE_LEFT_REAR_TARGET_COUNTS);
+}
+
+static bool check_obstacle_trigger(obstacle_controller_t *obstacle,
+                                   bool ultrasonic_sample_ready,
+                                   int64_t now_us)
+{
+    if (obstacle->state != OBSTACLE_IDLE ||
+        !ultrasonic_sample_ready) return false;
+    const int distance_mm = obstacle->latest_distance_mm;
+    if (distance_mm > 0 && distance_mm <= OBSTACLE_TRIGGER_MM) {
+        obstacle->near_samples++;
+    } else {
+        obstacle->near_samples = 0;
+    }
+    if (obstacle->near_samples < OBSTACLE_CONFIRM_SAMPLES) return false;
+    start_obstacle_left(obstacle, now_us);
+    return true;
+}
+
+static void start_settle(obstacle_controller_t *obstacle,
+                         obstacle_state_t state, int64_t now_us)
+{
+    stop_motors();
+    obstacle->state = state;
+    obstacle->state_started_us = now_us;
+    obstacle->settle_next_sample_us = now_us +
+        (int64_t)OBSTACLE_SETTLE_SAMPLE_MS * 1000;
+    obstacle->settle_stable_samples = 0;
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        obstacle->settle_previous_count[wheel] =
+            s_encoders[wheel].count;
+    }
+}
+
+static bool wheels_have_settled(obstacle_controller_t *obstacle,
+                                int64_t now_us)
+{
+    stop_motors();
+    if (now_us < obstacle->settle_next_sample_us) return false;
+    bool stopped = true;
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        const int32_t count = s_encoders[wheel].count;
+        if (abs(count - obstacle->settle_previous_count[wheel]) >
+            OBSTACLE_SETTLE_MAX_DELTA) {
+            stopped = false;
+        }
+        obstacle->settle_previous_count[wheel] = count;
+    }
+    obstacle->settle_stable_samples = stopped
+        ? obstacle->settle_stable_samples + 1 : 0;
+    obstacle->settle_next_sample_us = now_us +
+        (int64_t)OBSTACLE_SETTLE_SAMPLE_MS * 1000;
+    return obstacle->settle_stable_samples >= OBSTACLE_SETTLE_SAMPLES;
+}
+
+static void update_left_strafe(obstacle_controller_t *obstacle,
+                               int64_t now_us)
+{
+    int progress[WHEEL_COUNT];
+    get_strafe_progress(obstacle, progress);
+    const int average = progress_average(progress);
+    const int remaining = OBSTACLE_LEFT_REAR_TARGET_COUNTS - average;
+    const int elapsed_ms =
+        (int)((now_us - obstacle->state_started_us) / 1000);
+    if (average >= OBSTACLE_LEFT_REAR_TARGET_COUNTS -
+                       OBSTACLE_LEFT_POSITION_TOLERANCE) {
+        if (progress_spread(progress) >
+            OBSTACLE_STRAFE_IMBALANCE_ABORT) {
+            fail_obstacle_action(obstacle,
+                                 "left strafe encoder imbalance");
+            return;
+        }
+        obstacle->state = OBSTACLE_STRAFE_LEFT_BRAKE;
+        obstacle->state_started_us = now_us;
+        brake_motors();
+        ESP_LOGW(TAG, "STRAFE LEFT reached Aeq=%d B=%d Deq=%d",
+                 progress[WHEEL_A], progress[WHEEL_B], progress[WHEEL_D]);
+        return;
+    }
+    if (elapsed_ms >= OBSTACLE_LEFT_STRAFE_TIMEOUT_MS) {
+        fail_obstacle_action(obstacle, "left strafe timeout");
+        return;
+    }
+    const int speed_percent = remaining >= OBSTACLE_LEFT_SLOWDOWN_COUNTS
+        ? 100
+        : clamp_int(45 + 55 * (remaining > 0 ? remaining : 0) /
+                              OBSTACLE_LEFT_SLOWDOWN_COUNTS,
+                    45, 100);
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        s_strafe_balance_output[wheel] = clamp_int(
+            (average - progress[wheel]) / 6,
+            -OBSTACLE_LEFT_SYNC_CORRECTION_MAX,
+            OBSTACLE_LEFT_SYNC_CORRECTION_MAX);
+    }
+    update_strafe_pi(true, speed_percent, now_us);
+    apply_strafe(true, speed_percent);
+}
+
+static void start_obstacle_forward(obstacle_controller_t *obstacle,
+                                   int64_t now_us)
+{
+    stop_motors();
+    obstacle->state = OBSTACLE_FORWARD;
+    obstacle->state_started_us = now_us;
+    obstacle->forward_start_a_count = s_encoders[WHEEL_A].count;
+    obstacle->forward_start_d_count = s_encoders[WHEEL_D].count;
+    reset_forward_pi(now_us);
+    drive_wheels(OBSTACLE_FORWARD_DUTY, OBSTACLE_FORWARD_DUTY);
+    ESP_LOGW(TAG, "OBSTACLE FORWARD target=%d counts",
+             OBSTACLE_FORWARD_TARGET_COUNTS);
+}
+
+static void update_obstacle_forward(obstacle_controller_t *obstacle,
+                                    int64_t now_us)
+{
+    const int a_progress =
+        abs(s_encoders[WHEEL_A].count -
+            obstacle->forward_start_a_count);
+    const int d_progress =
+        abs(s_encoders[WHEEL_D].count -
+            obstacle->forward_start_d_count);
+    const int average = (a_progress + d_progress) / 2;
+    const int remaining = OBSTACLE_FORWARD_TARGET_COUNTS - average;
+    const int elapsed_ms =
+        (int)((now_us - obstacle->state_started_us) / 1000);
+    if (average >= OBSTACLE_FORWARD_TARGET_COUNTS -
+                       OBSTACLE_FORWARD_POSITION_TOLERANCE) {
+        if (abs(a_progress - d_progress) >
+            OBSTACLE_FORWARD_IMBALANCE_ABORT) {
+            fail_obstacle_action(obstacle,
+                                 "forward encoder imbalance");
+            return;
+        }
+        obstacle->state = OBSTACLE_FORWARD_BRAKE;
+        obstacle->state_started_us = now_us;
+        brake_motors();
+        ESP_LOGW(TAG, "OBSTACLE FORWARD reached A=%d D=%d",
+                 a_progress, d_progress);
+        return;
+    }
+    if (elapsed_ms >= OBSTACLE_FORWARD_TIMEOUT_MS) {
+        fail_obstacle_action(obstacle, "forward timeout");
+        return;
+    }
+    const int speed_percent = remaining >=
+            OBSTACLE_FORWARD_SLOWDOWN_COUNTS
+        ? 100
+        : clamp_int(55 + 45 * (remaining > 0 ? remaining : 0) /
+                              OBSTACLE_FORWARD_SLOWDOWN_COUNTS,
+                    55, 100);
+    const int base_duty = OBSTACLE_FORWARD_DUTY * speed_percent / 100;
+    const int a_sync = clamp_int((average - a_progress) / 4,
+        -OBSTACLE_FORWARD_SYNC_CORRECTION_MAX,
+        OBSTACLE_FORWARD_SYNC_CORRECTION_MAX);
+    const int d_sync = clamp_int((average - d_progress) / 4,
+        -OBSTACLE_FORWARD_SYNC_CORRECTION_MAX,
+        OBSTACLE_FORWARD_SYNC_CORRECTION_MAX);
+    update_forward_pi(base_duty, base_duty, now_us);
+    const int a_duty = clamp_int(
+        base_duty + s_forward_pi_output_a + a_sync,
+        OBSTACLE_FORWARD_MIN_DUTY, OBSTACLE_FORWARD_MAX_DUTY);
+    const int d_duty = clamp_int(
+        base_duty + s_forward_pi_output_d + d_sync,
+        OBSTACLE_FORWARD_MIN_DUTY, OBSTACLE_FORWARD_MAX_DUTY);
+    drive_wheels(a_duty, d_duty);
+}
+
+static void start_right_search(obstacle_controller_t *obstacle,
+                               int64_t now_us)
+{
+    stop_motors();
+    obstacle->state = OBSTACLE_STRAFE_RIGHT_FIND_CENTER;
+    obstacle->state_started_us = now_us;
+    obstacle->reacquire_frames = 0;
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        obstacle->strafe_start_count[wheel] = s_encoders[wheel].count;
+    }
+    reset_strafe_pi(now_us);
+    apply_strafe(false, 100);
+    ESP_LOGW(TAG, "OBSTACLE STRAFE RIGHT until camera line centered");
+}
+
+static void update_right_search(obstacle_controller_t *obstacle,
+                                const line_vision_result_t *result,
+                                bool line_valid, bool new_frame,
+                                int64_t now_us)
+{
+    int progress[WHEEL_COUNT];
+    get_strafe_progress(obstacle, progress);
+    const int elapsed_ms =
+        (int)((now_us - obstacle->state_started_us) / 1000);
+    if (elapsed_ms >= OBSTACLE_RIGHT_SEARCH_TIMEOUT_MS) {
+        fail_obstacle_action(obstacle, "right strafe line timeout");
+        return;
+    }
+    if (progress_spread(progress) > OBSTACLE_STRAFE_IMBALANCE_ABORT) {
+        fail_obstacle_action(obstacle,
+                             "right strafe encoder imbalance");
+        return;
+    }
+
+    if (new_frame) {
+        const bool centered = line_valid && result->foot_track_centered &&
+            abs(result->foot_lateral_error) <=
+                OBSTACLE_CAMERA_CENTER_ERROR_MAX;
+        obstacle->reacquire_frames = centered
+            ? obstacle->reacquire_frames + 1 : 0;
+        if (obstacle->reacquire_frames >=
+            OBSTACLE_REACQUIRE_CONFIRM_FRAMES) {
+            obstacle->state = OBSTACLE_STRAFE_RIGHT_BRAKE;
+            obstacle->state_started_us = now_us;
+            brake_motors();
+            ESP_LOGW(TAG,
+                     "CAMERA LINE CENTERED err=%d frames=%d Aeq=%d B=%d Deq=%d",
+                     result->foot_lateral_error,
+                     obstacle->reacquire_frames,
+                     progress[WHEEL_A], progress[WHEEL_B],
+                     progress[WHEEL_D]);
+            return;
+        }
+        if (obstacle->reacquire_frames > 0) {
+            /* Pause immediately on the first centered frame so the 15 fps
+             * confirmation interval does not carry the chassis past center. */
+            brake_motors();
+            return;
+        }
+    } else if (obstacle->reacquire_frames > 0) {
+        brake_motors();
+        return;
+    }
+
+    const int average = progress_average(progress);
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        s_strafe_balance_output[wheel] = clamp_int(
+            (average - progress[wheel]) / 6,
+            -OBSTACLE_RIGHT_SYNC_CORRECTION_MAX,
+            OBSTACLE_RIGHT_SYNC_CORRECTION_MAX);
+    }
+    update_strafe_pi(false, 100, now_us);
+    apply_strafe(false, 100);
+}
+
+static void start_final_forward(obstacle_controller_t *obstacle,
+                                pursuit_controller_t *controller,
+                                int64_t now_us)
+{
+    obstacle->state = OBSTACLE_FINAL_FORWARD;
+    obstacle->state_started_us = now_us;
+    obstacle->final_lost_frames = 0;
+    reset_controller(controller);
+    controller->a_command = FOLLOW_BASE_DUTY;
+    controller->d_command = FOLLOW_BASE_DUTY;
+    drive_wheels(controller->a_command, controller->d_command);
+    ESP_LOGW(TAG,
+             "OBSTACLE BYPASS COMPLETE: FINAL LINE FOLLOW, turns disabled");
+}
+
+/* Return true while the obstacle/final-course state machine owns all motors. */
+static bool update_obstacle_action(obstacle_controller_t *obstacle,
+                                   pursuit_controller_t *controller,
+                                   const line_vision_result_t *result,
+                                   bool line_valid, bool new_frame,
+                                   int64_t now_us)
+{
+    const int elapsed_ms =
+        (int)((now_us - obstacle->state_started_us) / 1000);
+    switch (obstacle->state) {
+    case OBSTACLE_IDLE:
+        return false;
+    case OBSTACLE_STRAFE_LEFT:
+        update_left_strafe(obstacle, now_us);
+        return true;
+    case OBSTACLE_STRAFE_LEFT_BRAKE:
+        if (elapsed_ms >= OBSTACLE_STRAFE_BRAKE_MS) {
+            start_settle(obstacle, OBSTACLE_STRAFE_LEFT_SETTLE,
+                         now_us);
+        } else {
+            brake_motors();
+        }
+        return true;
+    case OBSTACLE_STRAFE_LEFT_SETTLE:
+        if (elapsed_ms >= OBSTACLE_SETTLE_TIMEOUT_MS) {
+            fail_obstacle_action(obstacle, "left wheels did not settle");
+        } else if (wheels_have_settled(obstacle, now_us)) {
+            start_obstacle_forward(obstacle, now_us);
+        }
+        return true;
+    case OBSTACLE_FORWARD:
+        update_obstacle_forward(obstacle, now_us);
+        return true;
+    case OBSTACLE_FORWARD_BRAKE:
+        if (elapsed_ms >= OBSTACLE_FORWARD_BRAKE_MS) {
+            start_settle(obstacle, OBSTACLE_FORWARD_SETTLE, now_us);
+        } else {
+            brake_motors();
+        }
+        return true;
+    case OBSTACLE_FORWARD_SETTLE:
+        if (elapsed_ms >= OBSTACLE_SETTLE_TIMEOUT_MS) {
+            fail_obstacle_action(obstacle,
+                                 "forward wheels did not settle");
+        } else if (wheels_have_settled(obstacle, now_us)) {
+            start_right_search(obstacle, now_us);
+        }
+        return true;
+    case OBSTACLE_STRAFE_RIGHT_FIND_CENTER:
+        update_right_search(obstacle, result, line_valid, new_frame,
+                            now_us);
+        return true;
+    case OBSTACLE_STRAFE_RIGHT_BRAKE:
+        if (elapsed_ms >= OBSTACLE_STRAFE_BRAKE_MS) {
+            start_settle(obstacle, OBSTACLE_STRAFE_RIGHT_SETTLE,
+                         now_us);
+        } else {
+            brake_motors();
+        }
+        return true;
+    case OBSTACLE_STRAFE_RIGHT_SETTLE:
+        if (elapsed_ms >= OBSTACLE_SETTLE_TIMEOUT_MS) {
+            fail_obstacle_action(obstacle,
+                                 "right wheels did not settle");
+        } else if (wheels_have_settled(obstacle, now_us)) {
+            start_final_forward(obstacle, controller, now_us);
+        }
+        return true;
+    case OBSTACLE_FINAL_FORWARD:
+        if (new_frame) {
+            const bool foot_valid =
+                line_valid && result->foot_track_valid;
+            obstacle->final_lost_frames = foot_valid
+                ? 0 : obstacle->final_lost_frames + 1;
+            if (obstacle->final_lost_frames >=
+                OBSTACLE_FINAL_LOST_FRAMES) {
+                stop_motors();
+                s_enabled = false;
+                ESP_LOGW(TAG,
+                         "FINAL black line lost for %d frames: stopped",
+                         obstacle->final_lost_frames);
+                return true;
+            }
+            if (foot_valid) {
+                /* Reuse ordinary foot-position correction, but deliberately
+                 * skip update_turn_hint(), arm_turn() and every pivot state. */
+                apply_tracking_control(result->foot_lateral_error,
+                                       FOLLOW_BASE_DUTY, controller);
+                return true;
+            }
+        }
+        drive_wheels(controller->a_command, controller->d_command);
+        return true;
+    default:
+        fail_obstacle_action(obstacle, "invalid obstacle state");
+        return true;
+    }
 }
 
 static void reset_controller(pursuit_controller_t *controller)
@@ -350,12 +1209,16 @@ static bool arm_turn(const line_vision_result_t *result,
     controller->turn_armed = true;
     controller->turn_armed_us = now_us;
     ESP_LOGW(TAG,
-             "TURN READY direction=%d clean=%d foot=%d center=%d path=%d",
+             "TURN READY direction=%d clean=%d foot=%d center=%d path=%d angle=%d tconf=%d steer=%d weight=%d",
              controller->turn_direction,
              controller->clean_straight_frames,
              result->foot_pixel_count,
              result->foot_center_pixel_count,
-             result->foot_path_length_pixels);
+             result->foot_path_length_pixels,
+             result->turn_angle_deg,
+             result->turn_confidence,
+             result->steering_error,
+             result->far_preview_weight);
     return true;
 }
 
@@ -543,8 +1406,11 @@ static void control_task(void *argument)
     (void)argument;
     pursuit_controller_t controller;
     reset_controller(&controller);
+    obstacle_controller_t obstacle;
+    reset_obstacle_controller(&obstacle, esp_timer_get_time());
     uint32_t processed_sequence = 0;
     int64_t last_report_us = 0;
+    bool previous_enabled = false;
 
     while (true) {
         handle_uart_command();
@@ -562,6 +1428,22 @@ static void control_task(void *argument)
             now_us - frame_us <= (int64_t)FOLLOW_FRAME_TIMEOUT_MS * 1000;
         const bool line_valid = result_ready(&result, frame_us, now_us);
         const bool foot_valid = line_valid && result.foot_track_valid;
+        const bool new_frame = sequence != processed_sequence;
+
+        if (s_enabled && !previous_enabled) {
+            reset_controller(&controller);
+            reset_obstacle_controller(&obstacle, now_us);
+        } else if (!s_enabled && previous_enabled) {
+            reset_obstacle_controller(&obstacle, now_us);
+        }
+
+        bool ultrasonic_sample_ready = false;
+        if (obstacle.state == OBSTACLE_IDLE &&
+            !s_tuner_enabled && !s_calibration_enabled &&
+            !s_debug_enabled) {
+            ultrasonic_sample_ready =
+                update_ultrasonic(&obstacle, now_us);
+        }
 
         if (!s_enabled) {
             reset_controller(&controller);
@@ -569,8 +1451,21 @@ static void control_task(void *argument)
             s_enabled = false;
             stop_motors();
             reset_controller(&controller);
+            reset_obstacle_controller(&obstacle, now_us);
             ESP_LOGE(TAG, "STALE CAMERA FRAME: motors stopped");
-        } else if (sequence != processed_sequence) {
+        } else {
+            if (check_obstacle_trigger(&obstacle,
+                                       ultrasonic_sample_ready,
+                                       now_us)) {
+                reset_controller(&controller);
+            }
+
+            const bool obstacle_owns_motors =
+                update_obstacle_action(&obstacle, &controller, &result,
+                                       line_valid, new_frame, now_us);
+            if (obstacle_owns_motors) {
+                if (new_frame) processed_sequence = sequence;
+            } else if (new_frame) {
             if (controller.pivot_active) {
                 const int64_t pivot_ms =
                     (now_us - controller.pivot_started_us) / 1000;
@@ -694,42 +1589,31 @@ static void control_task(void *argument)
                 }
             }
             processed_sequence = sequence;
+            }
         }
 
         if (now_us - last_report_us >=
             (int64_t)FOLLOW_STATUS_INTERVAL_MS * 1000) {
             const int64_t age_ms = frame_us > 0 ? (now_us - frame_us) / 1000
                                                 : -1;
+            const char *state = obstacle.state != OBSTACLE_IDLE
+                ? obstacle_state_name(obstacle.state)
+                : (controller.pivot_active ? "PIVOT" :
+                    (controller.commit_active ? "COMMIT" :
+                     (controller.turn_armed ? "READY" : "FOLLOW")));
             ESP_LOGI(TAG,
-                     "PURSUIT en=%d state=%s vision=%d foot=%d centered=%d conf=%d fpix=%d cpix=%d fpath=%d flat=%d near=%d nlook=%d,%d farlook=%d,%d weight=%d far=%d path=%d lat=%d head=%d steer=%d clean=%d lost=%d hint=%d/%d filt=%d integ=%d corr=%d reacq=%d A=%d D=%d age=%lldms",
+                     "RUN en=%d state=%s line=%d foot=%d err=%d corr=%d pwm=%d/%d dist=%dmm age=%lldms",
                      s_enabled,
-                     controller.pivot_active ? "PIVOT" :
-                         (controller.commit_active ? "COMMIT" :
-                          (controller.turn_armed ? "READY" : "FOLLOW")),
+                     state,
                      line_valid, result.foot_track_valid,
-                     result.foot_track_centered, result.confidence,
-                     result.foot_pixel_count,
-                     result.foot_center_pixel_count,
-                     result.foot_path_length_pixels,
-                     result.foot_lateral_error,
-                     result.near_x, result.near_lookahead_x,
-                     result.near_lookahead_y, result.lookahead_x,
-                     result.lookahead_y, result.far_preview_weight,
-                     result.far_x,
-                     result.path_length_pixels, result.lateral_error,
-                     result.heading_error, result.steering_error,
-                     controller.clean_straight_frames,
-                     controller.foot_lost_frames,
-                     controller.turn_direction,
-                     controller.hint_candidate_frames,
                      controller.filtered_error,
-                     controller.integral_error / FOLLOW_INTEGRAL_DIVISOR,
                      controller.correction,
-                     controller.reacquire_frames,
                      controller.a_command, controller.d_command,
+                     obstacle.latest_distance_mm,
                      (long long)age_ms);
             last_report_us = now_us;
         }
+        previous_enabled = s_enabled;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -765,6 +1649,9 @@ esp_err_t camera_line_follow_init(void)
                             "PWM channel failed");
     }
     stop_motors();
+    ESP_RETURN_ON_ERROR(configure_encoders(), TAG,
+                        "encoder initialization failed");
+    configure_ultrasonic();
 
     const esp_err_t uart_error = uart_driver_install(UART_NUM_0, 1024, 0, 0,
                                                       NULL, 0);
@@ -785,6 +1672,13 @@ esp_err_t camera_line_follow_init(void)
              TURN_HINT_ERROR,
              TURN_HINT_FAR_WEIGHT, FOOT_LOST_CONFIRM_FRAMES,
              PIVOT_MAX_MS);
+    ESP_LOGI(TAG,
+             "Obstacle bypass: trigger<=%dmm x%d left=%dcounts forward=%dcounts right-center<=%d final-lost=%dframes",
+             OBSTACLE_TRIGGER_MM, OBSTACLE_CONFIRM_SAMPLES,
+             OBSTACLE_LEFT_REAR_TARGET_COUNTS,
+             OBSTACLE_FORWARD_TARGET_COUNTS,
+             OBSTACLE_CAMERA_CENTER_ERROR_MAX,
+             OBSTACLE_FINAL_LOST_FRAMES);
     return ESP_OK;
 }
 
