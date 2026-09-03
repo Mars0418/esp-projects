@@ -1,10 +1,13 @@
 # Camera ground-plane calibration
 
-`camera_extrinsic_calibrator.py` is a PC-side calibration tool. It uses the
-dedicated `CALIB,1` safe state in `camera-line-follow-test`. The motors remain
-stopped, TFT refresh and line processing pause, and the camera's original
-640x480 MJPEG frames are sent at about 1 fps over 921600 baud. Normal line
-following continues to use 160x120 images outside calibration mode.
+`camera_extrinsic_calibrator.py` is a PC-side calibration tool. The temporary
+calibration-only build in `camera-line-follow-test` keeps the motors stopped,
+disables TFT/vision/odometry, and sends the camera's original 640x480 MJPEG
+frames at about 1 fps over 921600 baud. The desktop tool's initial `CALIB,1`
+command is ignored because this firmware starts directly in calibration mode.
+The mounted camera's raw image is upside down, so the desktop tool rotates each
+frame by 180 degrees before preview, corner detection and calibration. Exported
+parameters therefore match the first-person image used by runtime pose code.
 
 ## Parameters
 
@@ -15,9 +18,9 @@ following continues to use 160x120 images outside calibration mode.
   The outer board edge may approach or leave the image, but no inner corner can
   be cropped.
 - The square edge is 25 mm for the current board.
-- `bottom-center distance` defaults to 180 mm. It defines the ground point at
-  pixel `(79.5, 119)` as `(x, y) = (0, 180 mm)` relative to the estimated
-  vehicle center. Replace it after measuring the chassis.
+- `bottom-center distance` defaults to the measured 80 mm. It defines the
+  ground point at pixel `(79.5, 119)` as `(x, y) = (0, 80 mm)` relative to the
+  vehicle center.
 
 The coordinate system is top-view `+x` right and `+y` forward. The calibration
 only maps pixels whose camera rays intersect the flat ground in front of the
@@ -54,9 +57,10 @@ The dependency and calibration-math self-test does not require hardware:
 4. Select `Calculate intrinsics`. Prefer RMS below 1 pixel; lower is better.
 5. Lay the checkerboard flat on the ground, with its near edge parallel to the
    image bottom and covering as much of the driving region as practical.
-6. Set the provisional bottom-center distance, currently `180` mm, then select
-   `Calibrate ground extrinsics`.
-7. Export the result.
+6. Confirm the measured bottom-center distance, currently `80` mm, then select
+   `Calibrate ground extrinsics`. A successful calculation automatically saves
+   the result beside the tool.
+7. Use `Export` only when an additional copy is needed elsewhere.
 
 Export creates:
 

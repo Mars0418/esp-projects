@@ -32,6 +32,7 @@ CALIBRATION_MAGIC = b"@CALJPEG,"
 CALIBRATION_BAUD = 921600
 MAX_JPEG_BYTES = 256 * 1024
 RUNTIME_IMAGE_SIZE = (160, 120)
+CAMERA_INPUT_ROTATION_DEGREES = 180
 
 
 @dataclass(frozen=True)
@@ -293,6 +294,13 @@ def detect_chessboard(
     if not found or corners is None:
         return None
     return normalize_corner_order(corners, pattern_size)
+
+
+def orient_camera_frame(rgb_image: np.ndarray) -> np.ndarray:
+    """Convert the upside-down sensor output to the vehicle first-person view."""
+    if CAMERA_INPUT_ROTATION_DEGREES == 180:
+        return np.ascontiguousarray(np.rot90(rgb_image, 2))
+    return np.ascontiguousarray(rgb_image)
 
 
 def calibrate_intrinsics(
@@ -559,6 +567,7 @@ def calibration_to_dict(
             "calibration_width": intrinsic.image_size[0],
             "calibration_height": intrinsic.image_size[1],
             "calibration_pixel_format": "MJPEG decoded on PC",
+            "input_rotation_degrees": CAMERA_INPUT_ROTATION_DEGREES,
             "runtime_width": RUNTIME_IMAGE_SIZE[0],
             "runtime_height": RUNTIME_IMAGE_SIZE[1],
             "runtime_mapping": "edge-aligned full-frame scaling",
@@ -657,7 +666,7 @@ class CalibrationApp:
         self.columns_var = tk.IntVar(value=10)
         self.rows_var = tk.IntVar(value=7)
         self.square_size_var = tk.DoubleVar(value=25.0)
-        self.bottom_distance_var = tk.DoubleVar(value=180.0)
+        self.bottom_distance_var = tk.DoubleVar(value=80.0)
         self.connection_var = tk.StringVar(value="未连接")
         self.detection_var = tk.StringVar(value="等待图像")
         self.samples_var = tk.StringVar(value="内参样本：0")
@@ -833,7 +842,7 @@ class CalibrationApp:
                 f"JPEG 尺寸不一致：header={frame.width}x{frame.height}"
             )
             return
-        rgb = cv2.cvtColor(decoded_bgr, cv2.COLOR_BGR2RGB)
+        rgb = orient_camera_frame(cv2.cvtColor(decoded_bgr, cv2.COLOR_BGR2RGB))
         self.latest_rgb = rgb
         self.latest_image_size = (frame.width, frame.height)
         try:
@@ -961,14 +970,24 @@ class CalibrationApp:
                 self.current_square_size(),
                 bottom_distance,
             )
-        except (ValueError, cv2.error, np.linalg.LinAlgError, tk.TclError) as exc:
+            automatic_path = Path(__file__).resolve().with_name(
+                "camera_ground_calibration.json"
+            )
+            save_calibration(automatic_path, self.intrinsic, self.ground)
+        except (
+            OSError,
+            ValueError,
+            cv2.error,
+            np.linalg.LinAlgError,
+            tk.TclError,
+        ) as exc:
             messagebox.showerror("地面外参标定失败", str(exc))
             return
         position = self.ground.camera_position_vehicle_mm
         self.ground_var.set(
             f"地面外参：重投影={self.ground.reprojection_error_px:.3f}px，"
             f"相机估计位置=({position[0]:.1f}, {position[1]:.1f}, "
-            f"{position[2]:.1f})mm"
+            f"{position[2]:.1f})mm；已自动保存"
         )
 
     def export_results(self) -> None:
@@ -1001,6 +1020,11 @@ class CalibrationApp:
 
 
 def run_self_test() -> None:
+    orientation_probe = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+    oriented_probe = orient_camera_frame(orientation_probe)
+    if not np.array_equal(oriented_probe[0, 0], orientation_probe[-1, -1]):
+        raise AssertionError("camera 180-degree orientation failed")
+
     image_size = (640, 480)
     pattern_size = (9, 6)
     square_size = 25.0

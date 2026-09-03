@@ -1,7 +1,7 @@
-#include <inttypes.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -20,13 +20,12 @@ typedef struct {
     volatile uint8_t previous_state;
 } encoder_t;
 
-static const char *TAG = "three_wheel_odometry";
-
 static encoder_t s_encoders[] = {
     {GPIO_NUM_16, GPIO_NUM_17, 0, 0},
     {GPIO_NUM_8, GPIO_NUM_18, 0, 0},
     {GPIO_NUM_2, GPIO_NUM_1, 0, 0},
 };
+static portMUX_TYPE s_encoder_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static const gpio_num_t s_motor_control_pins[] = {
     DRIVER_STBY,
@@ -52,10 +51,21 @@ static void encoder_gpio_isr(void *argument)
 {
     encoder_t *encoder = (encoder_t *)argument;
     const uint8_t current_state = encoder_read_state(encoder);
+    portENTER_CRITICAL_ISR(&s_encoder_lock);
     const uint8_t transition =
         (uint8_t)((encoder->previous_state << 2) | current_state);
     encoder->count += s_quadrature_delta[transition];
     encoder->previous_state = current_state;
+    portEXIT_CRITICAL_ISR(&s_encoder_lock);
+}
+
+static void read_encoder_counts(int32_t counts[3])
+{
+    portENTER_CRITICAL(&s_encoder_lock);
+    counts[0] = s_encoders[0].count;
+    counts[1] = s_encoders[1].count;
+    counts[2] = s_encoders[2].count;
+    portEXIT_CRITICAL(&s_encoder_lock);
 }
 
 static void configure_output_low(gpio_num_t pin)
@@ -118,32 +128,27 @@ void app_main(void)
     configure_encoders();
 
     three_wheel_odometry_t odometry;
+    int32_t counts[3];
+    read_encoder_counts(counts);
     ESP_ERROR_CHECK(three_wheel_odometry_init(
-        &odometry, s_encoders[0].count, s_encoders[1].count,
-        s_encoders[2].count));
+        &odometry, counts[0], counts[1], counts[2]));
 
-    ESP_LOGW(TAG, "READ-ONLY TEST: all motor control pins remain LOW");
-    ESP_LOGW(TAG, "Geometry and encoder signs are uncalibrated placeholders");
-    ESP_LOGI(TAG, "Origin=(0,0), +x=right, +y=up/initial heading, CCW=positive");
+    esp_log_level_set("*", ESP_LOG_NONE);
 
     three_wheel_pose_t pose = {0};
     int64_t last_report_us = 0;
     while (true) {
         force_motors_disabled();
+        read_encoder_counts(counts);
         three_wheel_odometry_update(
-            &odometry, s_encoders[0].count, s_encoders[1].count,
-            s_encoders[2].count, &pose);
+            &odometry, counts[0], counts[1], counts[2], &pose);
 
         const int64_t now_us = esp_timer_get_time();
         if (now_us - last_report_us >=
             (int64_t)ODOM_REPORT_INTERVAL_MS * 1000) {
-            ESP_LOGI(TAG,
-                     "ODOM x_mm=%ld y_mm=%ld heading_mdeg=%ld countA=%" PRId32
-                     " countB=%" PRId32 " countD=%" PRId32,
-                     (long)lroundf(pose.x_mm), (long)lroundf(pose.y_mm),
-                     (long)lroundf(pose.heading_deg * 1000.0f),
-                     s_encoders[0].count, s_encoders[1].count,
-                     s_encoders[2].count);
+            printf("x_mm=%.1f,y_mm=%.1f,heading_deg=%.1f\n",
+                   (double)pose.x_mm, (double)pose.y_mm,
+                   (double)pose.heading_deg);
             last_report_us = now_us;
         }
         vTaskDelay(pdMS_TO_TICKS(ODOM_UPDATE_INTERVAL_MS));

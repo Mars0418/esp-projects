@@ -275,6 +275,7 @@ static encoder_t s_encoders[WHEEL_COUNT] = {
     {ENCODER_B_PHASE_A_GPIO, ENCODER_B_PHASE_B_GPIO, 0, 0},
     {ENCODER_D_PHASE_A_GPIO, ENCODER_D_PHASE_B_GPIO, 0, 0},
 };
+static portMUX_TYPE s_encoder_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static int64_t s_strafe_pi_last_update_us;
 static int32_t s_strafe_pi_previous[WHEEL_COUNT];
@@ -366,10 +367,12 @@ static void encoder_gpio_isr(void *argument)
 {
     encoder_t *encoder = (encoder_t *)argument;
     const uint8_t current_state = encoder_read_state(encoder);
+    portENTER_CRITICAL_ISR(&s_encoder_lock);
     const uint8_t transition =
         (uint8_t)((encoder->previous_state << 2) | current_state);
     encoder->count += s_quadrature_delta[transition];
     encoder->previous_state = current_state;
+    portEXIT_CRITICAL_ISR(&s_encoder_lock);
 }
 
 static esp_err_t configure_encoders(void)
@@ -1886,4 +1889,15 @@ bool camera_line_follow_tuner_enabled(void)
 bool camera_line_follow_calibration_enabled(void)
 {
     return s_calibration_enabled;
+}
+
+void camera_line_follow_get_encoder_counts(int32_t *count_a,
+                                           int32_t *count_b,
+                                           int32_t *count_d)
+{
+    portENTER_CRITICAL(&s_encoder_lock);
+    if (count_a) *count_a = s_encoders[WHEEL_A].count;
+    if (count_b) *count_b = s_encoders[WHEEL_B].count;
+    if (count_d) *count_d = s_encoders[WHEEL_D].count;
+    portEXIT_CRITICAL(&s_encoder_lock);
 }

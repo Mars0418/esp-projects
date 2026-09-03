@@ -1,12 +1,13 @@
 #include <stdbool.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "ball_vision.h"
 #include "black_marker_vision.h"
 #include "camera_display.h"
 #include "camera_line_follow.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_err.h"
@@ -24,6 +25,8 @@
 #include "libuvc_helper.h"
 #include "line_vision.h"
 #include "mbedtls/base64.h"
+#include "post_line_odometry.h"
+#include "quarter_goal_pose.h"
 #include "usb/usb_host.h"
 
 #define MJPEG_SLOT_COUNT      2
@@ -46,6 +49,25 @@
 #define RGB_DEBUG_B64_BYTES   (((RGB_DEBUG_BYTES + 2) / 3) * 4 + 1)
 #define MASK_DEBUG_B64_BYTES  (((RGB_DEBUG_MASK_BYTES + 2) / 3) * 4 + 1)
 #define TUNER_MASK_BYTES      ((DECODED_WIDTH * DECODED_HEIGHT + 7) / 8)
+#define PRECISE_WIDTH         640
+#define PRECISE_HEIGHT        480
+#define PRECISE_BUFFER_BYTES  (PRECISE_WIDTH * PRECISE_HEIGHT * 2)
+#define PRECISE_TRIGGER_CONFIDENCE 80
+#define PRECISE_TRIGGER_FRAMES 3
+#define LOCKED_POSE_REPORT_INTERVAL_US 100000
+#define PI_F 3.14159265359f
+
+/* Temporary high-resolution calibration firmware. Set to 0 after exporting
+ * the new camera calibration and copying its parameters into runtime code. */
+#define CAMERA_CALIBRATION_ONLY 1
+#define CALIBRATION_UART_BAUD 921600
+
+static const gpio_num_t s_motor_safe_stop_pins[] = {
+    GPIO_NUM_5,
+    GPIO_NUM_6, GPIO_NUM_15, GPIO_NUM_7,
+    GPIO_NUM_11, GPIO_NUM_9, GPIO_NUM_10,
+    GPIO_NUM_40, GPIO_NUM_42, GPIO_NUM_41,
+};
 
 typedef struct {
     uint8_t *data;
@@ -58,6 +80,14 @@ typedef struct {
     bool busy;
 } mjpeg_slot_t;
 
+typedef struct {
+    bool valid;
+    float visual_x_mm;
+    float visual_y_mm;
+    float visual_heading_rad;
+    post_line_odometry_pose_t odometry;
+} visual_pose_anchor_t;
+
 static const char *TAG = "CAMERA_VIEW";
 static EventGroupHandle_t s_uvc_events;
 static QueueHandle_t s_frame_queue;
@@ -66,6 +96,7 @@ static mjpeg_slot_t s_slots[MJPEG_SLOT_COUNT];
 static uint8_t *s_decoded_frame;
 static uint8_t *s_display_frame;
 static uint8_t *s_debug_raw_frame;
+static uint8_t *s_precise_frame;
 static uint8_t *s_jpeg_work_buffer;
 static portMUX_TYPE s_slot_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_display_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -92,6 +123,96 @@ static enum uvc_frame_format s_stream_format = UVC_FRAME_FORMAT_MJPEG;
 static esp_jpeg_image_scale_t s_decode_scale = JPEG_IMAGE_SCALE_1_4;
 
 static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot);
+
+static esp_err_t initialize_motor_safe_stop(void)
+{
+    for (size_t index = 0;
+         index < sizeof(s_motor_safe_stop_pins) /
+                     sizeof(s_motor_safe_stop_pins[0]);
+         ++index) {
+        const gpio_num_t pin = s_motor_safe_stop_pins[index];
+        ESP_RETURN_ON_ERROR(gpio_reset_pin(pin), TAG,
+                            "Failed to reset motor GPIO");
+        ESP_RETURN_ON_ERROR(gpio_set_level(pin, 0), TAG,
+                            "Failed to clear motor GPIO");
+        ESP_RETURN_ON_ERROR(gpio_set_direction(pin, GPIO_MODE_OUTPUT), TAG,
+                            "Failed to configure motor GPIO");
+        ESP_RETURN_ON_ERROR(gpio_set_level(pin, 0), TAG,
+                            "Failed to hold motor GPIO low");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t initialize_calibration_uart(void)
+{
+    const esp_err_t install_error = uart_driver_install(
+        UART_NUM_0, 1024, 0, 0, NULL, 0);
+    if (install_error != ESP_OK && install_error != ESP_ERR_INVALID_STATE) {
+        return install_error;
+    }
+    uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(200));
+    esp_log_level_set("*", ESP_LOG_NONE);
+    return uart_set_baudrate(UART_NUM_0, CALIBRATION_UART_BAUD);
+}
+
+static float normalize_radians(float radians)
+{
+    while (radians > PI_F) radians -= 2.0f * PI_F;
+    while (radians <= -PI_F) radians += 2.0f * PI_F;
+    return radians;
+}
+
+static bool anchored_odometry_pose(const visual_pose_anchor_t *anchor,
+                                   float *x_mm, float *y_mm,
+                                   float *heading_deg)
+{
+    post_line_odometry_pose_t current;
+    if (!anchor || !anchor->valid ||
+        !post_line_odometry_get_pose(&current)) {
+        return false;
+    }
+    const float delta_x = current.x_mm - anchor->odometry.x_mm;
+    const float delta_y = current.y_mm - anchor->odometry.y_mm;
+    const float boot_to_field =
+        anchor->visual_heading_rad -
+        (PI_F * 0.5f + anchor->odometry.heading_rad);
+    const float cosine = cosf(boot_to_field);
+    const float sine = sinf(boot_to_field);
+    *x_mm = anchor->visual_x_mm + cosine * delta_x - sine * delta_y;
+    *y_mm = anchor->visual_y_mm + sine * delta_x + cosine * delta_y;
+    const float heading = normalize_radians(
+        anchor->visual_heading_rad +
+        current.heading_rad - anchor->odometry.heading_rad);
+    *heading_deg = heading * 180.0f / PI_F;
+    return true;
+}
+
+static int scale_precise_coordinate(int coordinate, int precise_size,
+                                    int display_size)
+{
+    if (coordinate < 0) return -1;
+    return (coordinate * (display_size - 1) +
+            (precise_size - 1) / 2) / (precise_size - 1);
+}
+
+static quarter_goal_pose_result_t precise_pose_for_display(
+    const quarter_goal_pose_result_t *precise)
+{
+    quarter_goal_pose_result_t display = *precise;
+    display.origin_x_raw = scale_precise_coordinate(
+        precise->origin_x_raw, PRECISE_WIDTH, DECODED_WIDTH);
+    display.origin_y_raw = scale_precise_coordinate(
+        precise->origin_y_raw, PRECISE_HEIGHT, DECODED_HEIGHT);
+    display.x_axis_end_x_raw = scale_precise_coordinate(
+        precise->x_axis_end_x_raw, PRECISE_WIDTH, DECODED_WIDTH);
+    display.x_axis_end_y_raw = scale_precise_coordinate(
+        precise->x_axis_end_y_raw, PRECISE_HEIGHT, DECODED_HEIGHT);
+    display.y_axis_end_x_raw = scale_precise_coordinate(
+        precise->y_axis_end_x_raw, PRECISE_WIDTH, DECODED_WIDTH);
+    display.y_axis_end_y_raw = scale_precise_coordinate(
+        precise->y_axis_end_y_raw, PRECISE_HEIGHT, DECODED_HEIGHT);
+    return display;
+}
 
 static bool queue_tft_preview(const uint8_t *pixels)
 {
@@ -402,12 +523,52 @@ static void frame_display_task(void *argument)
     int64_t last_calibration_us = 0;
     int64_t last_tft_preview_us = 0;
     int64_t latest_frame_age_ms = 0;
+    int precise_trigger_frames = 0;
+    bool pose_locked = false;
+    int64_t last_locked_pose_report_us = 0;
+    visual_pose_anchor_t pose_anchor = {0};
 
     while (true) {
         if (xQueueReceive(s_frame_queue, &slot_index, portMAX_DELAY) != pdPASS) {
             continue;
         }
         const int64_t captured_at_us = s_slots[slot_index].captured_at_us;
+
+        if (CAMERA_CALIBRATION_ONLY) {
+            const int64_t calibration_now_us = esp_timer_get_time();
+            if (s_slots[slot_index].format == UVC_FRAME_FORMAT_MJPEG &&
+                s_slots[slot_index].width == PRECISE_WIDTH &&
+                s_slots[slot_index].height == PRECISE_HEIGHT &&
+                calibration_now_us - last_calibration_us >=
+                    CALIBRATION_INTERVAL_US) {
+                emit_calibration_jpeg(&s_slots[slot_index]);
+                last_calibration_us = esp_timer_get_time();
+            }
+            release_mjpeg_slot(slot_index);
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (pose_locked) {
+            release_mjpeg_slot(slot_index);
+            const int64_t now_us = esp_timer_get_time();
+            if (now_us - last_locked_pose_report_us >=
+                    LOCKED_POSE_REPORT_INTERVAL_US) {
+                float x_mm;
+                float y_mm;
+                float heading_deg;
+                if (anchored_odometry_pose(&pose_anchor, &x_mm, &y_mm,
+                                            &heading_deg)) {
+                    ESP_LOGI(TAG,
+                             "POSE source=ODOM x_mm=%d y_mm=%d heading_deg=%d",
+                             (int)lroundf(x_mm), (int)lroundf(y_mm),
+                             (int)lroundf(heading_deg));
+                }
+                last_locked_pose_report_us = now_us;
+            }
+            vTaskDelay(1);
+            continue;
+        }
 
         if (camera_line_follow_calibration_enabled()) {
             const int64_t calibration_now_us = esp_timer_get_time();
@@ -456,30 +617,111 @@ static void frame_display_task(void *argument)
                 memcpy(s_debug_raw_frame, s_decoded_frame,
                        DECODED_BUFFER_BYTES);
             }
-            ball_vision_result_t ball_result;
-            ball_vision_result_t white_ball_result;
             black_marker_result_t marker_result;
-            ball_vision_process(s_decoded_frame, output.width, output.height,
-                                &ball_result);
-            white_ball_vision_process(s_decoded_frame, output.width,
-                                      output.height, &white_ball_result);
+            quarter_goal_pose_result_t pose_result;
             black_marker_vision_process(s_decoded_frame, output.width,
                                         output.height, &marker_result);
-            ball_vision_draw_overlay(s_decoded_frame, output.width,
-                                     output.height, &ball_result);
-            ball_vision_draw_overlay_color(s_decoded_frame, output.width,
-                                           output.height, &white_ball_result,
-                                           0x07ff);
-            black_marker_vision_draw_overlay(s_decoded_frame, output.width,
-                                             output.height, &marker_result);
+            quarter_goal_pose_process(s_decoded_frame, output.width,
+                                      output.height, &marker_result,
+                                      &pose_result);
+            quarter_goal_pose_draw_overlay(s_decoded_frame, output.width,
+                                           output.height, &pose_result);
+            const bool trigger_candidate =
+                pose_result.found && !marker_result.predicted &&
+                pose_result.confidence >= PRECISE_TRIGGER_CONFIDENCE;
+            if (trigger_candidate) {
+                if (precise_trigger_frames < PRECISE_TRIGGER_FRAMES) {
+                    precise_trigger_frames++;
+                }
+            } else {
+                precise_trigger_frames = 0;
+            }
+            ESP_LOGI(TAG,
+                     "CORNER_SEARCH found=%d confidence=%d stable=%d/%d",
+                     pose_result.found, pose_result.confidence,
+                     precise_trigger_frames, PRECISE_TRIGGER_FRAMES);
+
+            if (precise_trigger_frames >= PRECISE_TRIGGER_FRAMES) {
+                precise_trigger_frames = 0;
+                if (s_slots[slot_index].format == UVC_FRAME_FORMAT_MJPEG &&
+                    s_slots[slot_index].width == PRECISE_WIDTH &&
+                    s_slots[slot_index].height == PRECISE_HEIGHT) {
+                    post_line_odometry_pose_t anchor_odometry;
+                    esp_jpeg_image_output_t precise_output = {0};
+                    esp_jpeg_image_cfg_t precise_config = {
+                        .indata = s_slots[slot_index].data,
+                        .indata_size = s_slots[slot_index].length,
+                        .outbuf = s_precise_frame,
+                        .outbuf_size = PRECISE_BUFFER_BYTES,
+                        .out_format = JPEG_IMAGE_FORMAT_RGB565,
+                        .out_scale = JPEG_IMAGE_SCALE_0,
+                        .flags = {
+                            .swap_color_bytes = 1,
+                        },
+                        .advanced = {
+                            .working_buffer = s_jpeg_work_buffer,
+                            .working_buffer_size = JPEG_WORK_BUFFER_BYTES,
+                        },
+                    };
+                    ESP_LOGW(TAG,
+                             "PRECISE_POSE decoding one 640x480 frame; keep car still");
+                    const bool odometry_ready =
+                        post_line_odometry_get_pose(&anchor_odometry);
+                    const esp_err_t precise_decode_error =
+                        esp_jpeg_decode(&precise_config, &precise_output);
+                    quarter_goal_pose_result_t precise_pose;
+                    const bool precise_valid =
+                        precise_decode_error == ESP_OK &&
+                        precise_output.width == PRECISE_WIDTH &&
+                        precise_output.height == PRECISE_HEIGHT &&
+                        odometry_ready &&
+                        quarter_goal_pose_refine_single_corner(
+                            s_precise_frame, PRECISE_WIDTH, PRECISE_HEIGHT,
+                            &marker_result, &pose_result, &precise_pose);
+                    if (precise_valid) {
+                        pose_anchor = (visual_pose_anchor_t) {
+                            .valid = true,
+                            .visual_x_mm = precise_pose.robot_field_x_mm,
+                            .visual_y_mm = precise_pose.robot_field_y_mm,
+                            .visual_heading_rad =
+                                precise_pose.robot_heading_deg * PI_F / 180.0f,
+                            .odometry = anchor_odometry,
+                        };
+                        pose_locked = true;
+                        const quarter_goal_pose_result_t display_pose =
+                            precise_pose_for_display(&precise_pose);
+                        quarter_goal_pose_draw_overlay(
+                            s_decoded_frame, output.width, output.height,
+                            &display_pose);
+                        ESP_LOGW(TAG,
+                                 "VISION_LOCK x_mm=%d y_mm=%d heading_deg=%d confidence=%d corner_px_640=(%d,%d) radius_mm=%d",
+                                 (int)lroundf(precise_pose.robot_field_x_mm),
+                                 (int)lroundf(precise_pose.robot_field_y_mm),
+                                 (int)lroundf(precise_pose.robot_heading_deg),
+                                 precise_pose.confidence,
+                                 precise_pose.origin_x_raw,
+                                 precise_pose.origin_y_raw,
+                                 (int)lroundf(precise_pose.fitted_radius_mm));
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "PRECISE_POSE rejected decode=%s output=%ux%u; returning to search",
+                                 esp_err_to_name(precise_decode_error),
+                                 precise_output.width, precise_output.height);
+                    }
+                } else {
+                    ESP_LOGW(TAG,
+                             "PRECISE_POSE requires 640x480 MJPEG; current=%ux%u format=%d",
+                             s_slots[slot_index].width,
+                             s_slots[slot_index].height,
+                             s_slots[slot_index].format);
+                }
+            }
             const int64_t vision_done_us = esp_timer_get_time();
             decode_time_us += (uint64_t)(decode_done_us - decode_start_us);
             vision_time_us += (uint64_t)(vision_done_us - decode_done_us);
             timed_frames++;
-            /* This firmware image is deliberately a visual ball-tracking
-             * test.  Do not run or submit line-following control here: the
-             * chassis remains in the safe-stop state while the TFT shows the
-             * adaptive red/white ball and black-goal boxes. */
+            /* Single-corner camera-pose test only. No line-control result is
+             * submitted, so the chassis stays stopped. */
             processed_frames++;
             const int64_t debug_now_us = esp_timer_get_time();
             if (!tuner && debug_now_us - last_tft_preview_us >=
@@ -619,6 +861,12 @@ static esp_err_t initialize_frame_pipeline(void)
     if (s_debug_raw_frame == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    s_precise_frame = heap_caps_malloc(PRECISE_BUFFER_BYTES,
+                                       MALLOC_CAP_SPIRAM |
+                                       MALLOC_CAP_8BIT);
+    if (s_precise_frame == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
     s_tuner_mask = heap_caps_malloc(TUNER_MASK_BYTES,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_tuner_mask == NULL) {
@@ -666,6 +914,12 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
     uvc_error_t result = UVC_ERROR_INVALID_MODE;
     for (size_t profile = 0;
          profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
+        if (CAMERA_CALIBRATION_ONLY &&
+            (profiles[profile].format != UVC_FRAME_FORMAT_MJPEG ||
+             profiles[profile].width != PRECISE_WIDTH ||
+             profiles[profile].height != PRECISE_HEIGHT)) {
+            continue;
+        }
         for (int attempt = 1; attempt <= 2; ++attempt) {
             result = uvc_get_stream_ctrl_format_size(device_handle, control,
                                                       profiles[profile].format,
@@ -690,9 +944,14 @@ static uvc_error_t negotiate_mjpeg_stream(uvc_device_handle_t *device_handle,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG,
-             "USB camera ball tracker; 160x120 adaptive box on TFT preview");
-    ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=115200");
+    if (CAMERA_CALIBRATION_ONLY) {
+        ESP_LOGI(TAG, "Dedicated 640x480 camera calibration firmware");
+    } else {
+        ESP_LOGI(TAG,
+                 "USB camera one-shot precise corner pose then odometry; 160x120 TFT preview");
+    }
+    ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=%d",
+             CAMERA_CALIBRATION_ONLY ? CALIBRATION_UART_BAUD : 115200);
     ESP_LOGI(TAG, "Camera: D-=GPIO19 D+=GPIO20; motors start in SAFE STOP");
 
     const size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
@@ -702,12 +961,21 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(camera_line_follow_init());
-    ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
-    ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
-    ESP_ERROR_CHECK(black_marker_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
-    ESP_ERROR_CHECK(camera_display_init());
-    ESP_ERROR_CHECK(camera_display_show_waiting());
+    ESP_ERROR_CHECK(initialize_motor_safe_stop());
+    if (CAMERA_CALIBRATION_ONLY) {
+        ESP_LOGW(TAG,
+                 "CALIBRATION_ONLY: motors stopped; TFT, vision and odometry disabled");
+        ESP_ERROR_CHECK(initialize_calibration_uart());
+    } else {
+        ESP_ERROR_CHECK(post_line_odometry_init());
+        ESP_ERROR_CHECK(black_marker_vision_init(DECODED_WIDTH,
+                                                  DECODED_HEIGHT));
+        black_marker_vision_set_logging(false);
+        quarter_goal_pose_set_single_corner_mode(true);
+        quarter_goal_pose_set_logging(false);
+        ESP_ERROR_CHECK(camera_display_init());
+        ESP_ERROR_CHECK(camera_display_show_waiting());
+    }
     ESP_ERROR_CHECK(initialize_frame_pipeline());
 
     s_uvc_events = xEventGroupCreate();
@@ -762,16 +1030,16 @@ void app_main(void)
                      s_stream_format == UVC_FRAME_FORMAT_YUYV
                          ? "YUYV" : "MJPEG");
             wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            camera_line_follow_camera_disconnected();
             uvc_stop_streaming(device_handle);
         } else {
             ESP_LOGE(TAG, "CAMERA_STATUS=STREAM_FAILED error=%s",
                      uvc_error_string(result));
             wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            camera_line_follow_camera_disconnected();
         }
 
-        camera_display_show_waiting();
+        if (!CAMERA_CALIBRATION_ONLY) {
+            camera_display_show_waiting();
+        }
         uvc_close(device_handle);
         uvc_unref_device(device);
         ESP_LOGW(TAG, "CAMERA_STATUS=DISCONNECTED");

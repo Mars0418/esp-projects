@@ -13,3 +13,6 @@ void camera_line_follow_camera_disconnected(void);
 bool camera_line_follow_debug_enabled(void);
 bool camera_line_follow_tuner_enabled(void);
 bool camera_line_follow_calibration_enabled(void);
+void camera_line_follow_get_encoder_counts(int32_t *count_a,
+                                           int32_t *count_b,
+                                           int32_t *count_d);

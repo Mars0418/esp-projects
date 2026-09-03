@@ -6,8 +6,13 @@
 #include "esp_heap_caps.h"
 
 #define MIN_RED_COMPONENT_PIXELS 8
-#define MAX_TRACK_MISS_FRAMES 3
+#define MAX_TRACK_MISS_FRAMES 1
 #define MAX_TRACK_JUMP_PIXELS 28
+#define POSITION_DEADBAND_PIXELS 2
+#define POSITION_SNAP_DISTANCE_PIXELS 12
+#define POSITION_SNAP_CONFIDENCE 80
+#define JUMP_CONFIRM_FRAMES 2
+#define JUMP_MATCH_PIXELS 4
 
 static uint8_t *s_seen;
 static uint16_t *s_queue;
@@ -17,12 +22,37 @@ static int s_track_x;
 static int s_track_y;
 static int s_track_half_size;
 static int s_missed_frames;
+static bool s_pending_jump_valid;
+static int s_pending_jump_x;
+static int s_pending_jump_y;
+static int s_pending_jump_count;
 
 static int clamp_int(int value, int minimum, int maximum)
 {
     if (value < minimum) return minimum;
     if (value > maximum) return maximum;
     return value;
+}
+
+static void clear_pending_jump(void)
+{
+    s_pending_jump_valid = false;
+    s_pending_jump_count = 0;
+}
+
+static bool confirm_low_confidence_jump(int x, int y)
+{
+    if (s_pending_jump_valid &&
+        abs(x - s_pending_jump_x) <= JUMP_MATCH_PIXELS &&
+        abs(y - s_pending_jump_y) <= JUMP_MATCH_PIXELS) {
+        s_pending_jump_count++;
+    } else {
+        s_pending_jump_valid = true;
+        s_pending_jump_count = 1;
+    }
+    s_pending_jump_x = x;
+    s_pending_jump_y = y;
+    return s_pending_jump_count >= JUMP_CONFIRM_FRAMES;
 }
 
 static void pixel_rgb(const uint8_t *pixels, size_t index,
@@ -96,6 +126,7 @@ esp_err_t ball_vision_init(size_t width, size_t height)
     s_capacity = pixel_count;
     s_track_valid = false;
     s_missed_frames = 0;
+    clear_pending_jump();
     return ESP_OK;
 }
 
@@ -167,9 +198,7 @@ void ball_vision_process(const uint8_t *rgb565, size_t width, size_t height,
             const int dy = candidate_y - s_track_y;
             const int jump_squared = dx * dx + dy * dy;
             if (jump_squared <= MAX_TRACK_JUMP_PIXELS * MAX_TRACK_JUMP_PIXELS) {
-                score += 2000 - jump_squared;
-            } else {
-                score -= 300;
+                score += 500 - jump_squared;
             }
         }
         if (score > best_score) {
@@ -190,26 +219,64 @@ void ball_vision_process(const uint8_t *rgb565, size_t width, size_t height,
         const int raw_half_size = ((component_width > component_height ?
                                       component_width : component_height) + 1) / 2 +
                                   2;
+        const int confidence = best_area >= 20 ? 100 : best_area * 5;
+        bool accept_candidate = true;
+        bool snap_to_candidate = !s_track_valid;
+
         if (s_track_valid) {
-            s_track_x = (3 * s_track_x + raw_x + 2) / 4;
-            s_track_y = (3 * s_track_y + raw_y + 2) / 4;
-            s_track_half_size = (3 * s_track_half_size + raw_half_size + 2) / 4;
-        } else {
-            s_track_x = raw_x;
-            s_track_y = raw_y;
-            s_track_half_size = raw_half_size;
+            const int dx = raw_x - s_track_x;
+            const int dy = raw_y - s_track_y;
+            const bool large_jump =
+                dx * dx + dy * dy > POSITION_SNAP_DISTANCE_PIXELS *
+                                      POSITION_SNAP_DISTANCE_PIXELS;
+            if (large_jump && confidence < POSITION_SNAP_CONFIDENCE) {
+                accept_candidate = confirm_low_confidence_jump(raw_x, raw_y);
+                snap_to_candidate = accept_candidate;
+            } else {
+                clear_pending_jump();
+                snap_to_candidate = large_jump;
+            }
+
+            if (accept_candidate && !snap_to_candidate) {
+                if (abs(dx) > POSITION_DEADBAND_PIXELS) {
+                    s_track_x = (3 * s_track_x + 7 * raw_x + 5) / 10;
+                }
+                if (abs(dy) > POSITION_DEADBAND_PIXELS) {
+                    s_track_y = (3 * s_track_y + 7 * raw_y + 5) / 10;
+                }
+                s_track_half_size =
+                    (3 * s_track_half_size + 7 * raw_half_size + 5) / 10;
+            }
         }
-        s_track_valid = true;
-        s_missed_frames = 0;
-        result->found = true;
-        result->purple_pixels = best_area;
-        result->confidence = best_area >= 20 ? 100 : best_area * 5;
+
+        if (accept_candidate) {
+            if (snap_to_candidate) {
+                s_track_x = raw_x;
+                s_track_y = raw_y;
+                s_track_half_size = raw_half_size;
+            }
+            clear_pending_jump();
+            s_track_valid = true;
+            s_missed_frames = 0;
+            result->found = true;
+            result->purple_pixels = best_area;
+            result->confidence = confidence;
+        } else if (++s_missed_frames <= MAX_TRACK_MISS_FRAMES) {
+            result->found = true;
+            result->predicted = true;
+            result->confidence = 50;
+        } else {
+            s_track_valid = false;
+            clear_pending_jump();
+            return;
+        }
     } else if (s_track_valid && ++s_missed_frames <= MAX_TRACK_MISS_FRAMES) {
         result->found = true;
         result->predicted = true;
         result->confidence = 50;
     } else {
         s_track_valid = false;
+        clear_pending_jump();
         return;
     }
 
