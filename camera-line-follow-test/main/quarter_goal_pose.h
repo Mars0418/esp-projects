@@ -62,6 +62,11 @@ bool quarter_goal_pose_refine_single_corner(
     const black_marker_result_t *coarse_basic,
     const quarter_goal_pose_result_t *coarse_pose,
     quarter_goal_pose_result_t *result);
+bool quarter_goal_pose_assign_goal(quarter_goal_pose_result_t *result,
+                                   quarter_goal_identity_t identity);
+bool quarter_goal_pose_project_ground_pixel(float raw_x, float raw_y,
+                                            float *vehicle_right_mm,
+                                            float *vehicle_forward_mm);
 void quarter_goal_pose_draw_overlay(uint8_t *rgb565, size_t width,
                                     size_t height,
                                     const quarter_goal_pose_result_t *result);

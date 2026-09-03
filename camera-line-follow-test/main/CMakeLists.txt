@@ -1,6 +1,7 @@
 idf_component_register(
-    SRCS "black_marker_vision.c" "quarter_goal_pose.c"
-         "post_line_odometry.c" "line_vision.c"
+    SRCS "ball_vision.c" "white_ball_vision.c"
+         "black_marker_vision.c" "quarter_goal_pose.c"
+         "post_line_odometry.c" "post_line_navigation.c" "line_vision.c"
          "main.c" "camera_display.c"
          "camera_line_follow_band.c"
     INCLUDE_DIRS "."

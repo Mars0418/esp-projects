@@ -54,22 +54,22 @@ static float s_field_y_axis_reference_y;
 static bool s_single_corner_mode;
 static bool s_pose_logging_enabled = true;
 
-/* Runtime calibration copied from camera_ground_calibration.json on test_cmh.
- * The measured vehicle-centre to image-bottom ground distance is 80 mm.
- * Recalibrate and replace these constants if the camera mount changes. */
-static const float FX = 64.9068090752f;
-static const float FY = 67.6629103920f;
-static const float CX = 78.5160299187f;
-static const float CY = 52.0093016507f;
-static const float K1 = 0.0778242625f;
-static const float K2 = -0.0877000502f;
-static const float P1 = -0.0170842245f;
-static const float P2 = -0.00052946575f;
-static const float K3 = 0.0181648280f;
+/* Runtime calibration copied from camera_ground_calibration.json (2026-09-03,
+ * 14 samples, RMS 0.405 px). The vehicle-centre to image-bottom ground
+ * distance is 80 mm and the raw camera image is rotated by 180 degrees. */
+static const float FX = 62.2658588172f;
+static const float FY = 63.7391172126f;
+static const float CX = 79.5008738840f;
+static const float CY = 53.4665883481f;
+static const float K1 = 0.0815474671f;
+static const float K2 = -0.0890497661f;
+static const float P1 = -0.0151775104f;
+static const float P2 = 0.00328599594f;
+static const float K3 = 0.0191844912f;
 static const float H[3][3] = {
-    {21.9150372950f, 0.1580374346f, -1763.13140363f},
-    {0.7912072676f, -7.9453720479f, 1825.39441215f},
-    {0.0039838445f, 0.0827026644f, 1.0f},
+    {12.9968406512f, -0.0218747386f, -1027.41504410f},
+    {-0.1528642179f, -4.8746225132f, 1142.98429052f},
+    {-0.00122387697f, 0.0475105968f, 1.0f},
 };
 
 typedef struct {
@@ -225,6 +225,19 @@ static void map_visual_pose_to_global_field(
         atan2f(result->y_axis_vehicle_y, result->x_axis_vehicle_y) *
         180.0f / PI_F;
     result->field_pose_valid = true;
+}
+
+bool quarter_goal_pose_assign_goal(quarter_goal_pose_result_t *result,
+                                   quarter_goal_identity_t identity)
+{
+    if (!result || !result->position_valid ||
+        identity == QUARTER_GOAL_UNKNOWN) {
+        return false;
+    }
+    result->position_goal = identity;
+    result->field_pose_valid = false;
+    map_visual_pose_to_global_field(result);
+    return result->field_pose_valid;
 }
 
 static void remember_visual_pose(const quarter_goal_pose_result_t *result)
@@ -727,6 +740,18 @@ static bool raw_pixel_to_vehicle_ground(float raw_x, float raw_y,
     return isfinite(ground->x) && isfinite(ground->y) &&
            fabsf(ground->x) < 3000.0f && ground->y > -500.0f &&
            ground->y < 5000.0f;
+}
+
+bool quarter_goal_pose_project_ground_pixel(float raw_x, float raw_y,
+                                            float *vehicle_right_mm,
+                                            float *vehicle_forward_mm)
+{
+    if (!vehicle_right_mm || !vehicle_forward_mm) return false;
+    point_t ground;
+    if (!raw_pixel_to_vehicle_ground(raw_x, raw_y, &ground)) return false;
+    *vehicle_right_mm = ground.x;
+    *vehicle_forward_mm = ground.y;
+    return true;
 }
 
 static bool selected_pixel(const uint8_t *rgb565, size_t width,
