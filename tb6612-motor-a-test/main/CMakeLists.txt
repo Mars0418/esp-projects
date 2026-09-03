@@ -1,5 +1,5 @@
 set(APP_SOURCE "keyboard_remote.c" CACHE STRING
-    "Application source file; use three_wheel_diagnostic.c for wheel testing")
+    "Application source file; select a standalone diagnostic when needed")
 
 idf_component_register(
     SRCS "${APP_SOURCE}" "tft_status_display.c"

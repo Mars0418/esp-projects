@@ -3,13 +3,19 @@ param(
     [ValidateSet("build", "flash", "monitor", "run", "ports")]
     [string]$Action = "run",
     [string]$Port = "",
-    [string]$IdfPath = ""
+    [string]$IdfPath = "",
+    [ValidatePattern("^[A-Za-z0-9_.-]+\.c$")]
+    [string]$AppSource = "keyboard_remote.c"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $projectDir = Join-Path $PSScriptRoot "tb6612-motor-a-test"
+$appSourcePath = Join-Path $projectDir (Join-Path "main" $AppSource)
+if (-not (Test-Path -LiteralPath $appSourcePath -PathType Leaf)) {
+    throw "Application source '$AppSource' was not found in '$projectDir\main'."
+}
 $preferredIdfVersion = "5.5.5"
 $env:PYTHONUTF8 = "1"
 
@@ -154,6 +160,10 @@ if ($LASTEXITCODE -ne 0 -or -not $idfVersionLine) {
 $idfVersion = $idfVersionLine -replace "^ESP-IDF\s+v?", ""
 $buildVersion = $idfVersion -replace "[^A-Za-z0-9._-]", "-"
 $buildDir = "build-local-$buildVersion"
+if ($AppSource -ne "keyboard_remote.c") {
+    $appBuildName = [IO.Path]::GetFileNameWithoutExtension($AppSource) -replace "[^A-Za-z0-9._-]", "-"
+    $buildDir = "$buildDir-$appBuildName"
+}
 $sharedSdkconfig = Join-Path $projectDir "sdkconfig"
 $localSdkconfig = Join-Path $projectDir "sdkconfig.local-$buildVersion"
 
@@ -163,10 +173,12 @@ if (-not (Test-Path -LiteralPath $localSdkconfig)) {
 
 Write-Host "Using $idfVersionLine with build directory $buildDir"
 Write-Host "Using local project configuration $localSdkconfig"
+Write-Host "Using application source $AppSource"
 
 Push-Location $projectDir
 try {
-    $idfArgs = @("-D", "SDKCONFIG=$localSdkconfig", "-B", $buildDir)
+    $idfArgs = @("-D", "SDKCONFIG=$localSdkconfig",
+                 "-D", "APP_SOURCE=$AppSource", "-B", $buildDir)
     switch ($Action) {
         "build"   { $idfArgs += "build" }
         "flash"   { $idfArgs += @("-p", $Port, "flash") }

@@ -16,9 +16,9 @@
 #define ODOM_B_COUNTS_PER_REV 406.0f
 #define ODOM_D_COUNTS_PER_REV 406.0f
 
-#define ODOM_A_WHEEL_RADIUS_MM 24.0f
-#define ODOM_B_WHEEL_RADIUS_MM 24.0f
-#define ODOM_D_WHEEL_RADIUS_MM 24.0f
+#define ODOM_A_WHEEL_RADIUS_MM 27.5f
+#define ODOM_B_WHEEL_RADIUS_MM 27.5f
+#define ODOM_D_WHEEL_RADIUS_MM 27.5f
 
 /* Provisional: verify all three signs from signed encoder logs. */
 #define ODOM_A_ENCODER_SIGN (-1.0f)
@@ -26,9 +26,9 @@
 #define ODOM_D_ENCODER_SIGN (-1.0f)
 
 /* Initial estimates only: measure center-to-wheel contact distance. */
-#define ODOM_A_POSITION_RADIUS_MM 100.0f
-#define ODOM_B_POSITION_RADIUS_MM 100.0f
-#define ODOM_D_POSITION_RADIUS_MM 100.0f
+#define ODOM_A_POSITION_RADIUS_MM 90.0f
+#define ODOM_B_POSITION_RADIUS_MM 90.0f
+#define ODOM_D_POSITION_RADIUS_MM 90.0f
 
 /* A=right-front, B=rear, D=left-front. */
 #define ODOM_A_POSITION_ANGLE_DEG 30.0f
