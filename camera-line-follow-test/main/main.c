@@ -83,11 +83,13 @@
 #define MISSION_EXPLORATION_START_FRAMES 10
 #define MISSION_RETURN_HEADING_DEG (-45.0f)
 #define MISSION_BALL_CENTER_TOLERANCE_PX 10
+#define MISSION_PUSH_HEADING_TOLERANCE_DEG 20.0f
 #define MISSION_BALL_CENTER_CONFIRM_FRAMES 3
 #define MISSION_BALL_CENTER_CONFIRM_TIMEOUT_US 3000000
 #define MISSION_RECOVERY_REVERSE_MM 50.0f
 #define MISSION_GOAL_CAPTURE_RADIUS_MM 100.0f
 #define MISSION_LOST_BALL_FORWARD_MM 80.0f
+#define MISSION_VISUAL_PUSH_CENTER_X (DECODED_WIDTH / 2)
 #define UPPER_GOAL_X_MM 0.0f
 #define UPPER_GOAL_Y_MM 0.0f
 #define LOWER_GOAL_X_MM 900.0f
@@ -1555,18 +1557,37 @@ static void process_ball_capture_mission(
         const int center_error_px = enough_samples
             ? average_center_x - DECODED_WIDTH / 2
             : DECODED_WIDTH;
-        float corrected_ball_x;
-        float corrected_ball_y;
+        float corrected_ball_x = 0.0f;
+        float corrected_ball_y = 0.0f;
         const bool corrected_ball = enough_samples && selected_real &&
             project_ball_to_field(selected, &corrected_ball_x,
                                   &corrected_ball_y);
         const bool ball_centered = corrected_ball &&
             abs(center_error_px) <= MISSION_BALL_CENTER_TOLERANCE_PX;
+        post_line_navigation_pose_t centered_pose;
+        float push_heading_error_deg = 180.0f;
+        bool push_heading_aligned = false;
+        if (ball_centered &&
+            post_line_navigation_get_pose(&centered_pose)) {
+            float goal_x;
+            float goal_y;
+            mission_goal_geometry(mission, &goal_x, &goal_y);
+            const float desired_heading = atan2f(
+                goal_y - corrected_ball_y,
+                goal_x - corrected_ball_x);
+            push_heading_error_deg = fabsf(normalize_radians(
+                desired_heading - centered_pose.heading_rad)) *
+                180.0f / PI_F;
+            push_heading_aligned = push_heading_error_deg <=
+                MISSION_PUSH_HEADING_TOLERANCE_DEG;
+        }
+        const bool push_ready = ball_centered && push_heading_aligned;
         ESP_LOGW(TAG,
-                 "MISSION_PUSH_CENTER_RESULT samples=%d center_x=%d error=%dpx centered=%d",
+                 "MISSION_PUSH_CENTER_RESULT samples=%d center_x=%d error=%dpx centered=%d heading_error=%ddeg ready=%d",
                  mission->ball_center_samples, average_center_x,
-                 center_error_px, ball_centered);
-        if (ball_centered) {
+                 center_error_px, ball_centered,
+                 (int)lroundf(push_heading_error_deg), push_ready);
+        if (push_ready) {
             mission->ball_field_x_mm = corrected_ball_x;
             mission->ball_field_y_mm = corrected_ball_y;
             if (!mission_start_final_push(mission)) {
@@ -1588,7 +1609,8 @@ static void process_ball_capture_mission(
         mission->exploring = false;
         mission->state = MISSION_PUSH_RECOVERY_REVERSE;
         ESP_LOGW(TAG,
-                 "MISSION_PUSH_RECOVERY ball_centered=0; reverse=%dmm then reacquire",
+                 "MISSION_PUSH_RECOVERY centered=%d heading_aligned=%d; reverse=%dmm then reacquire",
+                 ball_centered, push_heading_aligned,
                  (int)lroundf(MISSION_RECOVERY_REVERSE_MM));
         return;
     }
@@ -1661,6 +1683,13 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH) {
+        if (selected_real) {
+            const float visual_right_error =
+                (MISSION_VISUAL_PUSH_CENTER_X - selected->center_x) /
+                (float)MISSION_VISUAL_PUSH_CENTER_X;
+            post_line_navigation_set_visual_push_error(
+                visual_right_error, true);
+        }
         float push_ball_x = 0.0f;
         float push_ball_y = 0.0f;
         const char *ball_position_source = NULL;

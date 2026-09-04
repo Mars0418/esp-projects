@@ -61,6 +61,8 @@ bool post_line_navigation_rotate_to(float heading_deg, float speed_scale,
 bool post_line_navigation_push_to(float x_mm, float y_mm,
                                   float heading_deg, float tolerance_mm,
                                   float speed_scale, uint32_t *command_id);
+void post_line_navigation_set_visual_push_error(float right_error_normalized,
+                                                bool valid);
 bool post_line_navigation_reverse_by(float distance_mm, float speed_scale,
                                      uint32_t *command_id);
 bool post_line_navigation_follow_path(
