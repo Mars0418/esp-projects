@@ -57,6 +57,14 @@
 #define NAV_VISUAL_LATERAL_KP 1.50f
 #define NAV_VISUAL_MIN_LATERAL 0.50f
 #define NAV_VISUAL_MAX_LATERAL 0.60f
+#define NAV_VISUAL_GOAL_HOLD_MS 700
+#define NAV_VISUAL_GOAL_FADE_MS 900
+#define NAV_VISUAL_GOAL_HEADING_KP 0.75f
+#define NAV_VISUAL_GOAL_MAX_TURN 0.20f
+#define NAV_VISUAL_GOAL_ANGLE_DEADBAND_RAD 0.0523599f
+#define NAV_VISUAL_GOAL_FULL_SPEED_RAD 0.1047198f
+#define NAV_VISUAL_GOAL_SLOW_ANGLE_RAD 0.4363323f
+#define NAV_VISUAL_GOAL_MIN_FORWARD 0.45f
 
 /* The inner speed loop follows the camera-line controller's 150 ms PI and
  * anti-stall policy. These are floor-test parameters, intentionally grouped
@@ -140,9 +148,14 @@ static post_line_navigation_waypoint_t
     s_path_points[POST_LINE_NAVIGATION_MAX_PATH_POINTS];
 static size_t s_path_point_count;
 static size_t s_path_point_index;
+static bool s_path_require_final_heading;
 static bool s_visual_push_valid;
 static float s_visual_push_right_error;
 static int64_t s_visual_push_updated_us;
+static bool s_visual_goal_mode;
+static float s_visual_goal_right_mm;
+static float s_visual_goal_forward_mm;
+static int64_t s_visual_goal_updated_us;
 
 static bool navigation_motion_allowed(uint32_t command_id);
 
@@ -375,6 +388,47 @@ static void apply_path_request(
     }
 }
 
+static void apply_visual_goal_request(
+    float right_mm, float forward_mm, float steering_weight,
+    const post_line_odometry_pose_t *odometry, int64_t now_us,
+    float command_scale, uint32_t command_id)
+{
+    const float safe_forward = fmaxf(forward_mm, 50.0f);
+    float angle_error = atan2f(right_mm, safe_forward);
+    if (fabsf(angle_error) <= NAV_VISUAL_GOAL_ANGLE_DEADBAND_RAD) {
+        angle_error = 0.0f;
+    }
+    const float turn = -clamp_float(
+        NAV_VISUAL_GOAL_HEADING_KP * angle_error,
+        -NAV_VISUAL_GOAL_MAX_TURN, NAV_VISUAL_GOAL_MAX_TURN) *
+        steering_weight;
+    const float absolute_angle = fabsf(angle_error);
+    float forward_scale = absolute_angle <=
+            NAV_VISUAL_GOAL_FULL_SPEED_RAD
+        ? 1.0f
+        : clamp_float(
+              1.0f - (absolute_angle - NAV_VISUAL_GOAL_FULL_SPEED_RAD) /
+                  (NAV_VISUAL_GOAL_SLOW_ANGLE_RAD -
+                   NAV_VISUAL_GOAL_FULL_SPEED_RAD),
+              NAV_VISUAL_GOAL_MIN_FORWARD, 1.0f);
+    forward_scale = fmaxf(
+        NAV_VISUAL_GOAL_MIN_FORWARD,
+        forward_scale *
+            (NAV_VISUAL_GOAL_MIN_FORWARD +
+             (1.0f - NAV_VISUAL_GOAL_MIN_FORWARD) * steering_weight));
+    float wheel_request[NAV_WHEEL_COUNT] = {
+        0.8660254f * forward_scale + turn,
+        turn,
+        -0.8660254f * forward_scale + turn,
+    };
+    if (navigation_motion_allowed(command_id)) {
+        apply_scaled_wheel_requests(wheel_request, odometry, now_us,
+                                    command_scale);
+    } else {
+        brake_motors();
+    }
+}
+
 static post_line_navigation_pose_t pose_from_odometry(
     const navigation_anchor_t *anchor,
     const post_line_odometry_pose_t *odometry)
@@ -480,9 +534,14 @@ static void navigation_task(void *argument)
         int64_t brake_until_us;
         size_t path_point_count;
         size_t path_point_index;
+        bool path_require_final_heading;
         bool visual_push_valid;
         float visual_push_right_error;
         int64_t visual_push_updated_us;
+        bool visual_goal_mode;
+        float visual_goal_right_mm;
+        float visual_goal_forward_mm;
+        int64_t visual_goal_updated_us;
         portENTER_CRITICAL(&s_lock);
         anchor = s_anchor;
         anchor_revision = s_anchor_revision;
@@ -502,9 +561,14 @@ static void navigation_task(void *argument)
         brake_until_us = s_brake_until_us;
         path_point_count = s_path_point_count;
         path_point_index = s_path_point_index;
+        path_require_final_heading = s_path_require_final_heading;
         visual_push_valid = s_visual_push_valid;
         visual_push_right_error = s_visual_push_right_error;
         visual_push_updated_us = s_visual_push_updated_us;
+        visual_goal_mode = s_visual_goal_mode;
+        visual_goal_right_mm = s_visual_goal_right_mm;
+        visual_goal_forward_mm = s_visual_goal_forward_mm;
+        visual_goal_updated_us = s_visual_goal_updated_us;
         reset_pi = s_reset_pi_requested;
         s_reset_pi_requested = false;
         portEXIT_CRITICAL(&s_lock);
@@ -518,9 +582,19 @@ static void navigation_task(void *argument)
         const bool visual_lateral_pulse = visual_push_active &&
             now_us - visual_push_updated_us <=
                 (int64_t)NAV_VISUAL_LATERAL_PULSE_MS * 1000;
-        float visual_push_lateral = 0.0f;
-        float visual_push_forward = 0.0f;
-
+        const bool visual_goal_active =
+            command == POST_NAV_COMMAND_PUSH && visual_goal_mode;
+        const int64_t visual_goal_age_us = visual_goal_active
+            ? now_us - visual_goal_updated_us : 0;
+        const float visual_goal_steering_weight = !visual_goal_active ||
+                visual_goal_age_us <=
+                    (int64_t)NAV_VISUAL_GOAL_HOLD_MS * 1000
+            ? 1.0f
+            : clamp_float(
+                  1.0f - (float)(visual_goal_age_us -
+                      (int64_t)NAV_VISUAL_GOAL_HOLD_MS * 1000) /
+                      ((float)NAV_VISUAL_GOAL_FADE_MS * 1000.0f),
+                  0.0f, 1.0f);
         if (stopped || !started || command == POST_NAV_COMMAND_NONE) {
             coast_motors();
             publish_pose(pose, anchor_revision);
@@ -603,13 +677,16 @@ static void navigation_task(void *argument)
             const float drive_direction = reverse_drive ? -1.0f : 1.0f;
             const float directional_remaining =
                 drive_direction * forward_remaining;
-            const bool position_reached = path_command
-                ? final_path_point && distance <= target_tolerance &&
-                    fabsf(path_heading_error) <=
-                        NAV_PATH_HEADING_TOLERANCE_RAD
-                : fixed_heading_drive
-                ? directional_remaining <= target_tolerance
-                : distance <= target_tolerance;
+            const bool position_reached = visual_goal_active
+                ? false
+                : path_command
+                    ? final_path_point && distance <= target_tolerance &&
+                        (!path_require_final_heading ||
+                         fabsf(path_heading_error) <=
+                             NAV_PATH_HEADING_TOLERANCE_RAD)
+                    : fixed_heading_drive
+                        ? directional_remaining <= target_tolerance
+                        : distance <= target_tolerance;
             if (path_command && !final_path_point &&
                 distance <= NAV_PATH_WAYPOINT_RADIUS_MM) {
                 portENTER_CRITICAL(&s_lock);
@@ -667,11 +744,20 @@ static void navigation_task(void *argument)
                     ? target_heading : atan2f(error_y, error_x);
                 float heading_error = normalize_radians(
                     desired_heading - pose.heading_rad);
-                if (path_command) {
+                if (visual_goal_active) {
+                    apply_visual_goal_request(
+                        visual_goal_right_mm, visual_goal_forward_mm,
+                        visual_goal_steering_weight, &odometry, now_us,
+                        command_scale, command_id);
+                } else if (path_command) {
                     if (distance <= target_tolerance) {
-                        apply_rotation_request(
-                            heading_error, &odometry, now_us,
-                            command_scale, command_id);
+                        if (path_require_final_heading) {
+                            apply_rotation_request(
+                                heading_error, &odometry, now_us,
+                                command_scale, command_id);
+                        } else {
+                            brake_motors();
+                        }
                     } else {
                         const float inverse_distance = 1.0f / distance;
                         apply_path_request(
@@ -748,8 +834,6 @@ static void navigation_task(void *argument)
                             forward_scale *= centering_progress;
                         }
                     }
-                    visual_push_lateral = body_right;
-                    visual_push_forward = forward_scale;
                     float wheel_request[NAV_WHEEL_COUNT] = {
                         -0.5f * body_right +
                             0.8660254f * forward_scale + turn,
@@ -773,28 +857,19 @@ static void navigation_task(void *argument)
                 (int64_t)NAV_STATUS_INTERVAL_MS * 1000) {
             post_line_navigation_pose_t status;
             post_line_navigation_get_pose(&status);
-            const char *mode = status.command == POST_NAV_COMMAND_PATH
-                ? "CURVE"
-                : (s_aligning ? "ALIGN"
-                              : (visual_push_active ? "VISUAL_PUSH"
-                                                    : "DRIVE"));
-            ESP_LOGI(TAG,
-                     "NAV state=%s command=%d id=%lu mode=%s pose=(%d,%d,%ddeg) target=(%d,%d,%ddeg) remaining=%dmm visual_error=%dpx lateral=%d%% forward=%d%%",
-                     post_line_navigation_state_name(status.state),
-                     status.command, (unsigned long)status.command_id,
-                     mode,
-                     (int)lroundf(status.x_mm),
-                     (int)lroundf(status.y_mm),
-                     (int)lroundf(status.heading_deg),
-                     (int)lroundf(status.target_x_mm),
-                     (int)lroundf(status.target_y_mm),
-                     (int)lroundf(status.target_heading_deg),
-                     (int)lroundf(status.distance_to_target_mm),
-                     visual_push_active
-                         ? (int)lroundf(visual_push_right_error * 80.0f)
-                         : 0,
-                     (int)lroundf(visual_push_lateral * 100.0f),
-                     (int)lroundf(visual_push_forward * 100.0f));
+            if (visual_goal_active) {
+                ESP_LOGI(TAG,
+                         "CONTROL source=VISION odometry=(x=%dmm,y=%dmm) target_vehicle=(right=%dmm,forward=%dmm)",
+                         (int)lroundf(status.x_mm),
+                         (int)lroundf(status.y_mm),
+                         (int)lroundf(visual_goal_right_mm),
+                         (int)lroundf(visual_goal_forward_mm));
+            } else {
+                ESP_LOGI(TAG,
+                         "CONTROL source=ODOMETRY odometry=(x=%dmm,y=%dmm)",
+                         (int)lroundf(status.x_mm),
+                         (int)lroundf(status.y_mm));
+            }
             s_last_status_us = now_us;
         }
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(NAV_CONTROL_INTERVAL_MS));
@@ -883,9 +958,14 @@ esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
     s_command_id = 0;
     s_path_point_count = 0;
     s_path_point_index = 0;
+    s_path_require_final_heading = true;
     s_visual_push_valid = false;
     s_visual_push_right_error = 0.0f;
     s_visual_push_updated_us = 0;
+    s_visual_goal_mode = false;
+    s_visual_goal_right_mm = 0.0f;
+    s_visual_goal_forward_mm = 0.0f;
+    s_visual_goal_updated_us = 0;
     s_target_x_mm = initial_x_mm;
     s_target_y_mm = initial_y_mm;
     s_target_heading_rad = initial_heading_deg * NAV_PI / 180.0f;
@@ -1060,6 +1140,10 @@ bool post_line_navigation_push_to(float x_mm, float y_mm,
     s_visual_push_valid = false;
     s_visual_push_right_error = 0.0f;
     s_visual_push_updated_us = 0;
+    s_visual_goal_mode = false;
+    s_visual_goal_right_mm = 0.0f;
+    s_visual_goal_forward_mm = 0.0f;
+    s_visual_goal_updated_us = 0;
     s_target_x_mm = x_mm;
     s_target_y_mm = y_mm;
     s_target_heading_rad = normalize_radians(heading_deg * NAV_PI / 180.0f);
@@ -1118,6 +1202,43 @@ void post_line_navigation_set_visual_push_error(float right_error_normalized,
     portEXIT_CRITICAL(&s_lock);
 }
 
+void post_line_navigation_set_visual_goal_target(float right_mm,
+                                                 float forward_mm)
+{
+    if (!isfinite(right_mm) || !isfinite(forward_mm) ||
+        forward_mm <= 0.0f) {
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (s_started && !s_stopped &&
+        s_command == POST_NAV_COMMAND_PUSH) {
+        const bool newly_enabled = !s_visual_goal_mode;
+        s_visual_goal_mode = true;
+        s_visual_goal_right_mm = right_mm;
+        s_visual_goal_forward_mm = forward_mm;
+        s_visual_goal_updated_us = now_us;
+        s_visual_push_valid = false;
+        s_visual_push_right_error = 0.0f;
+        s_visual_push_updated_us = 0;
+        s_aligning = false;
+        if (newly_enabled) {
+            s_phase_started_us = now_us;
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void post_line_navigation_clear_visual_goal_target(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_visual_goal_mode = false;
+    s_visual_goal_right_mm = 0.0f;
+    s_visual_goal_forward_mm = 0.0f;
+    s_visual_goal_updated_us = 0;
+    portEXIT_CRITICAL(&s_lock);
+}
+
 bool post_line_navigation_reverse_by(float distance_mm, float speed_scale,
                                      uint32_t *command_id)
 {
@@ -1168,8 +1289,8 @@ bool post_line_navigation_reverse_by(float distance_mm, float speed_scale,
 
 bool post_line_navigation_follow_path(
     const post_line_navigation_waypoint_t *points, size_t point_count,
-    float final_heading_deg, float final_tolerance_mm, float speed_scale,
-    uint32_t *command_id)
+    float final_heading_deg, bool require_final_heading,
+    float final_tolerance_mm, float speed_scale, uint32_t *command_id)
 {
     if (!points || point_count == 0 ||
         point_count > POST_LINE_NAVIGATION_MAX_PATH_POINTS ||
@@ -1194,6 +1315,7 @@ bool post_line_navigation_follow_path(
            point_count * sizeof(s_path_points[0]));
     s_path_point_count = point_count;
     s_path_point_index = 0;
+    s_path_require_final_heading = require_final_heading;
     s_command_id++;
     const uint32_t issued_id = s_command_id;
     s_command = POST_NAV_COMMAND_PATH;
@@ -1216,13 +1338,14 @@ bool post_line_navigation_follow_path(
     if (command_id) *command_id = issued_id;
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGW(TAG,
-             "PATH_COMMAND id=%lu points=%u first=(%d,%d) final=(%d,%d,%ddeg) tolerance=%d scale=%d%%",
+             "PATH_COMMAND id=%lu points=%u first=(%d,%d) final=(%d,%d,%ddeg) align_final=%d tolerance=%d scale=%d%%",
              (unsigned long)issued_id, (unsigned)point_count,
              (int)lroundf(points[0].x_mm),
              (int)lroundf(points[0].y_mm),
              (int)lroundf(points[point_count - 1].x_mm),
              (int)lroundf(points[point_count - 1].y_mm),
              (int)lroundf(final_heading_deg),
+             require_final_heading,
              (int)lroundf(final_tolerance_mm),
              (int)lroundf(speed_scale * 100.0f));
     return true;

@@ -63,12 +63,15 @@ bool post_line_navigation_push_to(float x_mm, float y_mm,
                                   float speed_scale, uint32_t *command_id);
 void post_line_navigation_set_visual_push_error(float right_error_normalized,
                                                 bool valid);
+void post_line_navigation_set_visual_goal_target(float right_mm,
+                                                 float forward_mm);
+void post_line_navigation_clear_visual_goal_target(void);
 bool post_line_navigation_reverse_by(float distance_mm, float speed_scale,
                                      uint32_t *command_id);
 bool post_line_navigation_follow_path(
     const post_line_navigation_waypoint_t *points, size_t point_count,
-    float final_heading_deg, float final_tolerance_mm, float speed_scale,
-    uint32_t *command_id);
+    float final_heading_deg, bool require_final_heading,
+    float final_tolerance_mm, float speed_scale, uint32_t *command_id);
 bool post_line_navigation_correct_pose(float x_mm, float y_mm,
                                        float heading_deg);
 bool post_line_navigation_get_pose(post_line_navigation_pose_t *pose);

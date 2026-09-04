@@ -83,7 +83,7 @@ static void log_white_ball_result(const ball_vision_result_t *result,
                              ? (result->left + result->right) / 2 : -1;
     const int center_y = detected_this_frame
                              ? (result->top + result->bottom) / 2 : -1;
-    ESP_LOGI(WHITE_TAG,
+    ESP_LOGD(WHITE_TAG,
              "WHITE_BALL found=%d confidence=%d center=(%d,%d) recent10=%d",
              detected_this_frame, detected_this_frame ? result->confidence : 0,
              center_x, center_y,

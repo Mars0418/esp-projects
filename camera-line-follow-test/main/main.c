@@ -59,19 +59,21 @@
 #define PRECISE_TRIGGER_FRAMES 3
 #define GOAL_DETECTION_WINDOW_FRAMES 10
 #define GOAL_DETECTION_REQUIRED_FRAMES 8
+#define VISUAL_GOAL_SWITCH_WINDOW_FRAMES 5
+#define VISUAL_GOAL_SWITCH_REQUIRED_FRAMES 2
 #define OBJECT_STATUS_INTERVAL_US 500000
 #define INITIAL_FIELD_X_MM 470.0f
 #define INITIAL_FIELD_Y_MM 650.0f
 #define INITIAL_FIELD_HEADING_DEG (-90.0f)
 #define PI_F 3.14159265359f
 
-#define MISSION_TRAVEL_SPEED 0.60f
-#define MISSION_PUSH_SPEED 0.35f
+#define MISSION_TRAVEL_SPEED 0.4f
+#define MISSION_PUSH_SPEED 0.3f
 #define MISSION_BALL_CANDIDATE_FRAMES 2
 #define MISSION_BALL_SETTLE_US 250000
 #define MISSION_BALL_STABLE_FRAMES 3
 #define MISSION_BALL_STABLE_MAX_MM 30.0f
-#define MISSION_PREPUSH_STANDOFF_MM 180.0f
+#define MISSION_PREPUSH_STANDOFF_MM 160.0f
 #define MISSION_PREPUSH_TOLERANCE_MM 20.0f
 #define MISSION_BALL_KEEP_OUT_MM 150.0f
 #define MISSION_BALL_ORBIT_RADIUS_MM 240.0f
@@ -82,16 +84,32 @@
 #define MISSION_PRECISE_TIMEOUT_US 6000000
 #define MISSION_EXPLORATION_START_FRAMES 10
 #define MISSION_RETURN_HEADING_DEG (-45.0f)
+#define MISSION_RETURN_LOCALIZE_X_MM 250.0f
+#define MISSION_RETURN_LOCALIZE_Y_MM 300.0f
+#define MISSION_RETURN_LOCALIZE_TOLERANCE_MM 35.0f
+#define MISSION_UPPER_GOAL_CORNER_X_MM 0.0f
+#define MISSION_UPPER_GOAL_CORNER_Y_MM 0.0f
+#define MISSION_LOWER_GOAL_CORNER_X_MM 900.0f
+#define MISSION_LOWER_GOAL_CORNER_Y_MM 0.0f
 #define MISSION_BALL_CENTER_TOLERANCE_PX 10
 #define MISSION_PUSH_HEADING_TOLERANCE_DEG 20.0f
 #define MISSION_BALL_CENTER_CONFIRM_FRAMES 3
 #define MISSION_BALL_CENTER_CONFIRM_TIMEOUT_US 3000000
 #define MISSION_RECOVERY_REVERSE_MM 50.0f
-#define MISSION_GOAL_CAPTURE_RADIUS_MM 100.0f
-#define MISSION_LOST_BALL_FORWARD_MM 80.0f
+#define MISSION_VISUAL_GOAL_CAPTURE_DISTANCE_MM 300.0f
 #define MISSION_VISUAL_PUSH_CENTER_X (DECODED_WIDTH / 2)
+#define MISSION_BALL_HELD_X_TOLERANCE_PX 12
+#define MISSION_BALL_HELD_Y_MAX_PX 30
+#define MISSION_BALL_HELD_CONFIRM_FRAMES 2
+#define MISSION_PREPUSH_CAPTURE_SWITCH_MM 45.0f
+#define MISSION_ENABLE_PUSH_PRECISE_LOCALIZATION 0
+#define MISSION_VISUAL_GOAL_CONFIDENCE 70
+#define MISSION_VISUAL_GOAL_FILTER_ALPHA 0.25f
+#define MISSION_VISUAL_GOAL_MAX_JUMP_MM 250.0f
+#define MISSION_VISUAL_GOAL_MAX_RIGHT_MM 2000.0f
+#define MISSION_VISUAL_GOAL_MAX_FORWARD_MM 3000.0f
 #define UPPER_GOAL_X_MM 0.0f
-#define UPPER_GOAL_Y_MM 0.0f
+#define UPPER_GOAL_Y_MM -100.0f
 #define LOWER_GOAL_X_MM 900.0f
 #define LOWER_GOAL_Y_MM 0.0f
 
@@ -139,6 +157,9 @@ typedef enum {
     MISSION_PUSH_RECOVERY_SEARCH,
     MISSION_PUSH_RECOVERY_SETTLE,
     MISSION_PUSH,
+    MISSION_RETURN_LOCALIZE_MOVE,
+    MISSION_RETURN_LOCALIZE_ALIGN,
+    MISSION_RETURN_LOCALIZE_PRECISE,
     MISSION_RETURN_INITIAL,
     MISSION_RETURN_ALIGN,
     MISSION_SELECT_SECOND_BALL,
@@ -155,7 +176,6 @@ typedef enum {
 typedef struct {
     ball_capture_mission_state_t state;
     mission_ball_kind_t selected_ball;
-    mission_ball_kind_t first_ball;
     int target_goal_index;
     int candidate_frames;
     int missing_ball_frames;
@@ -163,7 +183,16 @@ typedef struct {
     int ball_center_x_sum;
     bool exploring;
     bool push_precise_locked;
+    bool ball_held;
+    int ball_held_candidate_frames;
     goal_detection_window_t ball_window;
+    goal_detection_window_t visual_goal_window;
+    bool visual_goal_locked;
+    bool visual_goal_filter_initialized;
+    float visual_goal_right_mm;
+    float visual_goal_forward_mm;
+    int64_t visual_goal_updated_us;
+    int64_t visual_goal_last_diag_us;
     int stable_ball_frames;
     float last_ball_field_x_mm;
     float last_ball_field_y_mm;
@@ -249,19 +278,36 @@ static float normalize_radians(float radians)
     return radians;
 }
 
-static bool update_goal_detection_window(goal_detection_window_t *window,
-                                         bool detected)
+static bool update_detection_window(goal_detection_window_t *window,
+                                    bool detected, int window_frames,
+                                    int required_frames)
 {
-    if (window->count == GOAL_DETECTION_WINDOW_FRAMES) {
+    if (window->count == window_frames) {
         window->detected_count -= window->detected[window->index];
     } else {
         window->count++;
     }
     window->detected[window->index] = detected ? 1 : 0;
     window->detected_count += detected ? 1 : 0;
-    window->index = (window->index + 1) % GOAL_DETECTION_WINDOW_FRAMES;
-    return window->count == GOAL_DETECTION_WINDOW_FRAMES &&
-           window->detected_count >= GOAL_DETECTION_REQUIRED_FRAMES;
+    window->index = (window->index + 1) % window_frames;
+    return window->count == window_frames &&
+           window->detected_count >= required_frames;
+}
+
+static bool update_goal_detection_window(goal_detection_window_t *window,
+                                         bool detected)
+{
+    return update_detection_window(
+        window, detected, GOAL_DETECTION_WINDOW_FRAMES,
+        GOAL_DETECTION_REQUIRED_FRAMES);
+}
+
+static bool update_visual_goal_switch_window(
+    goal_detection_window_t *window, bool detected)
+{
+    return update_detection_window(
+        window, detected, VISUAL_GOAL_SWITCH_WINDOW_FRAMES,
+        VISUAL_GOAL_SWITCH_REQUIRED_FRAMES);
 }
 
 static float pose_prior_score(const quarter_goal_pose_result_t *candidate,
@@ -348,6 +394,9 @@ static const char *mission_state_name(ball_capture_mission_state_t state)
     case MISSION_PUSH_RECOVERY_SEARCH: return "PUSH_RECOVERY_SEARCH";
     case MISSION_PUSH_RECOVERY_SETTLE: return "PUSH_RECOVERY_SETTLE";
     case MISSION_PUSH: return "PUSH";
+    case MISSION_RETURN_LOCALIZE_MOVE: return "RETURN_LOCALIZE_MOVE";
+    case MISSION_RETURN_LOCALIZE_ALIGN: return "RETURN_LOCALIZE_ALIGN";
+    case MISSION_RETURN_LOCALIZE_PRECISE: return "RETURN_LOCALIZE_PRECISE";
     case MISSION_RETURN_INITIAL: return "RETURN_INITIAL";
     case MISSION_RETURN_ALIGN: return "RETURN_ALIGN";
     case MISSION_SELECT_SECOND_BALL: return "SELECT_SECOND_BALL";
@@ -364,15 +413,6 @@ static const ball_vision_result_t *selected_ball_result(
     if (kind == MISSION_BALL_RED) return red;
     if (kind == MISSION_BALL_WHITE) return white;
     return NULL;
-}
-
-static bool ball_kind_is_real(
-    mission_ball_kind_t kind, const ball_vision_result_t *red,
-    const ball_vision_result_t *white)
-{
-    const ball_vision_result_t *ball =
-        selected_ball_result(kind, red, white);
-    return ball && ball->found && !ball->predicted;
 }
 
 static bool project_ball_to_field(const ball_vision_result_t *ball,
@@ -453,6 +493,19 @@ static void mission_goal_geometry(const ball_capture_mission_t *mission,
     const bool lower = mission->target_goal_index == 1;
     *goal_x_mm = lower ? LOWER_GOAL_X_MM : UPPER_GOAL_X_MM;
     *goal_y_mm = lower ? LOWER_GOAL_Y_MM : UPPER_GOAL_Y_MM;
+}
+
+static void mission_reset_visual_goal(ball_capture_mission_t *mission)
+{
+    memset(&mission->visual_goal_window, 0,
+           sizeof(mission->visual_goal_window));
+    mission->visual_goal_locked = false;
+    mission->visual_goal_filter_initialized = false;
+    mission->visual_goal_right_mm = 0.0f;
+    mission->visual_goal_forward_mm = 0.0f;
+    mission->visual_goal_updated_us = 0;
+    mission->visual_goal_last_diag_us = 0;
+    post_line_navigation_clear_visual_goal_target();
 }
 
 static float point_to_segment_distance(
@@ -594,7 +647,7 @@ static bool mission_move_behind_ball(ball_capture_mission_t *mission,
              (unsigned)point_count, needs_orbit,
              (int)lroundf(direct_clearance));
     return post_line_navigation_follow_path(
-        points, point_count, push_heading * 180.0f / PI_F,
+        points, point_count, push_heading * 180.0f / PI_F, false,
         MISSION_PREPUSH_TOLERANCE_MM, MISSION_TRAVEL_SPEED,
         &mission->command_id);
 }
@@ -612,7 +665,7 @@ static bool mission_start_exploration(ball_capture_mission_t *mission)
         .y_mm = goal_y,
     };
     if (!post_line_navigation_follow_path(
-            &target, 1, heading, MISSION_MOVE_TOLERANCE_MM,
+            &target, 1, heading, true, MISSION_MOVE_TOLERANCE_MM,
             MISSION_PUSH_SPEED, &mission->command_id)) return false;
     ESP_LOGW(TAG,
              "MISSION_EXPLORE goal=%s target=(%d,%d) heading=%ddeg speed=%d%%",
@@ -620,6 +673,24 @@ static bool mission_start_exploration(ball_capture_mission_t *mission)
              (int)lroundf(goal_x), (int)lroundf(goal_y),
              (int)lroundf(heading),
              (int)lroundf(MISSION_PUSH_SPEED * 100.0f));
+    return true;
+}
+
+static bool mission_start_return_initial(ball_capture_mission_t *mission,
+                                         const char *localization_source)
+{
+    if (!post_line_navigation_move_to(
+            INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
+            MISSION_MOVE_TOLERANCE_MM, MISSION_TRAVEL_SPEED,
+            &mission->command_id)) {
+        return false;
+    }
+    mission->state = MISSION_RETURN_INITIAL;
+    ESP_LOGW(TAG,
+             "MISSION_RETURN target=(%d,%d) localization=%s; align to %ddeg after arrival",
+             (int)lroundf(INITIAL_FIELD_X_MM),
+             (int)lroundf(INITIAL_FIELD_Y_MM), localization_source,
+             (int)lroundf(MISSION_RETURN_HEADING_DEG));
     return true;
 }
 
@@ -636,12 +707,162 @@ static bool mission_start_final_push(ball_capture_mission_t *mission)
             &mission->command_id)) {
         return false;
     }
+    mission_reset_visual_goal(mission);
     ESP_LOGW(TAG,
              "MISSION_PUSH goal=%s vertex=(%d,%d) fixed_heading=%ddeg",
              mission->target_goal_index == 0 ? "UPPER" : "LOWER",
              (int)lroundf(goal_x), (int)lroundf(goal_y),
              (int)lroundf(push_heading));
     return true;
+}
+
+static bool mission_update_ball_held(
+    ball_capture_mission_t *mission, const ball_vision_result_t *ball,
+    bool real_detection)
+{
+    if (mission->ball_held) return true;
+    const bool at_contact = real_detection &&
+        abs(ball->center_x - MISSION_VISUAL_PUSH_CENTER_X) <=
+            MISSION_BALL_HELD_X_TOLERANCE_PX &&
+        ball->center_y <= MISSION_BALL_HELD_Y_MAX_PX;
+    if (!at_contact) {
+        mission->ball_held_candidate_frames = 0;
+        return false;
+    }
+    mission->ball_held_candidate_frames++;
+    if (mission->ball_held_candidate_frames <
+            MISSION_BALL_HELD_CONFIRM_FRAMES) {
+        return false;
+    }
+    float ball_x;
+    float ball_y;
+    if (project_ball_to_field(ball, &ball_x, &ball_y)) {
+        mission->ball_field_x_mm = ball_x;
+        mission->ball_field_y_mm = ball_y;
+    }
+    mission->ball_held = true;
+    ESP_LOGW(TAG,
+             "MISSION_BALL_HELD center=(%d,%d) confirmed=%d; continuous push has priority",
+             ball->center_x, ball->center_y,
+             mission->ball_held_candidate_frames);
+    return true;
+}
+
+static bool mission_continue_with_held_ball(ball_capture_mission_t *mission,
+                                            const char *source)
+{
+    if (!mission_start_final_push(mission)) return false;
+    memset(&mission->ball_window, 0, sizeof(mission->ball_window));
+    mission->stable_goal_frames = 0;
+    mission->state = MISSION_PUSH;
+    ESP_LOGW(TAG,
+             "MISSION_HELD_PUSH_PRIORITY source=%s; skip heading alignment and precise localization",
+             source);
+    return true;
+}
+
+static void mission_update_visual_goal(
+    ball_capture_mission_t *mission,
+    const black_marker_result_t *marker,
+    const quarter_goal_pose_result_t *goal_pose, int64_t now_us)
+{
+    const char *reject_reason = "ACCEPTED";
+    bool accepted = true;
+    if (!marker || !marker->found) {
+        accepted = false;
+        reject_reason = "NO_MARKER";
+    } else if (marker->predicted) {
+        accepted = false;
+        reject_reason = "MARKER_PREDICTED";
+    } else if (!goal_pose || !goal_pose->found) {
+        accepted = false;
+        reject_reason = "NO_GOAL_POSE";
+    } else if (!goal_pose->position_valid) {
+        accepted = false;
+        reject_reason = "POSITION_INVALID";
+    } else if (goal_pose->confidence < MISSION_VISUAL_GOAL_CONFIDENCE) {
+        accepted = false;
+        reject_reason = "LOW_CONFIDENCE";
+    } else if (goal_pose->origin_vehicle_y_mm <= 0.0f) {
+        accepted = false;
+        reject_reason = "NOT_IN_FRONT";
+    } else if (goal_pose->origin_vehicle_y_mm >
+                   MISSION_VISUAL_GOAL_MAX_FORWARD_MM) {
+        accepted = false;
+        reject_reason = "TOO_FAR_FORWARD";
+    } else if (fabsf(goal_pose->origin_vehicle_x_mm) >
+                   MISSION_VISUAL_GOAL_MAX_RIGHT_MM) {
+        accepted = false;
+        reject_reason = "TOO_FAR_LATERAL";
+    }
+
+    if (accepted && mission->visual_goal_filter_initialized) {
+        const float jump = hypotf(
+            goal_pose->origin_vehicle_x_mm -
+                mission->visual_goal_right_mm,
+            goal_pose->origin_vehicle_y_mm -
+                mission->visual_goal_forward_mm);
+        if (jump > MISSION_VISUAL_GOAL_MAX_JUMP_MM) {
+            accepted = false;
+            reject_reason = "FRAME_JUMP";
+        }
+    }
+
+    if (accepted) {
+        if (!mission->visual_goal_filter_initialized) {
+            mission->visual_goal_right_mm =
+                goal_pose->origin_vehicle_x_mm;
+            mission->visual_goal_forward_mm =
+                goal_pose->origin_vehicle_y_mm;
+            mission->visual_goal_filter_initialized = true;
+        } else {
+            mission->visual_goal_right_mm +=
+                MISSION_VISUAL_GOAL_FILTER_ALPHA *
+                (goal_pose->origin_vehicle_x_mm -
+                 mission->visual_goal_right_mm);
+            mission->visual_goal_forward_mm +=
+                MISSION_VISUAL_GOAL_FILTER_ALPHA *
+                (goal_pose->origin_vehicle_y_mm -
+                 mission->visual_goal_forward_mm);
+        }
+        mission->visual_goal_updated_us = now_us;
+    }
+
+    const bool confirmed = update_visual_goal_switch_window(
+        &mission->visual_goal_window, accepted);
+    if ((!mission->visual_goal_locked || !accepted) &&
+        now_us - mission->visual_goal_last_diag_us >= 1000000) {
+        ESP_LOGW(TAG,
+                 "VISUAL_GOAL_CHECK accepted=%d reason=%s marker=%d/%d pose=%d/%d confidence=%d rel=(%d,%d) recent=%d/%d",
+                 accepted, reject_reason,
+                 marker && marker->found,
+                 marker && marker->predicted,
+                 goal_pose && goal_pose->found,
+                 goal_pose && goal_pose->position_valid,
+                 goal_pose ? goal_pose->confidence : 0,
+                 goal_pose ?
+                     (int)lroundf(goal_pose->origin_vehicle_x_mm) : 0,
+                 goal_pose ?
+                     (int)lroundf(goal_pose->origin_vehicle_y_mm) : 0,
+                 mission->visual_goal_window.detected_count,
+                 mission->visual_goal_window.count);
+        mission->visual_goal_last_diag_us = now_us;
+    }
+    if (!mission->visual_goal_locked && confirmed && accepted) {
+        mission->visual_goal_locked = true;
+        ESP_LOGW(TAG,
+                 "MISSION_VISUAL_GOAL_LOCK detected=%d/%d filtered_rel=(%d,%d) confidence=%d; odometry guidance disabled",
+                 mission->visual_goal_window.detected_count,
+                 mission->visual_goal_window.count,
+                 (int)lroundf(mission->visual_goal_right_mm),
+                 (int)lroundf(mission->visual_goal_forward_mm),
+                 goal_pose->confidence);
+    }
+    if (mission->visual_goal_locked && accepted) {
+        post_line_navigation_set_visual_goal_target(
+            mission->visual_goal_right_mm,
+            mission->visual_goal_forward_mm);
+    }
 }
 
 static bool mission_update_stable_ball(
@@ -1348,19 +1569,15 @@ static void process_ball_capture_mission(
 
     if (mission->state == MISSION_SELECT_FIRST_BALL ||
         mission->state == MISSION_SELECT_SECOND_BALL) {
-        const mission_ball_kind_t candidate =
-            mission->state == MISSION_SELECT_FIRST_BALL
-                ? choose_ball_nearest_goal(
-                      red_ball, white_ball, UPPER_GOAL_X_MM,
-                      UPPER_GOAL_Y_MM)
-                : (ball_kind_is_real(mission->selected_ball,
-                                     red_ball, white_ball)
-                       ? mission->selected_ball : MISSION_BALL_NONE);
+        float selection_goal_x;
+        float selection_goal_y;
+        mission_goal_geometry(mission, &selection_goal_x,
+                              &selection_goal_y);
+        const mission_ball_kind_t candidate = choose_ball_nearest_goal(
+            red_ball, white_ball, selection_goal_x, selection_goal_y);
         if (candidate == MISSION_BALL_NONE) {
             mission->candidate_frames = 0;
-            if (mission->state == MISSION_SELECT_FIRST_BALL) {
-                mission->selected_ball = MISSION_BALL_NONE;
-            }
+            mission->selected_ball = MISSION_BALL_NONE;
             if (mission->missing_ball_frames <
                     MISSION_EXPLORATION_START_FRAMES) {
                 mission->missing_ball_frames++;
@@ -1393,7 +1610,7 @@ static void process_ball_capture_mission(
                      mission->selected_ball == MISSION_BALL_RED
                          ? "RED" : "WHITE",
                      mission->target_goal_index == 0
-                         ? "NEAREST_UPPER_GOAL" : "REMAINING_BALL");
+                         ? "NEAREST_UPPER_GOAL" : "NEAREST_LOWER_GOAL");
         }
         return;
     }
@@ -1416,10 +1633,9 @@ static void process_ball_capture_mission(
         const bool confirmed = update_goal_detection_window(
             &mission->ball_window, selected_real);
         if (confirmed) {
-            if (mission->target_goal_index == 0) {
-                mission->first_ball = mission->selected_ball;
-            }
             mission->push_precise_locked = false;
+            mission->ball_held = false;
+            mission->ball_held_candidate_frames = 0;
             mission->stable_ball_frames = 0;
             mission->state = MISSION_BALL_STABLE;
             ESP_LOGW(TAG, "MISSION_BALL_CONFIRM passed=%d/%d",
@@ -1433,9 +1649,7 @@ static void process_ball_capture_mission(
                 mission->selected_ball = MISSION_BALL_NONE;
                 mission->state = MISSION_SELECT_FIRST_BALL;
             } else {
-                mission->selected_ball = mission->first_ball ==
-                        MISSION_BALL_RED
-                    ? MISSION_BALL_WHITE : MISSION_BALL_RED;
+                mission->selected_ball = MISSION_BALL_NONE;
                 mission->state = MISSION_SELECT_SECOND_BALL;
             }
             ESP_LOGW(TAG, "MISSION_BALL_CONFIRM rejected; resume search");
@@ -1444,6 +1658,13 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_BALL_STABLE) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            if (!mission_continue_with_held_ball(mission,
+                                                 "BALL_ALREADY_AT_CONTACT")) {
+                mission_fail(mission, "cannot start priority held-ball push");
+            }
+            return;
+        }
         if (mission_update_stable_ball(mission, selected, selected_real)) {
             if (!mission_move_behind_ball(mission, true)) {
                 mission_fail(mission, "invalid ball geometry or move command");
@@ -1456,6 +1677,40 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_MOVE_BEHIND) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            if (!mission_continue_with_held_ball(mission,
+                                                 "CAPTURED_DURING_APPROACH")) {
+                mission_fail(mission, "cannot continue captured-ball push");
+            }
+            return;
+        }
+        const bool centered_near_prepush = selected_real && nav_pose_valid &&
+            nav_pose.state == POST_NAV_RUNNING &&
+            nav_pose.distance_to_target_mm <=
+                MISSION_PREPUSH_CAPTURE_SWITCH_MM &&
+            abs(selected->center_x - MISSION_VISUAL_PUSH_CENTER_X) <=
+                MISSION_BALL_HELD_X_TOLERANCE_PX;
+        if (centered_near_prepush) {
+            float ball_x;
+            float ball_y;
+            if (project_ball_to_field(selected, &ball_x, &ball_y)) {
+                mission->ball_field_x_mm = ball_x;
+                mission->ball_field_y_mm = ball_y;
+            }
+            if (!mission_start_final_push(mission)) {
+                mission_fail(mission,
+                             "cannot switch from approach to ball capture");
+                return;
+            }
+            memset(&mission->ball_window, 0,
+                   sizeof(mission->ball_window));
+            mission->state = MISSION_PUSH;
+            ESP_LOGW(TAG,
+                     "MISSION_CAPTURE_PRIORITY center=(%d,%d) prepush_remaining=%dmm; keep moving",
+                     selected->center_x, selected->center_y,
+                     (int)lroundf(nav_pose.distance_to_target_mm));
+            return;
+        }
         if (!mission_command_complete(mission, &nav_pose)) return;
         mission->stable_ball_frames = 0;
         mission->settle_until_us = now_us + MISSION_BALL_SETTLE_US;
@@ -1467,6 +1722,13 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_FINAL_BALL_SETTLE) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            if (!mission_continue_with_held_ball(mission,
+                                                 "CAPTURED_AT_PREPUSH")) {
+                mission_fail(mission, "cannot continue held ball at prepush");
+            }
+            return;
+        }
         if (now_us < mission->settle_until_us) return;
         if (now_us >= mission->deadline_us) {
             mission_fail(mission, "ball lost before push");
@@ -1485,6 +1747,13 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH_PRECISE_LOCALIZE) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            if (!mission_continue_with_held_ball(mission,
+                                                 "CAPTURED_DURING_PRECISE")) {
+                mission_fail(mission, "cannot leave precise localization");
+            }
+            return;
+        }
         if (now_us < mission->settle_until_us) return;
         if (now_us >= mission->deadline_us) {
             mission->stable_goal_frames = 0;
@@ -1541,6 +1810,13 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH_CENTER_CONFIRM) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            if (!mission_continue_with_held_ball(mission,
+                                                 "CAPTURED_DURING_CONFIRM")) {
+                mission_fail(mission, "cannot leave ball confirmation");
+            }
+            return;
+        }
         if (selected_real &&
             mission->ball_center_samples <
                 MISSION_BALL_CENTER_CONFIRM_FRAMES) {
@@ -1683,65 +1959,66 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH) {
-        if (selected_real) {
+        mission_update_ball_held(mission, selected, selected_real);
+        if (mission->ball_held) {
+            mission_update_visual_goal(mission, marker, goal_pose, now_us);
+        }
+        if (selected_real && !mission->ball_held) {
             const float visual_right_error =
                 (MISSION_VISUAL_PUSH_CENTER_X - selected->center_x) /
                 (float)MISSION_VISUAL_PUSH_CENTER_X;
             post_line_navigation_set_visual_push_error(
                 visual_right_error, true);
         }
-        float push_ball_x = 0.0f;
-        float push_ball_y = 0.0f;
-        const char *ball_position_source = NULL;
-        if (selected_real &&
-            project_ball_to_field(selected, &push_ball_x, &push_ball_y)) {
-            ball_position_source = "VISION";
-        } else if (!selected_real && nav_pose_valid) {
-            push_ball_x = nav_pose.x_mm +
-                cosf(nav_pose.heading_rad) * MISSION_LOST_BALL_FORWARD_MM;
-            push_ball_y = nav_pose.y_mm +
-                sinf(nav_pose.heading_rad) * MISSION_LOST_BALL_FORWARD_MM;
-            ball_position_source = "FRONT_80MM";
+
+        bool ball_scored = false;
+        float goal_distance = INFINITY;
+        const float visual_goal_right = mission->visual_goal_right_mm;
+        const float visual_goal_forward = mission->visual_goal_forward_mm;
+        if (mission->ball_held && mission->visual_goal_locked) {
+            goal_distance = hypotf(visual_goal_right,
+                                   visual_goal_forward);
+            ball_scored = goal_distance <=
+                MISSION_VISUAL_GOAL_CAPTURE_DISTANCE_MM;
         }
 
-        if (mission->push_precise_locked && ball_position_source) {
-            float goal_x;
-            float goal_y;
-            mission_goal_geometry(mission, &goal_x, &goal_y);
-            mission->ball_field_x_mm = push_ball_x;
-            mission->ball_field_y_mm = push_ball_y;
-            const float goal_distance = hypotf(push_ball_x - goal_x,
-                                               push_ball_y - goal_y);
-            if (goal_distance <= MISSION_GOAL_CAPTURE_RADIUS_MM) {
-                post_line_navigation_pause();
-                ESP_LOGW(TAG,
-                         "MISSION_BALL_SCORED goal=%s source=%s ball=(%d,%d) distance=%dmm",
-                         mission->target_goal_index == 0 ? "UPPER" : "LOWER",
-                         ball_position_source,
-                         (int)lroundf(push_ball_x),
-                         (int)lroundf(push_ball_y),
-                         (int)lroundf(goal_distance));
-                if (mission->target_goal_index == 1) {
-                    mission->state = MISSION_DONE;
-                    ESP_LOGW(TAG, "MISSION_COMPLETE both balls pushed");
-                    return;
-                }
-                if (!post_line_navigation_move_to(
-                        INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
-                        MISSION_MOVE_TOLERANCE_MM, MISSION_TRAVEL_SPEED,
-                        &mission->command_id)) {
-                    mission_fail(mission, "cannot return to initial position");
-                    return;
-                }
-                mission->state = MISSION_RETURN_INITIAL;
-                ESP_LOGW(TAG,
-                         "MISSION_RETURN target=(470,650); align to -45deg after arrival");
+        if (ball_scored) {
+            post_line_navigation_pause();
+            mission->ball_held = false;
+            mission->ball_held_candidate_frames = 0;
+            ESP_LOGW(TAG,
+                     "MISSION_BALL_SCORED goal=%s source=VISION_CORNER_RANGE distance=%dmm visual_goal_rel=(%d,%d)",
+                     mission->target_goal_index == 0 ? "UPPER" : "LOWER",
+                     (int)lroundf(goal_distance),
+                     (int)lroundf(visual_goal_right),
+                     (int)lroundf(visual_goal_forward));
+            mission_reset_visual_goal(mission);
+            if (mission->target_goal_index == 1) {
+                mission->state = MISSION_DONE;
+                ESP_LOGW(TAG, "MISSION_COMPLETE both balls pushed");
                 return;
             }
+            if (!post_line_navigation_move_to(
+                    MISSION_RETURN_LOCALIZE_X_MM,
+                    MISSION_RETURN_LOCALIZE_Y_MM,
+                    MISSION_RETURN_LOCALIZE_TOLERANCE_MM,
+                    MISSION_TRAVEL_SPEED,
+                    &mission->command_id)) {
+                mission_fail(mission,
+                             "cannot move to return localization point");
+                return;
+            }
+            mission->state = MISSION_RETURN_LOCALIZE_MOVE;
+            ESP_LOGW(TAG,
+                     "MISSION_RETURN_LOCALIZE_MOVE target=(%d,%d)",
+                     (int)lroundf(MISSION_RETURN_LOCALIZE_X_MM),
+                     (int)lroundf(MISSION_RETURN_LOCALIZE_Y_MM));
+            return;
         }
 
-        if (nav_pose_valid && nav_pose.state == POST_NAV_RUNNING &&
-            !mission->push_precise_locked &&
+        if (MISSION_ENABLE_PUSH_PRECISE_LOCALIZATION &&
+            nav_pose_valid && nav_pose.state == POST_NAV_RUNNING &&
+            !mission->push_precise_locked && !mission->ball_held &&
             update_goal_detection_window(&mission->ball_window,
                                          selected_real)) {
             mission->stable_goal_frames = 0;
@@ -1766,10 +2043,97 @@ static void process_ball_capture_mission(
         mission->missing_ball_frames = 0;
         mission->stable_ball_frames = 0;
         mission->exploring = false;
+        mission->ball_held = false;
+        mission->ball_held_candidate_frames = 0;
         mission->state = MISSION_PUSH_RECOVERY_REVERSE;
         ESP_LOGW(TAG,
                  "MISSION_GOAL_UNCONFIRMED; reverse=%dmm then reacquire",
                  (int)lroundf(MISSION_RECOVERY_REVERSE_MM));
+        return;
+    }
+
+    if (mission->state == MISSION_RETURN_LOCALIZE_MOVE) {
+        if (!mission_command_complete(mission, &nav_pose)) return;
+        const float heading_to_upper = atan2f(
+            MISSION_UPPER_GOAL_CORNER_Y_MM - nav_pose.y_mm,
+            MISSION_UPPER_GOAL_CORNER_X_MM - nav_pose.x_mm) *
+            180.0f / PI_F;
+        if (!post_line_navigation_rotate_to(
+                heading_to_upper, MISSION_PUSH_SPEED,
+                &mission->command_id)) {
+            mission_fail(mission,
+                         "cannot face upper goal for return localization");
+            return;
+        }
+        mission->state = MISSION_RETURN_LOCALIZE_ALIGN;
+        ESP_LOGW(TAG,
+                 "MISSION_RETURN_LOCALIZE_ALIGN heading=%ddeg goal=(%d,%d)",
+                 (int)lroundf(heading_to_upper),
+                 (int)lroundf(MISSION_UPPER_GOAL_CORNER_X_MM),
+                 (int)lroundf(MISSION_UPPER_GOAL_CORNER_Y_MM));
+        return;
+    }
+
+    if (mission->state == MISSION_RETURN_LOCALIZE_ALIGN) {
+        if (!mission_command_complete(mission, &nav_pose)) return;
+        post_line_navigation_pause();
+        memset(&mission->visual_goal_window, 0,
+               sizeof(mission->visual_goal_window));
+        mission->settle_until_us = now_us + MISSION_BALL_SETTLE_US;
+        mission->deadline_us = now_us + MISSION_PRECISE_TIMEOUT_US;
+        mission->state = MISSION_RETURN_LOCALIZE_PRECISE;
+        ESP_LOGW(TAG,
+                 "MISSION_RETURN_LOCALIZE_PRECISE stationary; wait for goal 8/10");
+        return;
+    }
+
+    if (mission->state == MISSION_RETURN_LOCALIZE_PRECISE) {
+        if (now_us < mission->settle_until_us) return;
+        if (now_us >= mission->deadline_us) {
+            ESP_LOGW(TAG,
+                     "MISSION_RETURN_LOCALIZE_FALLBACK precise localization timed out; keep odometry");
+            if (!mission_start_return_initial(mission,
+                                              "ODOMETRY_FALLBACK")) {
+                mission_fail(mission,
+                             "cannot return after localization timeout");
+            }
+            return;
+        }
+
+        const bool reliable_goal = marker->found && !marker->predicted &&
+            goal_pose->found && goal_pose->position_valid &&
+            goal_pose->confidence >= PRECISE_TRIGGER_CONFIDENCE;
+        if (!update_goal_detection_window(&mission->visual_goal_window,
+                                          reliable_goal)) {
+            return;
+        }
+
+        quarter_goal_pose_result_t precise_pose;
+        if (!refine_precise_goal_pose(
+                slot, marker, goal_pose, QUARTER_GOAL_UPPER,
+                &precise_pose) ||
+            !post_line_navigation_correct_pose(
+                precise_pose.robot_field_x_mm,
+                precise_pose.robot_field_y_mm,
+                precise_pose.robot_heading_deg)) {
+            memset(&mission->visual_goal_window, 0,
+                   sizeof(mission->visual_goal_window));
+            return;
+        }
+
+        const quarter_goal_pose_result_t display_pose =
+            precise_pose_for_display(&precise_pose);
+        quarter_goal_pose_draw_overlay(s_decoded_frame, DECODED_WIDTH,
+                                       DECODED_HEIGHT, &display_pose);
+        ESP_LOGW(TAG,
+                 "MISSION_RETURN_LOCALIZE_LOCK pose=(%d,%d,%ddeg); odometry corrected",
+                 (int)lroundf(precise_pose.robot_field_x_mm),
+                 (int)lroundf(precise_pose.robot_field_y_mm),
+                 (int)lroundf(precise_pose.robot_heading_deg));
+        if (!mission_start_return_initial(mission, "PRECISE_VISION")) {
+            mission_fail(mission,
+                         "cannot return after precise localization");
+        }
         return;
     }
 
@@ -1791,19 +2155,18 @@ static void process_ball_capture_mission(
     if (mission->state == MISSION_RETURN_ALIGN) {
         if (!mission_command_complete(mission, &nav_pose)) return;
         mission->target_goal_index = 1;
-        mission->selected_ball = mission->first_ball == MISSION_BALL_RED
-            ? MISSION_BALL_WHITE : MISSION_BALL_RED;
+        mission->selected_ball = MISSION_BALL_NONE;
         mission->candidate_frames = 0;
         mission->missing_ball_frames = 0;
         mission->exploring = false;
         mission->push_precise_locked = false;
+        mission->ball_held = false;
+        mission->ball_held_candidate_frames = 0;
         memset(&mission->ball_window, 0, sizeof(mission->ball_window));
         mission->stable_ball_frames = 0;
         mission->state = MISSION_SELECT_SECOND_BALL;
         ESP_LOGW(TAG,
-                 "MISSION_SELECT_SECOND_BALL stationary color=%s heading=%ddeg",
-                 mission->selected_ball == MISSION_BALL_RED
-                     ? "RED" : "WHITE",
+                 "MISSION_SELECT_SECOND_BALL stationary any_color=1 heading=%ddeg",
                  (int)lroundf(nav_pose.heading_deg));
     }
 }
@@ -1936,7 +2299,7 @@ static void frame_display_task(void *argument)
 
             if (vision_now_us - last_object_status_us >=
                     OBJECT_STATUS_INTERVAL_US) {
-                ESP_LOGI(TAG,
+                ESP_LOGD(TAG,
                          "OBJECTS red=%d/%d center=(%d,%d) white=%d/%d center=(%d,%d) goal=%d/%d center=(%d,%d) recent_goal=%d/%d localization=%s mission=%s",
                          red_ball_result.found && !red_ball_result.predicted,
                          red_ball_result.confidence,
@@ -2008,7 +2371,7 @@ static void frame_display_task(void *argument)
                 ? decode_time_us / timed_frames : 0;
             const uint32_t vision_average_us = timed_frames > 0
                 ? vision_time_us / timed_frames : 0;
-            ESP_LOGI(TAG,
+            ESP_LOGD(TAG,
                      "VIDEO fps=%lu.%lu/%lu.%lu/%lu.%lu drop=%lu age=%lldms cost=%lu/%luus",
                      (unsigned long)(rx_fps_x10 / 10),
                      (unsigned long)(rx_fps_x10 % 10),
