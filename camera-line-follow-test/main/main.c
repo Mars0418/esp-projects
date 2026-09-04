@@ -86,14 +86,12 @@
 #define MISSION_BALL_CENTER_CONFIRM_FRAMES 3
 #define MISSION_BALL_CENTER_CONFIRM_TIMEOUT_US 3000000
 #define MISSION_RECOVERY_REVERSE_MM 50.0f
+#define MISSION_GOAL_CAPTURE_RADIUS_MM 100.0f
+#define MISSION_LOST_BALL_FORWARD_MM 80.0f
 #define UPPER_GOAL_X_MM 0.0f
 #define UPPER_GOAL_Y_MM 0.0f
-#define UPPER_STOP_X_MM 130.0f
-#define UPPER_STOP_Y_MM 130.0f
 #define LOWER_GOAL_X_MM 900.0f
 #define LOWER_GOAL_Y_MM 0.0f
-#define LOWER_STOP_X_MM 770.0f
-#define LOWER_STOP_Y_MM 130.0f
 
 /* Temporary high-resolution calibration firmware. Set to 0 after exporting
  * the new camera calibration and copying its parameters into runtime code. */
@@ -448,14 +446,11 @@ static void mission_fail(ball_capture_mission_t *mission,
 }
 
 static void mission_goal_geometry(const ball_capture_mission_t *mission,
-                                  float *goal_x_mm, float *goal_y_mm,
-                                  float *stop_x_mm, float *stop_y_mm)
+                                  float *goal_x_mm, float *goal_y_mm)
 {
     const bool lower = mission->target_goal_index == 1;
     *goal_x_mm = lower ? LOWER_GOAL_X_MM : UPPER_GOAL_X_MM;
     *goal_y_mm = lower ? LOWER_GOAL_Y_MM : UPPER_GOAL_Y_MM;
-    *stop_x_mm = lower ? LOWER_STOP_X_MM : UPPER_STOP_X_MM;
-    *stop_y_mm = lower ? LOWER_STOP_Y_MM : UPPER_STOP_Y_MM;
 }
 
 static float point_to_segment_distance(
@@ -500,10 +495,8 @@ static bool append_approach_point(
 static bool mission_move_behind_ball(ball_capture_mission_t *mission,
                                      bool full_avoidance_route)
 {
-    float goal_x, goal_y, stop_x, stop_y;
-    mission_goal_geometry(mission, &goal_x, &goal_y, &stop_x, &stop_y);
-    (void)stop_x;
-    (void)stop_y;
+    float goal_x, goal_y;
+    mission_goal_geometry(mission, &goal_x, &goal_y);
     const float dx = goal_x - mission->ball_field_x_mm;
     const float dy = goal_y - mission->ball_field_y_mm;
     const float distance = hypotf(dx, dy);
@@ -606,17 +599,15 @@ static bool mission_move_behind_ball(ball_capture_mission_t *mission,
 
 static bool mission_start_exploration(ball_capture_mission_t *mission)
 {
-    float goal_x, goal_y, stop_x, stop_y;
-    mission_goal_geometry(mission, &goal_x, &goal_y, &stop_x, &stop_y);
-    (void)goal_x;
-    (void)goal_y;
+    float goal_x, goal_y;
+    mission_goal_geometry(mission, &goal_x, &goal_y);
     post_line_navigation_pose_t pose;
     if (!post_line_navigation_get_pose(&pose)) return false;
-    const float heading = atan2f(stop_y - pose.y_mm,
-                                 stop_x - pose.x_mm) * 180.0f / PI_F;
+    const float heading = atan2f(goal_y - pose.y_mm,
+                                 goal_x - pose.x_mm) * 180.0f / PI_F;
     const post_line_navigation_waypoint_t target = {
-        .x_mm = stop_x,
-        .y_mm = stop_y,
+        .x_mm = goal_x,
+        .y_mm = goal_y,
     };
     if (!post_line_navigation_follow_path(
             &target, 1, heading, MISSION_MOVE_TOLERANCE_MM,
@@ -624,7 +615,7 @@ static bool mission_start_exploration(ball_capture_mission_t *mission)
     ESP_LOGW(TAG,
              "MISSION_EXPLORE goal=%s target=(%d,%d) heading=%ddeg speed=%d%%",
              mission->target_goal_index == 0 ? "UPPER" : "LOWER",
-             (int)lroundf(stop_x), (int)lroundf(stop_y),
+             (int)lroundf(goal_x), (int)lroundf(goal_y),
              (int)lroundf(heading),
              (int)lroundf(MISSION_PUSH_SPEED * 100.0f));
     return true;
@@ -632,21 +623,21 @@ static bool mission_start_exploration(ball_capture_mission_t *mission)
 
 static bool mission_start_final_push(ball_capture_mission_t *mission)
 {
-    float goal_x, goal_y, stop_x, stop_y;
-    mission_goal_geometry(mission, &goal_x, &goal_y, &stop_x, &stop_y);
+    float goal_x, goal_y;
+    mission_goal_geometry(mission, &goal_x, &goal_y);
     const float push_heading = atan2f(
         goal_y - mission->ball_field_y_mm,
         goal_x - mission->ball_field_x_mm) * 180.0f / PI_F;
     if (!post_line_navigation_push_to(
-            stop_x, stop_y, push_heading,
+            goal_x, goal_y, push_heading,
             MISSION_PUSH_TOLERANCE_MM, MISSION_PUSH_SPEED,
             &mission->command_id)) {
         return false;
     }
     ESP_LOGW(TAG,
-             "MISSION_PUSH goal=%s stop_center=(%d,%d) fixed_heading=%ddeg",
+             "MISSION_PUSH goal=%s vertex=(%d,%d) fixed_heading=%ddeg",
              mission->target_goal_index == 0 ? "UPPER" : "LOWER",
-             (int)lroundf(stop_x), (int)lroundf(stop_y),
+             (int)lroundf(goal_x), (int)lroundf(goal_y),
              (int)lroundf(push_heading));
     return true;
 }
@@ -1670,6 +1661,56 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH) {
+        float push_ball_x = 0.0f;
+        float push_ball_y = 0.0f;
+        const char *ball_position_source = NULL;
+        if (selected_real &&
+            project_ball_to_field(selected, &push_ball_x, &push_ball_y)) {
+            ball_position_source = "VISION";
+        } else if (!selected_real && nav_pose_valid) {
+            push_ball_x = nav_pose.x_mm +
+                cosf(nav_pose.heading_rad) * MISSION_LOST_BALL_FORWARD_MM;
+            push_ball_y = nav_pose.y_mm +
+                sinf(nav_pose.heading_rad) * MISSION_LOST_BALL_FORWARD_MM;
+            ball_position_source = "FRONT_80MM";
+        }
+
+        if (mission->push_precise_locked && ball_position_source) {
+            float goal_x;
+            float goal_y;
+            mission_goal_geometry(mission, &goal_x, &goal_y);
+            mission->ball_field_x_mm = push_ball_x;
+            mission->ball_field_y_mm = push_ball_y;
+            const float goal_distance = hypotf(push_ball_x - goal_x,
+                                               push_ball_y - goal_y);
+            if (goal_distance <= MISSION_GOAL_CAPTURE_RADIUS_MM) {
+                post_line_navigation_pause();
+                ESP_LOGW(TAG,
+                         "MISSION_BALL_SCORED goal=%s source=%s ball=(%d,%d) distance=%dmm",
+                         mission->target_goal_index == 0 ? "UPPER" : "LOWER",
+                         ball_position_source,
+                         (int)lroundf(push_ball_x),
+                         (int)lroundf(push_ball_y),
+                         (int)lroundf(goal_distance));
+                if (mission->target_goal_index == 1) {
+                    mission->state = MISSION_DONE;
+                    ESP_LOGW(TAG, "MISSION_COMPLETE both balls pushed");
+                    return;
+                }
+                if (!post_line_navigation_move_to(
+                        INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
+                        MISSION_MOVE_TOLERANCE_MM, MISSION_TRAVEL_SPEED,
+                        &mission->command_id)) {
+                    mission_fail(mission, "cannot return to initial position");
+                    return;
+                }
+                mission->state = MISSION_RETURN_INITIAL;
+                ESP_LOGW(TAG,
+                         "MISSION_RETURN target=(470,650); align to -45deg after arrival");
+                return;
+            }
+        }
+
         if (nav_pose_valid && nav_pose.state == POST_NAV_RUNNING &&
             !mission->push_precise_locked &&
             update_goal_detection_window(&mission->ball_window,
@@ -1687,21 +1728,19 @@ static void process_ball_capture_mission(
             return;
         }
         if (!mission_command_complete(mission, &nav_pose)) return;
-        if (mission->target_goal_index == 1) {
-            mission->state = MISSION_DONE;
-            ESP_LOGW(TAG, "MISSION_COMPLETE both balls pushed");
-            return;
-        }
-        if (!post_line_navigation_move_to(
-                INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
-                MISSION_MOVE_TOLERANCE_MM, MISSION_TRAVEL_SPEED,
+        if (!post_line_navigation_reverse_by(
+                MISSION_RECOVERY_REVERSE_MM, MISSION_PUSH_SPEED,
                 &mission->command_id)) {
-            mission_fail(mission, "cannot return to initial position");
+            mission_fail(mission, "cannot recover after unconfirmed goal");
             return;
         }
-        mission->state = MISSION_RETURN_INITIAL;
+        mission->missing_ball_frames = 0;
+        mission->stable_ball_frames = 0;
+        mission->exploring = false;
+        mission->state = MISSION_PUSH_RECOVERY_REVERSE;
         ESP_LOGW(TAG,
-                 "MISSION_RETURN target=(470,650); align to -45deg after arrival");
+                 "MISSION_GOAL_UNCONFIRMED; reverse=%dmm then reacquire",
+                 (int)lroundf(MISSION_RECOVERY_REVERSE_MM));
         return;
     }
 
