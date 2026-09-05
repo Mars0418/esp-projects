@@ -1,0 +1,20 @@
+{
+  "model_sha256": "2f06e72de813a8635c9bc0397ac447a601bdbfa7df4bebc278723b958831c9bf",
+  "weights": 5994,
+  "dtype": "float32",
+  "test_count": 10000,
+  "correct": 9890,
+  "accuracy": 0.989,
+  "selftest_indices": [
+    3,
+    2,
+    1,
+    18,
+    4,
+    8,
+    11,
+    0,
+    61,
+    7
+  ]
+}

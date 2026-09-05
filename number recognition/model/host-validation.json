@@ -1,0 +1,74 @@
+{
+  "c_onnx_parity_count": 1000,
+  "matching_predictions": 1000,
+  "max_logit_error": 1.33514404296875e-05,
+  "correct_first_1000": 984,
+  "checks": [
+    "blank_0",
+    "blank_80",
+    "blank_180",
+    "blank_255",
+    "ten_synthetic_cards",
+    "multiple_digits_rejected",
+    "clipped_digit_rejected",
+    "70_percent_inclusive_three_frames",
+    "below_70_resets_streak",
+    "different_digit_resets_streak",
+    "one_event_per_presentation",
+    "no_rearm_on_uncertainty_or_gap",
+    "blank_rearms",
+    "low_score_rejected"
+  ],
+  "synthetic_cards": [
+    {
+      "label": 0,
+      "predicted": 0,
+      "score": 0.9991278052330017
+    },
+    {
+      "label": 1,
+      "predicted": 1,
+      "score": 0.9999406337738037
+    },
+    {
+      "label": 2,
+      "predicted": 2,
+      "score": 0.9999990463256836
+    },
+    {
+      "label": 3,
+      "predicted": 3,
+      "score": 0.9937141537666321
+    },
+    {
+      "label": 4,
+      "predicted": 4,
+      "score": 0.9999991655349731
+    },
+    {
+      "label": 5,
+      "predicted": 5,
+      "score": 0.934650719165802
+    },
+    {
+      "label": 6,
+      "predicted": 6,
+      "score": 0.9999998807907104
+    },
+    {
+      "label": 7,
+      "predicted": 7,
+      "score": 1.0
+    },
+    {
+      "label": 8,
+      "predicted": 8,
+      "score": 0.9940659999847412
+    },
+    {
+      "label": 9,
+      "predicted": 9,
+      "score": 0.9997900128364563
+    }
+  ]
+}

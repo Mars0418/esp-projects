@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=5.4,<6.0"
+  usb_host_uvc:
+    path: ../../camera-usb-test/managed_components/espressif__usb_host_uvc
+  esp_jpeg: "1.3.1"

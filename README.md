@@ -14,6 +14,7 @@ USB VID 自动识别，不依赖固定 COM 号。
 |---|---|---|
 | `tb6612-motor-a-test` | 原有小车遥控、循迹与避障 | 按小车程序控制 |
 | `camera-usb-test` | USB 摄像头读取并显示到 128×160 TFT | 完全不初始化 |
+| [`number recognition`](<number recognition/README.md>) | 本地 MNIST 数字识别、TFT 预览与多帧确认 | STBY 与电机输出拉低，仅报告识别事件 |
 | `camera-line-follow-test` | 摄像头中心路径追踪、直角/钝角大弯识别、TFT 标注预览和 A/D 强转巡线 | 上电默认停车，UART `F` 启动、`X` 急停 |
 
 摄像头工程不是循迹程序的新模式，两套固件不会同时运行。烧录摄像头固件后如需恢复

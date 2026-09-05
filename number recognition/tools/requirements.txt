@@ -1,0 +1,5 @@
+numpy==2.5.2
+onnx==1.22.0
+onnxruntime==1.29.0
+pillow==12.3.0
+pyserial==3.5

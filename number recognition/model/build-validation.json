@@ -1,0 +1,18 @@
+{
+  "esp_idf": "5.5.5",
+  "target": "esp32s3",
+  "project_version": "digit-v1.2",
+  "build_passed": true,
+  "firmware_bytes": 378032,
+  "firmware_sha256": "84b20a45f37484ca241de6dbf9d031ddaa301bacede04449a45d3ac947ea87d5",
+  "app_offset": "0x10000",
+  "app_partition_bytes": 1048576,
+  "flashed": true,
+  "hardware_validation": "model_selftest_10_of_10; camera_streaming; digit_event_observed",
+  "camera_accuracy": "not_measured",
+  "board_inference_ms": 77.5105,
+  "board_injected_samples": 100,
+  "board_onnx_matching_predictions": 100,
+  "board_injected_samples_correct": 98,
+  "board_max_logit_error": 0.000007651318359336301
+}
