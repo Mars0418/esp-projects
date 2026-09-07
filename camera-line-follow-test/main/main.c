@@ -30,6 +30,7 @@
 #include "post_line_odometry.h"
 #include "post_line_navigation.h"
 #include "purple_ball_vision.h"
+#include "push_debug_stream.h"
 #include "quarter_goal_pose.h"
 #include "usb/usb_host.h"
 
@@ -97,12 +98,13 @@
 #define MISSION_BALL_CENTER_CONFIRM_FRAMES 3
 #define MISSION_BALL_CENTER_CONFIRM_TIMEOUT_US 3000000
 #define MISSION_RECOVERY_REVERSE_MM 50.0f
-#define MISSION_VISUAL_GOAL_CAPTURE_DISTANCE_MM 300.0f
+#define MISSION_VISUAL_GOAL_CAPTURE_DISTANCE_MM 240.0f
 #define MISSION_VISUAL_PUSH_CENTER_X (DECODED_WIDTH / 2)
-#define MISSION_BALL_HELD_X_TOLERANCE_PX 12
+#define MISSION_BALL_HELD_X_TOLERANCE_PX 7
 #define MISSION_BALL_HELD_Y_MAX_PX 30
 #define MISSION_BALL_HELD_CONFIRM_FRAMES 2
-#define MISSION_PREPUSH_CAPTURE_SWITCH_MM 45.0f
+#define MISSION_CAPTURE_OFF_CENTER_FRAMES 2
+#define MISSION_CAPTURE_LOST_FRAMES 3
 #define MISSION_ENABLE_PUSH_PRECISE_LOCALIZATION 0
 #define MISSION_VISUAL_GOAL_CONFIDENCE 70
 #define MISSION_VISUAL_GOAL_FILTER_ALPHA 0.25f
@@ -110,7 +112,7 @@
 #define MISSION_VISUAL_GOAL_MAX_RIGHT_MM 2000.0f
 #define MISSION_VISUAL_GOAL_MAX_FORWARD_MM 3000.0f
 #define UPPER_GOAL_X_MM 0.0f
-#define UPPER_GOAL_Y_MM -100.0f
+#define UPPER_GOAL_Y_MM -50.0f
 #define LOWER_GOAL_X_MM 900.0f
 #define LOWER_GOAL_Y_MM 0.0f
 
@@ -153,6 +155,7 @@ typedef enum {
     MISSION_BALL_STABLE,
     MISSION_MOVE_BEHIND,
     MISSION_FINAL_BALL_SETTLE,
+    MISSION_CAPTURE_BALL,
     MISSION_PUSH_PRECISE_LOCALIZE,
     MISSION_PUSH_CENTER_CONFIRM,
     MISSION_PUSH_RECOVERY_REVERSE,
@@ -175,9 +178,15 @@ typedef enum {
     MISSION_BALL_WHITE,
 } mission_ball_kind_t;
 
+typedef enum {
+    MISSION_PUSH_ENTRY_NONE = 0,
+    MISSION_PUSH_ENTRY_BALL_HELD,
+} mission_push_entry_t;
+
 typedef struct {
     ball_capture_mission_state_t state;
     mission_ball_kind_t selected_ball;
+    mission_push_entry_t push_entry;
     int target_goal_index;
     int candidate_frames;
     int missing_ball_frames;
@@ -187,10 +196,13 @@ typedef struct {
     bool push_precise_locked;
     bool ball_held;
     int ball_held_candidate_frames;
+    int capture_off_center_frames;
     goal_detection_window_t ball_window;
     goal_detection_window_t visual_goal_window;
     bool visual_goal_locked;
     bool visual_goal_filter_initialized;
+    float visual_corner_field_x_mm;
+    float visual_corner_field_y_mm;
     float visual_goal_right_mm;
     float visual_goal_forward_mm;
     int64_t visual_goal_updated_us;
@@ -390,6 +402,7 @@ static const char *mission_state_name(ball_capture_mission_state_t state)
     case MISSION_BALL_STABLE: return "BALL_STABLE";
     case MISSION_MOVE_BEHIND: return "MOVE_BEHIND";
     case MISSION_FINAL_BALL_SETTLE: return "FINAL_BALL_SETTLE";
+    case MISSION_CAPTURE_BALL: return "CAPTURE_BALL";
     case MISSION_PUSH_PRECISE_LOCALIZE: return "PUSH_PRECISE_LOCALIZE";
     case MISSION_PUSH_CENTER_CONFIRM: return "PUSH_CENTER_CONFIRM";
     case MISSION_PUSH_RECOVERY_REVERSE: return "PUSH_RECOVERY_REVERSE";
@@ -404,6 +417,15 @@ static const char *mission_state_name(ball_capture_mission_state_t state)
     case MISSION_SELECT_SECOND_BALL: return "SELECT_SECOND_BALL";
     case MISSION_DONE: return "DONE";
     case MISSION_ERROR: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *mission_push_entry_name(mission_push_entry_t entry)
+{
+    switch (entry) {
+    case MISSION_PUSH_ENTRY_NONE: return "NONE";
+    case MISSION_PUSH_ENTRY_BALL_HELD: return "BALL_HELD";
     default: return "UNKNOWN";
     }
 }
@@ -497,12 +519,51 @@ static void mission_goal_geometry(const ball_capture_mission_t *mission,
     *goal_y_mm = lower ? LOWER_GOAL_Y_MM : UPPER_GOAL_Y_MM;
 }
 
+static void mission_goal_corner_geometry(
+    const ball_capture_mission_t *mission,
+    float *corner_x_mm, float *corner_y_mm)
+{
+    const bool lower = mission->target_goal_index == 1;
+    *corner_x_mm = lower
+        ? MISSION_LOWER_GOAL_CORNER_X_MM
+        : MISSION_UPPER_GOAL_CORNER_X_MM;
+    *corner_y_mm = lower
+        ? MISSION_LOWER_GOAL_CORNER_Y_MM
+        : MISSION_UPPER_GOAL_CORNER_Y_MM;
+}
+
+static void vehicle_point_to_field(
+    const post_line_navigation_pose_t *pose,
+    float right_mm, float forward_mm,
+    float *field_x_mm, float *field_y_mm)
+{
+    const float sine = sinf(pose->heading_rad);
+    const float cosine = cosf(pose->heading_rad);
+    *field_x_mm = pose->x_mm + sine * right_mm + cosine * forward_mm;
+    *field_y_mm = pose->y_mm - cosine * right_mm + sine * forward_mm;
+}
+
+static void field_point_to_vehicle(
+    const post_line_navigation_pose_t *pose,
+    float field_x_mm, float field_y_mm,
+    float *right_mm, float *forward_mm)
+{
+    const float dx = field_x_mm - pose->x_mm;
+    const float dy = field_y_mm - pose->y_mm;
+    const float sine = sinf(pose->heading_rad);
+    const float cosine = cosf(pose->heading_rad);
+    *right_mm = sine * dx - cosine * dy;
+    *forward_mm = cosine * dx + sine * dy;
+}
+
 static void mission_reset_visual_goal(ball_capture_mission_t *mission)
 {
     memset(&mission->visual_goal_window, 0,
            sizeof(mission->visual_goal_window));
     mission->visual_goal_locked = false;
     mission->visual_goal_filter_initialized = false;
+    mission->visual_corner_field_x_mm = 0.0f;
+    mission->visual_corner_field_y_mm = 0.0f;
     mission->visual_goal_right_mm = 0.0f;
     mission->visual_goal_forward_mm = 0.0f;
     mission->visual_goal_updated_us = 0;
@@ -756,10 +817,50 @@ static bool mission_continue_with_held_ball(ball_capture_mission_t *mission,
     if (!mission_start_final_push(mission)) return false;
     memset(&mission->ball_window, 0, sizeof(mission->ball_window));
     mission->stable_goal_frames = 0;
+    mission->push_entry = MISSION_PUSH_ENTRY_BALL_HELD;
     mission->state = MISSION_PUSH;
     ESP_LOGW(TAG,
              "MISSION_HELD_PUSH_PRIORITY source=%s; skip heading alignment and precise localization",
              source);
+    return true;
+}
+
+static bool mission_start_ball_capture(ball_capture_mission_t *mission)
+{
+    if (!mission_start_final_push(mission)) return false;
+    memset(&mission->ball_window, 0, sizeof(mission->ball_window));
+    mission->push_entry = MISSION_PUSH_ENTRY_NONE;
+    mission->missing_ball_frames = 0;
+    mission->capture_off_center_frames = 0;
+    mission->ball_held_candidate_frames = 0;
+    mission->state = MISSION_CAPTURE_BALL;
+    ESP_LOGW(TAG,
+             "MISSION_CAPTURE_BALL begin; require center within %dpx and y<=%d for %d frames",
+             MISSION_BALL_HELD_X_TOLERANCE_PX,
+             MISSION_BALL_HELD_Y_MAX_PX,
+             MISSION_BALL_HELD_CONFIRM_FRAMES);
+    return true;
+}
+
+static bool mission_start_capture_recovery(
+    ball_capture_mission_t *mission, const char *reason)
+{
+    post_line_navigation_set_visual_push_error(0.0f, false);
+    if (!post_line_navigation_reverse_by(
+            MISSION_RECOVERY_REVERSE_MM, MISSION_PUSH_SPEED,
+            &mission->command_id)) {
+        return false;
+    }
+    mission->missing_ball_frames = 0;
+    mission->stable_ball_frames = 0;
+    mission->capture_off_center_frames = 0;
+    mission->ball_held_candidate_frames = 0;
+    mission->exploring = false;
+    mission->ball_held = false;
+    mission->state = MISSION_PUSH_RECOVERY_REVERSE;
+    ESP_LOGW(TAG,
+             "MISSION_CAPTURE_RECOVERY reason=%s reverse=%dmm then reacquire",
+             reason, (int)lroundf(MISSION_RECOVERY_REVERSE_MM));
     return true;
 }
 
@@ -768,6 +869,9 @@ static void mission_update_visual_goal(
     const black_marker_result_t *marker,
     const quarter_goal_pose_result_t *goal_pose, int64_t now_us)
 {
+    post_line_navigation_pose_t navigation;
+    const bool navigation_valid =
+        post_line_navigation_get_pose(&navigation);
     const char *reject_reason = "ACCEPTED";
     bool accepted = true;
     if (!marker || !marker->found) {
@@ -796,14 +900,23 @@ static void mission_update_visual_goal(
                    MISSION_VISUAL_GOAL_MAX_RIGHT_MM) {
         accepted = false;
         reject_reason = "TOO_FAR_LATERAL";
+    } else if (!navigation_valid) {
+        accepted = false;
+        reject_reason = "NO_ODOMETRY_POSE";
     }
 
+    float measured_corner_x = 0.0f;
+    float measured_corner_y = 0.0f;
+    if (accepted) {
+        vehicle_point_to_field(
+            &navigation, goal_pose->origin_vehicle_x_mm,
+            goal_pose->origin_vehicle_y_mm,
+            &measured_corner_x, &measured_corner_y);
+    }
     if (accepted && mission->visual_goal_filter_initialized) {
         const float jump = hypotf(
-            goal_pose->origin_vehicle_x_mm -
-                mission->visual_goal_right_mm,
-            goal_pose->origin_vehicle_y_mm -
-                mission->visual_goal_forward_mm);
+            measured_corner_x - mission->visual_corner_field_x_mm,
+            measured_corner_y - mission->visual_corner_field_y_mm);
         if (jump > MISSION_VISUAL_GOAL_MAX_JUMP_MM) {
             accepted = false;
             reject_reason = "FRAME_JUMP";
@@ -812,26 +925,35 @@ static void mission_update_visual_goal(
 
     if (accepted) {
         if (!mission->visual_goal_filter_initialized) {
-            mission->visual_goal_right_mm =
-                goal_pose->origin_vehicle_x_mm;
-            mission->visual_goal_forward_mm =
-                goal_pose->origin_vehicle_y_mm;
+            mission->visual_corner_field_x_mm = measured_corner_x;
+            mission->visual_corner_field_y_mm = measured_corner_y;
             mission->visual_goal_filter_initialized = true;
         } else {
-            mission->visual_goal_right_mm +=
+            mission->visual_corner_field_x_mm +=
                 MISSION_VISUAL_GOAL_FILTER_ALPHA *
-                (goal_pose->origin_vehicle_x_mm -
-                 mission->visual_goal_right_mm);
-            mission->visual_goal_forward_mm +=
+                (measured_corner_x -
+                 mission->visual_corner_field_x_mm);
+            mission->visual_corner_field_y_mm +=
                 MISSION_VISUAL_GOAL_FILTER_ALPHA *
-                (goal_pose->origin_vehicle_y_mm -
-                 mission->visual_goal_forward_mm);
+                (measured_corner_y -
+                 mission->visual_corner_field_y_mm);
         }
         mission->visual_goal_updated_us = now_us;
     }
 
+    if (mission->visual_goal_filter_initialized && navigation_valid) {
+        field_point_to_vehicle(
+            &navigation,
+            mission->visual_corner_field_x_mm,
+            mission->visual_corner_field_y_mm,
+            &mission->visual_goal_right_mm,
+            &mission->visual_goal_forward_mm);
+    }
+
     const bool confirmed = update_visual_goal_switch_window(
         &mission->visual_goal_window, accepted);
+    const bool single_frame_odometry_fallback = accepted &&
+        navigation_valid && !navigation.visual_control_active;
     if ((!mission->visual_goal_locked || !accepted) &&
         now_us - mission->visual_goal_last_diag_us >= 1000000) {
         ESP_LOGW(TAG,
@@ -850,10 +972,13 @@ static void mission_update_visual_goal(
                  mission->visual_goal_window.count);
         mission->visual_goal_last_diag_us = now_us;
     }
-    if (!mission->visual_goal_locked && confirmed && accepted) {
+    if (!mission->visual_goal_locked && accepted &&
+        (confirmed || single_frame_odometry_fallback)) {
         mission->visual_goal_locked = true;
         ESP_LOGW(TAG,
-                 "MISSION_VISUAL_GOAL_LOCK detected=%d/%d filtered_rel=(%d,%d) confidence=%d; odometry guidance disabled",
+                 "MISSION_VISUAL_GOAL_LOCK trigger=%s detected=%d/%d filtered_rel=(%d,%d) confidence=%d; global target anchored",
+                 single_frame_odometry_fallback
+                     ? "SINGLE_FRAME_ODOMETRY_FALLBACK" : "WINDOW",
                  mission->visual_goal_window.detected_count,
                  mission->visual_goal_window.count,
                  (int)lroundf(mission->visual_goal_right_mm),
@@ -861,9 +986,19 @@ static void mission_update_visual_goal(
                  goal_pose->confidence);
     }
     if (mission->visual_goal_locked && accepted) {
-        post_line_navigation_set_visual_goal_target(
-            mission->visual_goal_right_mm,
-            mission->visual_goal_forward_mm);
+        float configured_goal_x;
+        float configured_goal_y;
+        float nominal_corner_x;
+        float nominal_corner_y;
+        mission_goal_geometry(
+            mission, &configured_goal_x, &configured_goal_y);
+        mission_goal_corner_geometry(
+            mission, &nominal_corner_x, &nominal_corner_y);
+        post_line_navigation_set_visual_goal_field_target(
+            mission->visual_corner_field_x_mm +
+                configured_goal_x - nominal_corner_x,
+            mission->visual_corner_field_y_mm +
+                configured_goal_y - nominal_corner_y);
     }
 }
 
@@ -917,6 +1052,95 @@ static bool queue_tft_preview(const uint8_t *pixels)
         return false;
     }
     return true;
+}
+
+static push_debug_detection_t debug_ball_detection(
+    const ball_vision_result_t *result)
+{
+    return (push_debug_detection_t) {
+        .found = result->found,
+        .predicted = result->predicted,
+        .confidence = result->confidence,
+        .center_x = result->center_x,
+        .center_y = result->center_y,
+        .left = result->left,
+        .top = result->top,
+        .right = result->right,
+        .bottom = result->bottom,
+    };
+}
+
+static push_debug_detection_t debug_goal_detection(
+    const black_marker_result_t *result)
+{
+    return (push_debug_detection_t) {
+        .found = result->found,
+        .predicted = result->predicted,
+        .confidence = result->confidence,
+        .center_x = result->center_x,
+        .center_y = result->center_y,
+        .left = result->left,
+        .top = result->top,
+        .right = result->right,
+        .bottom = result->bottom,
+    };
+}
+
+static void queue_push_debug_frame(
+    const uint8_t *raw_pixels, int64_t captured_at_us,
+    const ball_capture_mission_t *mission,
+    const ball_vision_result_t *red_ball,
+    const ball_vision_result_t *white_ball,
+    const black_marker_result_t *marker,
+    const quarter_goal_pose_result_t *goal_pose)
+{
+    post_line_navigation_pose_t navigation = {0};
+    post_line_navigation_get_pose(&navigation);
+    const push_debug_metadata_t metadata = {
+        .captured_at_us = captured_at_us,
+        .processed_at_us = esp_timer_get_time(),
+        .mission_state = mission->state,
+        .mission_state_name = mission_state_name(mission->state),
+        .push_entry = mission->push_entry,
+        .push_entry_name = mission_push_entry_name(mission->push_entry),
+        .selected_ball = mission->selected_ball,
+        .target_goal = mission->target_goal_index,
+        .ball_held = mission->ball_held,
+        .visual_goal_locked = mission->visual_goal_locked,
+        .filtered_goal_right_mm = mission->visual_goal_right_mm,
+        .filtered_goal_forward_mm = mission->visual_goal_forward_mm,
+        .tracked_ball_field_x_mm = mission->ball_field_x_mm,
+        .tracked_ball_field_y_mm = mission->ball_field_y_mm,
+        .red_ball = debug_ball_detection(red_ball),
+        .white_ball = debug_ball_detection(white_ball),
+        .goal = debug_goal_detection(marker),
+        .corner_found = goal_pose->found,
+        .corner_confidence = goal_pose->confidence,
+        .corner_x = goal_pose->origin_x_raw,
+        .corner_y = goal_pose->origin_y_raw,
+        .navigation_valid = navigation.valid,
+        .navigation_state = navigation.state,
+        .navigation_command = navigation.command,
+        .visual_control_active = navigation.visual_control_active,
+        .vehicle_x_mm = navigation.x_mm,
+        .vehicle_y_mm = navigation.y_mm,
+        .vehicle_heading_deg = navigation.heading_deg,
+        .navigation_target_x_mm = navigation.target_x_mm,
+        .navigation_target_y_mm = navigation.target_y_mm,
+        .navigation_distance_mm = navigation.distance_to_target_mm,
+        .visual_target_right_mm = navigation.visual_target_right_mm,
+        .visual_target_forward_mm = navigation.visual_target_forward_mm,
+        .reverse_stall_duty_floor =
+            navigation.reverse_stall_duty_floor,
+        .wheel_pwm_a = navigation.wheel_pwm_a,
+        .wheel_pwm_b = navigation.wheel_pwm_b,
+        .wheel_pwm_d = navigation.wheel_pwm_d,
+        .encoder_delta_a = navigation.encoder_delta_a,
+        .encoder_delta_b = navigation.encoder_delta_b,
+        .encoder_delta_d = navigation.encoder_delta_d,
+    };
+    push_debug_stream_queue_frame(raw_pixels, DECODED_WIDTH,
+                                  DECODED_HEIGHT, &metadata);
 }
 
 static void tft_display_task(void *argument)
@@ -1636,6 +1860,7 @@ static void process_ball_capture_mission(
             &mission->ball_window, selected_real);
         if (confirmed) {
             mission->push_precise_locked = false;
+            mission->push_entry = MISSION_PUSH_ENTRY_NONE;
             mission->ball_held = false;
             mission->ball_held_candidate_frames = 0;
             mission->stable_ball_frames = 0;
@@ -1686,33 +1911,6 @@ static void process_ball_capture_mission(
             }
             return;
         }
-        const bool centered_near_prepush = selected_real && nav_pose_valid &&
-            nav_pose.state == POST_NAV_RUNNING &&
-            nav_pose.distance_to_target_mm <=
-                MISSION_PREPUSH_CAPTURE_SWITCH_MM &&
-            abs(selected->center_x - MISSION_VISUAL_PUSH_CENTER_X) <=
-                MISSION_BALL_HELD_X_TOLERANCE_PX;
-        if (centered_near_prepush) {
-            float ball_x;
-            float ball_y;
-            if (project_ball_to_field(selected, &ball_x, &ball_y)) {
-                mission->ball_field_x_mm = ball_x;
-                mission->ball_field_y_mm = ball_y;
-            }
-            if (!mission_start_final_push(mission)) {
-                mission_fail(mission,
-                             "cannot switch from approach to ball capture");
-                return;
-            }
-            memset(&mission->ball_window, 0,
-                   sizeof(mission->ball_window));
-            mission->state = MISSION_PUSH;
-            ESP_LOGW(TAG,
-                     "MISSION_CAPTURE_PRIORITY center=(%d,%d) prepush_remaining=%dmm; keep moving",
-                     selected->center_x, selected->center_y,
-                     (int)lroundf(nav_pose.distance_to_target_mm));
-            return;
-        }
         if (!mission_command_complete(mission, &nav_pose)) return;
         mission->stable_ball_frames = 0;
         mission->settle_until_us = now_us + MISSION_BALL_SETTLE_US;
@@ -1739,12 +1937,69 @@ static void process_ball_capture_mission(
         if (!mission_update_stable_ball(mission, selected, selected_real)) {
             return;
         }
-        if (!mission_start_final_push(mission)) {
-            mission_fail(mission, "cannot start push");
+        if (!mission_start_ball_capture(mission)) {
+            mission_fail(mission, "cannot start ball capture approach");
             return;
         }
-        memset(&mission->ball_window, 0, sizeof(mission->ball_window));
-        mission->state = MISSION_PUSH;
+        return;
+    }
+
+    if (mission->state == MISSION_CAPTURE_BALL) {
+        if (mission_update_ball_held(mission, selected, selected_real)) {
+            post_line_navigation_set_visual_push_error(0.0f, false);
+            mission->push_entry = MISSION_PUSH_ENTRY_BALL_HELD;
+            mission->state = MISSION_PUSH;
+            ESP_LOGW(TAG,
+                     "MISSION_PUSH entered after confirmed capture center=(%d,%d)",
+                     selected->center_x, selected->center_y);
+            return;
+        }
+
+        if (selected_real) {
+            mission->missing_ball_frames = 0;
+            const int center_error =
+                selected->center_x - MISSION_VISUAL_PUSH_CENTER_X;
+            const float visual_right_error =
+                -center_error / (float)MISSION_VISUAL_PUSH_CENTER_X;
+            post_line_navigation_set_visual_push_error(
+                visual_right_error, true);
+
+            const bool close_but_off_center =
+                selected->center_y <= MISSION_BALL_HELD_Y_MAX_PX &&
+                abs(center_error) > MISSION_BALL_HELD_X_TOLERANCE_PX;
+            mission->capture_off_center_frames = close_but_off_center
+                ? mission->capture_off_center_frames + 1 : 0;
+            if (mission->capture_off_center_frames >=
+                    MISSION_CAPTURE_OFF_CENTER_FRAMES) {
+                if (!mission_start_capture_recovery(
+                        mission, "CLOSE_BUT_OFF_CENTER")) {
+                    mission_fail(mission,
+                                 "cannot reverse after off-center capture");
+                }
+                return;
+            }
+        } else {
+            post_line_navigation_set_visual_push_error(0.0f, false);
+            mission->capture_off_center_frames = 0;
+            mission->missing_ball_frames++;
+            if (mission->missing_ball_frames >=
+                    MISSION_CAPTURE_LOST_FRAMES) {
+                if (!mission_start_capture_recovery(
+                        mission, "BALL_LOST")) {
+                    mission_fail(mission,
+                                 "cannot reverse after lost capture target");
+                }
+                return;
+            }
+        }
+
+        if (mission_command_complete(mission, &nav_pose)) {
+            if (!mission_start_capture_recovery(
+                    mission, "GOAL_REACHED_WITHOUT_CAPTURE")) {
+                mission_fail(mission,
+                             "cannot recover after unconfirmed capture");
+            }
+        }
         return;
     }
 
@@ -1961,17 +2216,17 @@ static void process_ball_capture_mission(
     }
 
     if (mission->state == MISSION_PUSH) {
-        mission_update_ball_held(mission, selected, selected_real);
-        if (mission->ball_held) {
-            mission_update_visual_goal(mission, marker, goal_pose, now_us);
+        if (!mission->ball_held) {
+            mission->push_entry = MISSION_PUSH_ENTRY_NONE;
+            mission->missing_ball_frames = 0;
+            mission->capture_off_center_frames = 0;
+            mission->ball_held_candidate_frames = 0;
+            mission->state = MISSION_CAPTURE_BALL;
+            ESP_LOGW(TAG,
+                     "MISSION_PUSH_INVARIANT_RECOVERY; return to CAPTURE_BALL");
+            return;
         }
-        if (selected_real && !mission->ball_held) {
-            const float visual_right_error =
-                (MISSION_VISUAL_PUSH_CENTER_X - selected->center_x) /
-                (float)MISSION_VISUAL_PUSH_CENTER_X;
-            post_line_navigation_set_visual_push_error(
-                visual_right_error, true);
-        }
+        mission_update_visual_goal(mission, marker, goal_pose, now_us);
 
         bool ball_scored = false;
         float goal_distance = INFINITY;
@@ -2162,6 +2417,7 @@ static void process_ball_capture_mission(
         mission->missing_ball_frames = 0;
         mission->exploring = false;
         mission->push_precise_locked = false;
+        mission->push_entry = MISSION_PUSH_ENTRY_NONE;
         mission->ball_held = false;
         mission->ball_held_candidate_frames = 0;
         memset(&mission->ball_window, 0, sizeof(mission->ball_window));
@@ -2260,7 +2516,8 @@ static void frame_display_task(void *argument)
             const int64_t decode_done_us = esp_timer_get_time();
             const bool rgb_debug = camera_line_follow_debug_enabled();
             const bool tuner = camera_line_follow_tuner_enabled();
-            if (rgb_debug || tuner) {
+            const bool push_debug = push_debug_stream_is_enabled();
+            if (rgb_debug || tuner || push_debug) {
                 memcpy(s_debug_raw_frame, s_decoded_frame,
                        DECODED_BUFFER_BYTES);
             }
@@ -2292,6 +2549,13 @@ static void frame_display_task(void *argument)
                     &mission, &s_slots[slot_index], &red_ball_result,
                     &white_ball_result, &marker_result, &pose_result,
                     vision_now_us);
+            }
+
+            if (push_debug) {
+                queue_push_debug_frame(
+                    s_debug_raw_frame, captured_at_us, &mission,
+                    &red_ball_result, &white_ball_result,
+                    &marker_result, &pose_result);
             }
 
             quarter_goal_pose_draw_overlay(s_decoded_frame, output.width,
@@ -2579,6 +2843,7 @@ void app_main(void)
                  "CALIBRATION_ONLY: motors stopped; TFT, vision and odometry disabled");
         ESP_ERROR_CHECK(initialize_calibration_uart());
     } else {
+        ESP_ERROR_CHECK(push_debug_stream_init());
         ESP_ERROR_CHECK(post_line_odometry_init());
         ESP_ERROR_CHECK(post_line_navigation_init(
             INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,

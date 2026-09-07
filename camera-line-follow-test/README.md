@@ -189,6 +189,36 @@ idf.py -p /dev/cu.usbserial-0001 monitor
 同一个串口不能同时用于烧录、日志监视和阈值工具。烧录提示端口忙时，应先退出当前
 monitor。
 
+## 推球视觉同步调试
+
+新固件支持在小车实际运行时，将用于识别和控制的 `160x120 RGB565` 帧压缩成
+`RGB332` 后发送到电脑。画面与同一帧的红球、白球、球门、角点、任务状态、里程计
+以及导航实际控制源绑定在同一个带 CRC 的数据包中。发送工作位于 Core 0 的低优先级
+独立任务，约每 `250 ms` 尝试发送一帧；发送队列忙时直接丢弃调试帧，不等待串口，
+因此不会阻塞 Core 1 的解码和识别任务。
+
+先烧录固件并退出 `idf.py monitor`，再运行：
+
+```powershell
+cd C:\esp-projects-team
+.\start_push_debug_viewer.ps1 -Port COM15
+```
+
+在窗口中点击 `Connect` 后，工具先以 `115200` 发送 `VSTREAM,1`，随后固件和电脑端
+自动切换到 `921600`。调试期间普通 ESP 日志暂停，右侧显示的是与画面严格同帧的诊断
+数据；`Control` 会明确显示这一帧对应的导航控制是 `VISION` 还是 `ODOMETRY`。
+`Emergency stop` 仍会发送 `X` 急停。断开连接时工具发送 `VSTREAM,0` 并把固件串口
+恢复到 `115200`。
+
+每帧 JSON 的 `navigation` 还包含 A/B/D 三轮的有符号 `wheel_pwm`、最近一次
+`encoder_delta` 和反向防堵补力下限 `reverse_stall_floor_pwm`，可用于区分控制输出不足、
+单轮停转和整车机械阻塞。
+
+勾选 `Record frames` 时，工具会把完整会话保存到仓库的
+`captures/push-debug-日期时间/`：`telemetry.jsonl` 每行对应一帧元数据，`frames/` 中
+是同序号的 PPM 图像。该目录已在 `.gitignore` 中，不会污染提交。查看器、
+`idf.py monitor` 和其他串口工具不能同时占用同一个 COM 口。
+
 摄像头接线：5V、GND、D-→GPIO19、D+→GPIO20。TFT 与电机接线分别沿用
 `camera-usb-test` 和 `tb6612-motor-a-test/WIRING.md`；GPIO19/20 由 USB Host 独占。
 

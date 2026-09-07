@@ -13,6 +13,7 @@ camera-usb-test/managed_components/*
 .vscode/
 tmp/
 course-materials/
+captures/
 *.log
 *.pyc
 __pycache__/

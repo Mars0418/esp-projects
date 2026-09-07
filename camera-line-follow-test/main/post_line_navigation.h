@@ -45,6 +45,16 @@ typedef struct {
     float target_y_mm;
     float distance_to_target_mm;
     float target_heading_deg;
+    bool visual_control_active;
+    float visual_target_right_mm;
+    float visual_target_forward_mm;
+    int reverse_stall_duty_floor;
+    int wheel_pwm_a;
+    int wheel_pwm_b;
+    int wheel_pwm_d;
+    int encoder_delta_a;
+    int encoder_delta_b;
+    int encoder_delta_d;
 } post_line_navigation_pose_t;
 
 esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
@@ -63,8 +73,8 @@ bool post_line_navigation_push_to(float x_mm, float y_mm,
                                   float speed_scale, uint32_t *command_id);
 void post_line_navigation_set_visual_push_error(float right_error_normalized,
                                                 bool valid);
-void post_line_navigation_set_visual_goal_target(float right_mm,
-                                                 float forward_mm);
+void post_line_navigation_set_visual_goal_field_target(float field_x_mm,
+                                                       float field_y_mm);
 void post_line_navigation_clear_visual_goal_target(void);
 bool post_line_navigation_reverse_by(float distance_mm, float speed_scale,
                                      uint32_t *command_id);
