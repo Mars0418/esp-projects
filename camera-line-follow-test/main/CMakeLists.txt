@@ -2,7 +2,7 @@ idf_component_register(
     SRCS "purple_ball_vision.c" "ball_vision.c" "white_ball_vision.c"
          "black_marker_vision.c" "quarter_goal_pose.c"
          "post_line_odometry.c" "post_line_navigation.c" "line_vision.c"
-         "main.c" "camera_display.c"
+         "push_debug_stream.c" "main.c" "camera_display.c"
          "camera_line_follow_band.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES usb esp_driver_gpio esp_driver_spi esp_driver_ledc
