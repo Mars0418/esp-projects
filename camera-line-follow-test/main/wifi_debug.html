@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小车无线调试</title>
+<style>
+body{font:16px/1.65 system-ui,sans-serif;background:#eef2f7;color:#182234;margin:0;padding:22px;max-width:960px;margin:auto}
+h1{margin:0;font-size:26px}h2{font-size:19px;margin-top:0}.muted{color:#59667a}.badge{background:#d9f5e4;padding:6px 12px;border-radius:8px;display:inline-block}
+section{background:white;border-radius:14px;padding:20px;margin-top:18px;box-shadow:0 3px 15px #1822340a}
+canvas{width:100%;max-width:640px;aspect-ratio:4/3;background:#172132;image-rendering:pixelated;display:block;margin:auto}
+.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:12px 0}button{background:#225fd2;color:white;border:0;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:16px}button:disabled{opacity:.5}
+input{font:inherit;padding:8px;border:1px solid #b7c3d6;border-radius:6px;box-sizing:border-box;max-width:100%;width:360px}label{display:block;margin:12px 0}table{border-collapse:collapse;width:100%}td,th{padding:8px;text-align:left;border-bottom:1px solid #e3e8f1}.warn{color:#a53b0d}a{color:#225fd2}#message{white-space:pre-wrap}
+</style>
+<h1>小车 · Wi-Fi 调试</h1>
+<p class="badge">仅视觉预览 · 电机控制未启用</p>
+<section><h2>摄像头与识别</h2><canvas id="view" width="160" height="120"></canvas>
+<div class="controls"><button id="pause">暂停预览</button><label style="margin:0"><input id="rotate" type="checkbox" style="width:auto">画面旋转 180°</label></div>
+<div id="frameInfo" class="muted">等待摄像头画面…</div>
+<p class="muted">原始识别分辨率 160×120，已放大显示。紫球框为洋红色；黄色框表示上一帧预测，不能算本帧检出。旋转只改变显示方向。</p>
+<table><thead><tr><th>目标</th><th>状态</th><th>置信度</th><th>中心坐标</th></tr></thead><tbody id="objects"></tbody></table>
+<div id="health" class="muted"></div></section>
+<section><h2>网络状态</h2><div id="network">正在读取…</div><p class="muted">连接路由器成功不代表已验证互联网。小车热点提供本地调试，不转发互联网。</p></section>
+<section><h2>连接路由器 / 手机热点</h2><p>请使用 2.4 GHz 网络。暂不支持需要网页登录的校园网；可以改用手机热点。</p>
+<form id="wifi"><label>Wi-Fi 名称（SSID）<br><input id="ssid" required autocomplete="off"></label>
+<label>Wi-Fi 密码<br><input id="password" type="password" autocomplete="new-password" placeholder="开放网络可留空"></label>
+<button id="save" type="submit">保存并连接</button></form><p id="message" role="status"></p>
+<p class="muted">配置保存在小车本地。连接时热点可能短暂换频道，页面会自动重试；连接成功后，同一路由器下的设备也可通过上方 IP 打开此页。</p></section>
+<script>
+'use strict';
+const $=id=>document.getElementById(id), ctx=$('view').getContext('2d');
+let paused=false,lastSeq=-1,lastAdvance=0;
+async function request(url,options={}){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+ try{return await fetch(url,{cache:'no-store',...options,signal:controller.signal});}finally{clearTimeout(timer);}
+}
+$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'继续预览':'暂停预览';if(paused)$('frameInfo').textContent='预览已暂停，识别仍在板端运行';};
+$('rotate').onchange=()=>{$('view').style.transform=$('rotate').checked?'rotate(180deg)':'';};
+async function frames(){
+ if(!paused){try{
+   const response=await request('/api/frame');if(!response.ok)throw Error('等待摄像头连接或首帧');
+   const buffer=await response.arrayBuffer(),data=new DataView(buffer);
+   if(buffer.byteLength<4)throw Error('画面数据不完整');
+   const length=data.getUint32(0,true);
+   if(length>1024||4+length>buffer.byteLength)throw Error('画面头无效');
+   const info=JSON.parse(new TextDecoder().decode(new Uint8Array(buffer,4,length)));
+   if(info.width!==160||info.height!==120||buffer.byteLength!==4+length+160*120*2)throw Error('画面长度无效');
+   const pixels=new Uint8Array(buffer,4+length),out=ctx.createImageData(160,120);
+   for(let i=0;i<160*120;i++){let c=(pixels[2*i]<<8)|pixels[2*i+1];out.data[4*i]=Math.floor(((c>>11)&31)*255/31);out.data[4*i+1]=Math.floor(((c>>5)&63)*255/63);out.data[4*i+2]=Math.floor((c&31)*255/31);out.data[4*i+3]=255;}
+   if(!paused)ctx.putImageData(out,0,0);
+   if(lastSeq!==info.sequence){lastSeq=info.sequence;lastAdvance=Date.now();}
+   const stale=info.age_ms>2000||Date.now()-lastAdvance>2000;
+   if(!paused){$('frameInfo').textContent=`帧 ${info.sequence} · 采集至发送 ${info.age_ms} ms${stale?' · 画面已过期，请检查摄像头':''}`;$('frameInfo').className=stale?'warn':'muted';}
+ }catch(error){if(!paused){$('frameInfo').textContent='画面暂不可用：'+error.message;$('frameInfo').className='warn';}}}
+ setTimeout(frames,400);
+}
+async function status(){
+ try{
+  const response=await request('/api/status');if(!response.ok)throw Error('状态请求失败');const s=await response.json();
+  $('objects').replaceChildren();
+  for(const [key,name] of [['red','红球'],['white','白球'],['purple','紫球'],['goal','黑色目标区']]){
+   const b=s[key],row=document.createElement('tr');
+   for(const value of [name,!s.camera_fresh?'画面过期':!b.found?'未检出':b.predicted?'预测（非本帧）':'本帧检出',b.confidence,b.found&&'x'in b?`(${b.x}, ${b.y})`:'—']){const td=document.createElement('td');td.textContent=value;row.append(td);}
+   $('objects').append(row);
+  }
+  $('health').textContent=`识别状态独立刷新 · 内部可用 RAM ${(s.internal_free/1024).toFixed(0)} KB`;
+  $('network').replaceChildren();
+  const line=document.createElement('div');line.textContent=`小车热点：${s.ap_ssid} · ${s.ap_ip}`;$('network').append(line);
+  const sta=document.createElement('div');sta.textContent=s.sta_connected?`已连接 ${s.sta_ssid} · 信号 ${s.rssi??'—'} dBm · `:s.sta_ssid?`正在连接 / 重试 ${s.sta_ssid}（断开原因码 ${s.disconnect_reason}）`:'尚未配置外部 Wi-Fi';
+  if(s.sta_connected){const link=document.createElement('a');link.href=`http://${s.sta_ip}/`;link.textContent=link.href;sta.append(link);}
+  $('network').append(sta);
+  if(s.config_error!=='ESP_OK'){const e=document.createElement('div');e.className='warn';e.textContent='配置失败：'+s.config_error;$('network').append(e);}
+ }catch(error){$('network').textContent='连接中断，正在自动重试。请保持连接小车热点或同一路由器。';$('health').textContent='状态已过期';for(const row of $('objects').rows)row.cells[1].textContent='连接中断';}
+ setTimeout(status,1000);
+}
+$('wifi').onsubmit=async event=>{
+ event.preventDefault();$('save').disabled=true;
+ try{
+ const ssid=$('ssid').value,password=$('password').value,encoder=new TextEncoder();
+ if(!ssid||encoder.encode(ssid).length>32)throw Error('Wi-Fi 名称必须是 1–32 字节');
+ const n=encoder.encode(password).length;if(n!==0&&(n<8||n>63))throw Error('密码须为 8–63 字节，开放网络留空');
+ const response=await request('/api/wifi',{method:'POST',headers:{'Content-Type':'application/json','X-Car-Config':'1'},body:JSON.stringify({ssid,password})});
+ if(!response.ok)throw Error(await response.text());
+ $('password').value='';$('message').textContent='配置已提交，正在保存并连接。请查看上方网络状态；失败后可重新填写。';
+ }catch(error){$('message').textContent=error.message;}finally{$('save').disabled=false;}
+};
+frames();status();
+</script></html>

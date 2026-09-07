@@ -1,0 +1,23 @@
+menu "Car wireless debug"
+    config CAR_XIAOZHI
+        bool "XiaoZhi manual voice session over saved Wi-Fi"
+        depends on CAR_WIFI_DEBUG
+        default y
+        help
+            Restores saved station credentials for cloud voice access.
+            No automatic recording, movement or firmware upgrades.
+    config CAR_WIFI_DEBUG
+        bool "Wi-Fi camera dashboard (motors disabled)"
+        default n
+        help
+            Starts a password-protected AP and optional Wi-Fi station.
+            Publishes annotated vision frames and detection results over HTTP.
+            Motor navigation and odometry are not initialized in this mode.
+    config CAR_WIFI_RESTORE_STATION
+        bool "Automatically reconnect saved external Wi-Fi on boot"
+        depends on CAR_WIFI_DEBUG
+        default n
+        help
+            Disabled for UART-only audio bring-up. Keeps saved credentials,
+            but does not connect to the previous phone hotspot on boot.
+endmenu

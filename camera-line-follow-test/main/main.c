@@ -32,6 +32,12 @@
 #include "purple_ball_vision.h"
 #include "quarter_goal_pose.h"
 #include "usb/usb_host.h"
+#ifdef CONFIG_CAR_WIFI_DEBUG
+#include "wifi_debug.h"
+#include "usb_av_probe.h"
+#include "usb_audio.h"
+#include "xiaozhi_client.h"
+#endif
 
 #define MJPEG_SLOT_COUNT      2
 #define FRAME_QUEUE_LENGTH    1
@@ -117,7 +123,11 @@
 /* Temporary high-resolution calibration firmware. Set to 0 after exporting
  * the new camera calibration and copying its parameters into runtime code. */
 #define CAMERA_CALIBRATION_ONLY 0
+#ifdef CONFIG_CAR_WIFI_DEBUG
+#define VISION_PREVIEW_ONLY 1
+#else
 #define VISION_PREVIEW_ONLY 0
+#endif
 #define CALIBRATION_UART_BAUD 921600
 
 static const gpio_num_t s_motor_safe_stop_pins[] = {
@@ -2307,6 +2317,13 @@ static void frame_display_task(void *argument)
             black_marker_vision_draw_overlay(s_decoded_frame, output.width,
                                              output.height, &marker_result);
 
+#ifdef CONFIG_CAR_WIFI_DEBUG
+            wifi_debug_publish(s_decoded_frame, output.width, output.height,
+                               captured_at_us, &red_ball_result,
+                               &white_ball_result, &purple_ball_result,
+                               &marker_result);
+#endif
+
             if (vision_now_us - last_object_status_us >=
                     OBJECT_STATUS_INTERVAL_US) {
                 ESP_LOGD(TAG,
@@ -2450,6 +2467,11 @@ static esp_err_t initialize_frame_pipeline(void)
             return ESP_ERR_NO_MEM;
         }
     }
+#ifdef CONFIG_CAR_XIAOZHI
+    s_decoded_frame = heap_caps_malloc(DECODED_BUFFER_BYTES,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "XIAOZHI_DECODE_BUFFER=PSRAM; internal RAM reserved for audio/TLS");
+#else
     s_decoded_frame = heap_caps_malloc(DECODED_BUFFER_BYTES,
                                        MALLOC_CAP_INTERNAL |
                                        MALLOC_CAP_8BIT);
@@ -2462,6 +2484,7 @@ static esp_err_t initialize_frame_pipeline(void)
         ESP_LOGI(TAG, "FAST_DECODE_BUFFER=INTERNAL bytes=%d",
                  DECODED_BUFFER_BYTES);
     }
+#endif
     s_display_frame = heap_caps_malloc(DECODED_BUFFER_BYTES,
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_decoded_frame == NULL || s_display_frame == NULL) {
@@ -2574,15 +2597,20 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(initialize_motor_safe_stop());
+#ifdef CONFIG_CAR_WIFI_DEBUG
+    ESP_ERROR_CHECK(wifi_debug_init());
+#endif
     if (CAMERA_CALIBRATION_ONLY) {
         ESP_LOGW(TAG,
                  "CALIBRATION_ONLY: motors stopped; TFT, vision and odometry disabled");
         ESP_ERROR_CHECK(initialize_calibration_uart());
     } else {
-        ESP_ERROR_CHECK(post_line_odometry_init());
-        ESP_ERROR_CHECK(post_line_navigation_init(
-            INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
-            INITIAL_FIELD_HEADING_DEG));
+        if (!VISION_PREVIEW_ONLY) {
+            ESP_ERROR_CHECK(post_line_odometry_init());
+            ESP_ERROR_CHECK(post_line_navigation_init(
+                INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
+                INITIAL_FIELD_HEADING_DEG));
+        }
         ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
         ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH,
                                                 DECODED_HEIGHT));
@@ -2601,6 +2629,13 @@ void app_main(void)
     s_uvc_events = xEventGroupCreate();
     ESP_ERROR_CHECK(s_uvc_events == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(initialize_usb_host());
+#ifdef CONFIG_CAR_WIFI_DEBUG
+    ESP_ERROR_CHECK(usb_av_probe_start());
+#ifdef CONFIG_CAR_XIAOZHI
+    ESP_ERROR_CHECK(xiaozhi_init());
+#endif
+    ESP_ERROR_CHECK(usb_audio_init());
+#endif
 
     libuvc_adapter_config_t adapter_config = {
         .create_background_task = true,

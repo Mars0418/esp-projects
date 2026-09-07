@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "vision_memory.h"
 
 #define MIN_PURPLE_COMPONENT_PIXELS 8
 #define MAX_TRACK_MISS_FRAMES 1
@@ -122,9 +123,9 @@ esp_err_t purple_ball_vision_init(size_t width, size_t height)
     free(s_seen);
     free(s_queue);
     s_seen = heap_caps_calloc(pixel_count, 1,
-                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                              VISION_WORK_CAPS);
     s_queue = heap_caps_malloc(pixel_count * sizeof(*s_queue),
-                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                               VISION_WORK_CAPS);
     if (s_seen == NULL || s_queue == NULL) {
         free(s_seen);
         free(s_queue);

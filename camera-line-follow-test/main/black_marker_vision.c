@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
+#include "vision_memory.h"
 #include "esp_log.h"
 
 #define GOAL_MIN_PIXELS 20
@@ -141,9 +142,9 @@ esp_err_t black_marker_vision_init(size_t width, size_t height)
     if (pixels == 0 || pixels > UINT16_MAX) return ESP_ERR_INVALID_ARG;
     free(s_seen);
     free(s_queue);
-    s_seen = heap_caps_calloc(pixels, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_seen = heap_caps_calloc(pixels, 1, VISION_WORK_CAPS);
     s_queue = heap_caps_malloc(pixels * sizeof(*s_queue),
-                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                               VISION_WORK_CAPS);
     if (!s_seen || !s_queue) return ESP_ERR_NO_MEM;
     s_capacity = pixels;
     s_track_valid = false;
