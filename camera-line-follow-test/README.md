@@ -163,11 +163,16 @@ UART0 使用 GPIO43/44、115200 baud：
 `RUN` 日志每 2 秒输出循迹状态、脚下误差、纠偏值和 A/D PWM；`VIDEO` 每 3 秒输出
 输入、处理、显示帧率以及解码/视觉耗时。
 
-## 构建与烧录
+## 快速编译、烧录与运行
 
-本机 ESP-IDF 6.1-beta1 和 COM15 的命令如下。`flash monitor` 完成烧录后会直接
-进入日志监视；摄像头开始传流后小车会自动运动，因此烧录前必须先架稳车身或摆好
-场地，并准备发送急停键。
+以下命令适用于 Windows PowerShell、本机 ESP-IDF 6.1-beta1 和 ESP32-S3 串口
+`COM15`。如果设备管理器中显示的是其他端口，请把所有命令中的 `COM15` 换成实际
+端口。每次新开 PowerShell 都需要先执行 `export.ps1`；同一个终端中只需执行一次。
+
+烧录完成并复位后，摄像头开始传流时两球任务会自动运行，不需要输入 `F`。因此执行
+`flash` 前必须把小车放在安全场地，或让驱动轮离地，并准备在监视器中输入 `X` 急停。
+
+首次编译或源码修改后的完整操作：
 
 ```powershell
 cd C:\esp-projects-team\camera-line-follow-test
@@ -176,6 +181,44 @@ $env:PYTHONUTF8 = '1'
 idf.py -B build-local-6.1-beta1 build
 idf.py -B build-local-6.1-beta1 -p COM15 flash monitor
 ```
+
+看到启动日志和任务状态后即表示固件正在运行。监视器中按 `Ctrl+]` 退出；该操作只关闭
+电脑端监视器，不会让已烧录的程序消失。按开发板 `Reset` 会从头重新运行任务。
+
+如果代码已经编译，只需重新烧录并查看日志：
+
+```powershell
+cd C:\esp-projects-team\camera-line-follow-test
+$env:PYTHONUTF8 = '1'
+. C:\esp\v6.1-beta1\esp-idf\export.ps1
+idf.py -B build-local-6.1-beta1 -p COM15 flash monitor
+```
+
+如果固件已经烧录，只打开串口日志：
+
+```powershell
+cd C:\esp-projects-team\camera-line-follow-test
+$env:PYTHONUTF8 = '1'
+. C:\esp\v6.1-beta1\esp-idf\export.ps1
+idf.py -B build-local-6.1-beta1 -p COM15 monitor
+```
+
+烧录出现端口占用时，先关闭其他 `idf.py monitor`、串口助手和调试查看器。查看可用
+串口可执行：
+
+```powershell
+Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Name
+```
+
+需要同时查看处理画面和同帧控制数据时，先按 `Ctrl+]` 退出 `idf.py monitor`，然后在
+仓库根目录启动同步调试工具：
+
+```powershell
+cd C:\esp-projects-team
+.\start_push_debug_viewer.ps1 -Port COM15
+```
+
+勾选 `Record frames` 产生的 `captures/` 仅保存在本地，已被 Git 忽略。
 
 下面是仓库原有的 macOS 示例：
 
