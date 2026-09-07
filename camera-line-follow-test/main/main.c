@@ -119,7 +119,7 @@
 /* Temporary high-resolution calibration firmware. Set to 0 after exporting
  * the new camera calibration and copying its parameters into runtime code. */
 #define CAMERA_CALIBRATION_ONLY 0
-#define VISION_PREVIEW_ONLY 1
+#define VISION_PREVIEW_ONLY 0
 #define CALIBRATION_UART_BAUD 921600
 
 static const gpio_num_t s_motor_safe_stop_pins[] = {
@@ -176,6 +176,7 @@ typedef enum {
     MISSION_BALL_NONE = 0,
     MISSION_BALL_RED,
     MISSION_BALL_WHITE,
+    MISSION_BALL_PURPLE,
 } mission_ball_kind_t;
 
 typedef enum {
@@ -432,11 +433,22 @@ static const char *mission_push_entry_name(mission_push_entry_t entry)
 
 static const ball_vision_result_t *selected_ball_result(
     mission_ball_kind_t kind, const ball_vision_result_t *red,
-    const ball_vision_result_t *white)
+    const ball_vision_result_t *white, const ball_vision_result_t *purple)
 {
     if (kind == MISSION_BALL_RED) return red;
     if (kind == MISSION_BALL_WHITE) return white;
+    if (kind == MISSION_BALL_PURPLE) return purple;
     return NULL;
+}
+
+static const char *mission_ball_name(mission_ball_kind_t kind)
+{
+    switch (kind) {
+    case MISSION_BALL_RED: return "RED";
+    case MISSION_BALL_WHITE: return "WHITE";
+    case MISSION_BALL_PURPLE: return "PURPLE";
+    default: return "NONE";
+    }
 }
 
 static bool project_ball_to_field(const ball_vision_result_t *ball,
@@ -1091,6 +1103,7 @@ static void queue_push_debug_frame(
     const ball_capture_mission_t *mission,
     const ball_vision_result_t *red_ball,
     const ball_vision_result_t *white_ball,
+    const ball_vision_result_t *purple_ball,
     const black_marker_result_t *marker,
     const quarter_goal_pose_result_t *goal_pose)
 {
@@ -1113,6 +1126,7 @@ static void queue_push_debug_frame(
         .tracked_ball_field_y_mm = mission->ball_field_y_mm,
         .red_ball = debug_ball_detection(red_ball),
         .white_ball = debug_ball_detection(white_ball),
+        .purple_ball = debug_ball_detection(purple_ball),
         .goal = debug_goal_detection(marker),
         .corner_found = goal_pose->found,
         .corner_confidence = goal_pose->confidence,
@@ -1766,6 +1780,7 @@ static void process_ball_capture_mission(
     ball_capture_mission_t *mission, const mjpeg_slot_t *slot,
     const ball_vision_result_t *red_ball,
     const ball_vision_result_t *white_ball,
+    const ball_vision_result_t *purple_ball,
     const black_marker_result_t *marker,
     const quarter_goal_pose_result_t *goal_pose, int64_t now_us)
 {
@@ -1799,8 +1814,17 @@ static void process_ball_capture_mission(
         float selection_goal_y;
         mission_goal_geometry(mission, &selection_goal_x,
                               &selection_goal_y);
-        const mission_ball_kind_t candidate = choose_ball_nearest_goal(
-            red_ball, white_ball, selection_goal_x, selection_goal_y);
+        mission_ball_kind_t candidate;
+        if (mission->target_goal_index == 1) {
+            /* Round two is purple-only, including every lost-ball retry.
+             * Never fall back to red/white when purple is absent. */
+            float purple_x, purple_y;
+            candidate = project_ball_to_field(purple_ball, &purple_x, &purple_y)
+                ? MISSION_BALL_PURPLE : MISSION_BALL_NONE;
+        } else {
+            candidate = choose_ball_nearest_goal(
+                red_ball, white_ball, selection_goal_x, selection_goal_y);
+        }
         if (candidate == MISSION_BALL_NONE) {
             mission->candidate_frames = 0;
             mission->selected_ball = MISSION_BALL_NONE;
@@ -1833,16 +1857,15 @@ static void process_ball_capture_mission(
             memset(&mission->ball_window, 0, sizeof(mission->ball_window));
             ESP_LOGW(TAG,
                      "MISSION_BALL_CANDIDATE color=%s mode=%s; braking",
-                     mission->selected_ball == MISSION_BALL_RED
-                         ? "RED" : "WHITE",
+                     mission_ball_name(mission->selected_ball),
                      mission->target_goal_index == 0
-                         ? "NEAREST_UPPER_GOAL" : "NEAREST_LOWER_GOAL");
+                         ? "NEAREST_UPPER_GOAL" : "PURPLE_ONLY_LOWER_GOAL");
         }
         return;
     }
 
     const ball_vision_result_t *selected = selected_ball_result(
-        mission->selected_ball, red_ball, white_ball);
+        mission->selected_ball, red_ball, white_ball, purple_ball);
     const bool selected_real = selected && selected->found &&
                                !selected->predicted;
 
@@ -2168,8 +2191,7 @@ static void process_ball_capture_mission(
             mission->state = MISSION_PUSH_RECOVERY_SETTLE;
             ESP_LOGW(TAG,
                      "MISSION_PUSH_RECOVERY_BALL_SEEN color=%s; braking before replanning",
-                     mission->selected_ball == MISSION_BALL_RED
-                         ? "RED" : "WHITE");
+                     mission_ball_name(mission->selected_ball));
             return;
         }
         if (mission->missing_ball_frames <
@@ -2424,7 +2446,7 @@ static void process_ball_capture_mission(
         mission->stable_ball_frames = 0;
         mission->state = MISSION_SELECT_SECOND_BALL;
         ESP_LOGW(TAG,
-                 "MISSION_SELECT_SECOND_BALL stationary any_color=1 heading=%ddeg",
+                 "MISSION_SELECT_SECOND_BALL stationary purple_only=1 heading=%ddeg",
                  (int)lroundf(nav_pose.heading_deg));
     }
 }
@@ -2547,14 +2569,15 @@ static void frame_display_task(void *argument)
             if (!VISION_PREVIEW_ONLY) {
                 process_ball_capture_mission(
                     &mission, &s_slots[slot_index], &red_ball_result,
-                    &white_ball_result, &marker_result, &pose_result,
+                    &white_ball_result, &purple_ball_result,
+                    &marker_result, &pose_result,
                     vision_now_us);
             }
 
             if (push_debug) {
                 queue_push_debug_frame(
                     s_debug_raw_frame, captured_at_us, &mission,
-                    &red_ball_result, &white_ball_result,
+                    &red_ball_result, &white_ball_result, &purple_ball_result,
                     &marker_result, &pose_result);
             }
 

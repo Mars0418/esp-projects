@@ -381,6 +381,7 @@ class PushDebugViewer:
         self._draw_detection(metadata.get("goal"), "#ffd54f", scale, offset_x, offset_y)
         self._draw_detection(metadata.get("red"), "#ff3b30", scale, offset_x, offset_y)
         self._draw_detection(metadata.get("white"), "#00e5ff", scale, offset_x, offset_y)
+        self._draw_detection(metadata.get("purple"), "#ff00ff", scale, offset_x, offset_y)
 
         goal = metadata.get("goal")
         if isinstance(goal, dict) and goal.get("corner_found"):
@@ -420,7 +421,7 @@ class PushDebugViewer:
         mission = metadata.get("mission", {})
         navigation = metadata.get("navigation", {})
         if isinstance(mission, dict):
-            ball_names = {0: "NONE", 1: "RED", 2: "WHITE"}
+            ball_names = {0: "NONE", 1: "RED", 2: "WHITE", 3: "PURPLE"}
             goal_names = {0: "UPPER", 1: "LOWER"}
             selected = ball_names.get(int(mission.get("selected_ball", 0)), "?")
             target = goal_names.get(int(mission.get("target_goal", -1)), "?")
@@ -445,7 +446,7 @@ class PushDebugViewer:
         self.objects_var.set(
             "Objects: " + " | ".join(
                 self._object_summary(name, metadata.get(name))
-                for name in ("red", "white", "goal")
+                for name in ("red", "white", "purple", "goal")
             )
         )
 

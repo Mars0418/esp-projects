@@ -1,9 +1,10 @@
 # Quarter-circle goal vision
 
-The basic and advanced goal methods remain separate. The current build is a
-motor-disabled TFT preview of red, white and purple balls plus black goals.
-The basic detector supplies the black candidate region to `quarter_goal_pose.c`
-on each decoded 160x120 RGB565 frame. Navigation and odometry are not started.
+The basic and advanced goal methods remain separate. The current source
+integrates the upstream push mission, with round two restricted to purple.
+`VISION_PREVIEW_ONLY=0` enables navigation and odometry; set it to 1 for the
+motor-disabled TFT preview. The basic detector supplies the black candidate
+region to `quarter_goal_pose.c` on each decoded 160x120 RGB565 frame.
 
 The unmodified-color preview baseline is archived locally at commit `9f74b00`,
 tag `archive/purple-preview-20260907`. No remote push was performed.

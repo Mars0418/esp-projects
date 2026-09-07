@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "driver/uart.h"
+#include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -96,6 +97,8 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
         ",\"white\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
+        ",\"purple\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
+        ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
         ",\"goal\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]"
         ",\"corner_found\":%d,\"corner_confidence\":%d"
@@ -125,6 +128,11 @@ static int build_metadata(char *buffer, size_t capacity,
         m->white_ball.center_x, m->white_ball.center_y,
         m->white_ball.left, m->white_ball.top,
         m->white_ball.right, m->white_ball.bottom,
+        m->purple_ball.found, m->purple_ball.predicted,
+        m->purple_ball.confidence,
+        m->purple_ball.center_x, m->purple_ball.center_y,
+        m->purple_ball.left, m->purple_ball.top,
+        m->purple_ball.right, m->purple_ball.bottom,
         m->goal.found, m->goal.predicted, m->goal.confidence,
         m->goal.center_x, m->goal.center_y,
         m->goal.left, m->goal.top, m->goal.right, m->goal.bottom,
