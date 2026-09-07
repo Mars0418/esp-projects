@@ -117,7 +117,7 @@
 /* Temporary high-resolution calibration firmware. Set to 0 after exporting
  * the new camera calibration and copying its parameters into runtime code. */
 #define CAMERA_CALIBRATION_ONLY 0
-#define VISION_PREVIEW_ONLY 0
+#define VISION_PREVIEW_ONLY 1
 #define CALIBRATION_UART_BAUD 921600
 
 static const gpio_num_t s_motor_safe_stop_pins[] = {
@@ -2558,6 +2558,8 @@ void app_main(void)
 {
     if (CAMERA_CALIBRATION_ONLY) {
         ESP_LOGI(TAG, "Dedicated 640x480 camera calibration firmware");
+    } else if (VISION_PREVIEW_ONLY) {
+        ESP_LOGI(TAG, "VISION_PREVIEW_ONLY: TFT object overlays; motors disabled");
     } else {
         ESP_LOGI(TAG,
                  "Integrated object recognition, one-shot visual pose correction and waypoint navigation");
@@ -2579,10 +2581,12 @@ void app_main(void)
                  "CALIBRATION_ONLY: motors stopped; TFT, vision and odometry disabled");
         ESP_ERROR_CHECK(initialize_calibration_uart());
     } else {
-        ESP_ERROR_CHECK(post_line_odometry_init());
-        ESP_ERROR_CHECK(post_line_navigation_init(
-            INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
-            INITIAL_FIELD_HEADING_DEG));
+        if (!VISION_PREVIEW_ONLY) {
+            ESP_ERROR_CHECK(post_line_odometry_init());
+            ESP_ERROR_CHECK(post_line_navigation_init(
+                INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
+                INITIAL_FIELD_HEADING_DEG));
+        }
         ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
         ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH,
                                                 DECODED_HEIGHT));
