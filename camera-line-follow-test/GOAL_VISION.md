@@ -1,10 +1,12 @@
 # Quarter-circle goal vision
 
-The basic and advanced goal methods remain separate. The current build is the
-advanced-only test: the basic detector silently supplies the black candidate
-region, then `quarter_goal_pose.c` estimates the calibrated field pose on each
-decoded 160x120 RGB565 frame. Red/white ball detection and line following are
-not called, and the motors remain in safe stop.
+The basic and advanced goal methods remain separate. The current build is a
+motor-disabled TFT preview of red, white and purple balls plus black goals.
+The basic detector supplies the black candidate region to `quarter_goal_pose.c`
+on each decoded 160x120 RGB565 frame. Navigation and odometry are not started.
+
+The unmodified-color preview baseline is archived locally at commit `9f74b00`,
+tag `archive/purple-preview-20260907`. No remote push was performed.
 
 ## Basic detector
 
@@ -17,10 +19,26 @@ selected black pixels, not the centre of the bounding box:
 GOAL_BASIC found=1 confidence=87 center_raw=(82,43) black_pixels=146
 ```
 
-The magenta rectangle is the component box and the white cross is its centroid.
+The orange rectangle is the component box and the white cross is its centroid.
+Purple balls retain a magenta rectangle with a red center pixel; predicted
+boxes are yellow for one missed frame.
 The coordinates are raw decoder coordinates. Black thresholds default to
 maximum luminance 85, maximum channel 110 and maximum RGB spread 24. They are
 stored in `s_thresholds` near the top of `black_marker_vision.c`.
+
+To reduce dark purple balls being selected as goals, pixels with blue >= 40
+and blue exceeding both red and green by >= 12 are now excluded. The original
+brightness, component geometry, contrast and tracking limits are unchanged.
+This rule is shared with precise pose detection through the existing pixel
+predicate. No whole-ball bounding box is removed, so a ball inside a goal
+does not automatically disqualify the surrounding black region.
+
+`python tools/test_goal_color.py` checks a reference model over all 65,536
+RGB565 colors. At current thresholds it removes 30 formerly accepted colors,
+including all 21 overlapping with the purple pixel rule, retaining 506 black
+colors. This is not a C-execution or real-image accuracy test. Nearly neutral
+ball shadows may still pass; noticeably blue-tinted real goals may lose pixels.
+Check a ball alone, a goal alone, and a ball inside the goal on the actual TFT.
 
 Only a component whose black-pixel centroid lies in the centred 100x90 trust
 region is reported. At 160x120 this is raw `x=30..129, y=15..104`; candidates

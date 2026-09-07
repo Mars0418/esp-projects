@@ -16,6 +16,10 @@
 #define GOAL_POSITION_SNAP_CONFIDENCE 65
 #define GOAL_JUMP_CONFIRM_FRAMES 2
 #define GOAL_JUMP_MATCH_PIXELS 4
+/* Two RGB565 blue/red steps: reject clear blue-purple tint, not slight
+ * channel quantization differences in neutral black. Keep near-black pixels. */
+#define GOAL_PURPLE_BLUE_MIN 40
+#define GOAL_PURPLE_BLUE_EXCESS 12
 
 static const char *TAG = "goal_basic";
 static uint8_t *s_seen;
@@ -106,9 +110,17 @@ bool black_marker_vision_pixel_is_goal(const uint8_t *rgb565, size_t index)
     const int minimum = red < green ? (red < blue ? red : blue) :
                                       (green < blue ? green : blue);
     const int luminance = (77 * red + 150 * green + 29 * blue) >> 8;
+    /* A dark purple shell can pass all three original darkness thresholds.
+     * Use the same blue-dominance direction as the purple detector, extended
+     * into shadow. Do not mask the ball's whole box: it may sit inside a goal.
+     * This shared predicate also keeps precise goal localization consistent. */
+    const bool purple_tint = blue >= GOAL_PURPLE_BLUE_MIN &&
+                            blue - red >= GOAL_PURPLE_BLUE_EXCESS &&
+                            blue - green >= GOAL_PURPLE_BLUE_EXCESS;
     return luminance <= s_thresholds.luminance_max &&
            maximum <= s_thresholds.channel_max &&
-           maximum - minimum <= s_thresholds.rgb_spread_max;
+           maximum - minimum <= s_thresholds.rgb_spread_max &&
+           !purple_tint;
 }
 
 goal_dark_thresholds_t black_marker_vision_get_thresholds(void)
@@ -388,7 +400,8 @@ void black_marker_vision_draw_overlay(uint8_t *rgb565, size_t width,
                                       const black_marker_result_t *result)
 {
     if (!rgb565 || !result || !result->found) return;
-    const uint16_t box_color = result->predicted ? 0xffe0 : 0xf81f;
+    /* Orange goal box + white cross; purple ball uses magenta + red center. */
+    const uint16_t box_color = result->predicted ? 0xffe0 : 0xfd20;
     const uint16_t center_color = 0xffff;
     for (int x = result->left; x <= result->right; ++x) {
         set_pixel(rgb565, width, height, x, result->top, box_color);
