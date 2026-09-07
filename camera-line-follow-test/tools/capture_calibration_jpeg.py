@@ -14,18 +14,24 @@ def main() -> None:
     parser.add_argument("--port", default="COM6")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=12.0)
+    parser.add_argument(
+        "--direct", action="store_true",
+        help="Listen directly at 921600 for CAMERA_CALIBRATION_ONLY firmware.",
+    )
     args = parser.parse_args()
 
-    port = serial.Serial(args.port, 115200, timeout=0.1)
+    port = serial.Serial(args.port, 921600 if args.direct else 115200,
+                         timeout=0.1)
     try:
         # Opening the CP210x console toggles reset on this board.  Wait until
         # USB camera startup has completed before sending the mode command.
         time.sleep(3.0)
         port.reset_input_buffer()
-        port.write(b"CALIB,1\n")
-        port.flush()
-        time.sleep(0.2)
-        port.baudrate = 921600
+        if not args.direct:
+            port.write(b"CALIB,1\n")
+            port.flush()
+            time.sleep(0.2)
+            port.baudrate = 921600
 
         buffer = bytearray()
         deadline = time.monotonic() + args.timeout
@@ -55,12 +61,18 @@ def main() -> None:
                 args.output.write_bytes(jpeg)
                 print(f"saved={args.output} sequence={sequence} size={width}x{height} bytes={payload_size}")
                 return
-        raise TimeoutError("No complete calibration JPEG arrived from the camera.")
+        raise TimeoutError(
+            "No complete calibration JPEG arrived from the camera. "
+            f"received={len(buffer)} bytes "
+            f"headers={buffer.count(b'@CALJPEG,')} "
+            f"prefix={bytes(buffer[:80])!r}"
+        )
     finally:
         try:
-            port.write(b"CALIB,0\n")
-            port.flush()
-            time.sleep(0.15)
+            if not args.direct:
+                port.write(b"CALIB,0\n")
+                port.flush()
+                time.sleep(0.15)
         finally:
             port.close()
 

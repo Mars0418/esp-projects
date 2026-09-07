@@ -29,6 +29,7 @@
 #include "mbedtls/base64.h"
 #include "post_line_odometry.h"
 #include "post_line_navigation.h"
+#include "purple_ball_vision.h"
 #include "quarter_goal_pose.h"
 #include "usb/usb_host.h"
 
@@ -116,6 +117,7 @@
 /* Temporary high-resolution calibration firmware. Set to 0 after exporting
  * the new camera calibration and copying its parameters into runtime code. */
 #define CAMERA_CALIBRATION_ONLY 0
+#define VISION_PREVIEW_ONLY 0
 #define CALIBRATION_UART_BAUD 921600
 
 static const gpio_num_t s_motor_safe_stop_pins[] = {
@@ -2265,12 +2267,15 @@ static void frame_display_task(void *argument)
 
             ball_vision_result_t red_ball_result;
             ball_vision_result_t white_ball_result;
+            ball_vision_result_t purple_ball_result;
             black_marker_result_t marker_result;
             quarter_goal_pose_result_t pose_result = {0};
             ball_vision_process(s_decoded_frame, output.width, output.height,
                                 &red_ball_result);
             white_ball_vision_process(s_decoded_frame, output.width,
                                       output.height, &white_ball_result);
+            purple_ball_vision_process(s_decoded_frame, output.width,
+                                       output.height, &purple_ball_result);
             black_marker_vision_process(s_decoded_frame, output.width,
                                         output.height, &marker_result);
             quarter_goal_pose_process(s_decoded_frame, output.width,
@@ -2282,10 +2287,12 @@ static void frame_display_task(void *argument)
                 !marker_result.predicted && pose_result.found;
             update_goal_detection_window(&detection_window,
                                          real_goal_detection);
-            process_ball_capture_mission(
-                &mission, &s_slots[slot_index], &red_ball_result,
-                &white_ball_result, &marker_result, &pose_result,
-                vision_now_us);
+            if (!VISION_PREVIEW_ONLY) {
+                process_ball_capture_mission(
+                    &mission, &s_slots[slot_index], &red_ball_result,
+                    &white_ball_result, &marker_result, &pose_result,
+                    vision_now_us);
+            }
 
             quarter_goal_pose_draw_overlay(s_decoded_frame, output.width,
                                            output.height, &pose_result);
@@ -2294,13 +2301,16 @@ static void frame_display_task(void *argument)
             ball_vision_draw_overlay_color(s_decoded_frame, output.width,
                                            output.height, &white_ball_result,
                                            0x07ff);
+            purple_ball_vision_draw_overlay_color(
+                s_decoded_frame, output.width, output.height,
+                &purple_ball_result, 0xf81f);
             black_marker_vision_draw_overlay(s_decoded_frame, output.width,
                                              output.height, &marker_result);
 
             if (vision_now_us - last_object_status_us >=
                     OBJECT_STATUS_INTERVAL_US) {
                 ESP_LOGD(TAG,
-                         "OBJECTS red=%d/%d center=(%d,%d) white=%d/%d center=(%d,%d) goal=%d/%d center=(%d,%d) recent_goal=%d/%d localization=%s mission=%s",
+                         "OBJECTS red=%d/%d center=(%d,%d) white=%d/%d center=(%d,%d) purple=%d/%d center=(%d,%d) goal=%d/%d center=(%d,%d) recent_goal=%d/%d localization=%s mission=%s",
                          red_ball_result.found && !red_ball_result.predicted,
                          red_ball_result.confidence,
                          red_ball_result.center_x, red_ball_result.center_y,
@@ -2309,6 +2319,11 @@ static void frame_display_task(void *argument)
                          white_ball_result.confidence,
                          white_ball_result.center_x,
                          white_ball_result.center_y,
+                         purple_ball_result.found &&
+                             !purple_ball_result.predicted,
+                         purple_ball_result.confidence,
+                         purple_ball_result.center_x,
+                         purple_ball_result.center_y,
                          marker_result.found && !marker_result.predicted,
                          marker_result.confidence,
                          marker_result.center_x, marker_result.center_y,
@@ -2571,6 +2586,8 @@ void app_main(void)
         ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
         ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH,
                                                 DECODED_HEIGHT));
+        ESP_ERROR_CHECK(purple_ball_vision_init(DECODED_WIDTH,
+                                                DECODED_HEIGHT));
         ESP_ERROR_CHECK(black_marker_vision_init(DECODED_WIDTH,
                                                   DECODED_HEIGHT));
         black_marker_vision_set_logging(false);
@@ -2632,11 +2649,11 @@ void app_main(void)
                      s_stream_width, s_stream_height, s_stream_fps,
                      s_stream_format == UVC_FRAME_FORMAT_YUYV
                          ? "YUYV" : "MJPEG");
-            if (!CAMERA_CALIBRATION_ONLY) {
+            if (!CAMERA_CALIBRATION_ONLY && !VISION_PREVIEW_ONLY) {
                 post_line_navigation_start();
             }
             wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            if (!CAMERA_CALIBRATION_ONLY) {
+            if (!CAMERA_CALIBRATION_ONLY && !VISION_PREVIEW_ONLY) {
                 post_line_navigation_pause();
             }
             uvc_stop_streaming(device_handle);
