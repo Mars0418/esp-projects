@@ -34,7 +34,6 @@ typedef struct {
     float tracked_ball_field_x_mm;
     float tracked_ball_field_y_mm;
     push_debug_detection_t red_ball;
-    push_debug_detection_t white_ball;
     push_debug_detection_t purple_ball;
     push_debug_detection_t goal;
     bool corner_found;

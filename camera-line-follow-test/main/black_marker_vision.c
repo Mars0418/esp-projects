@@ -153,10 +153,29 @@ esp_err_t black_marker_vision_init(size_t width, size_t height)
     if (pixels == 0 || pixels > UINT16_MAX) return ESP_ERR_INVALID_ARG;
     free(s_seen);
     free(s_queue);
+    s_seen = NULL;
+    s_queue = NULL;
     s_seen = heap_caps_calloc(pixels, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_seen) {
+        s_seen = heap_caps_calloc(pixels, 1,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "Goal seen-map moved to PSRAM");
+    }
     s_queue = heap_caps_malloc(pixels * sizeof(*s_queue),
                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s_seen || !s_queue) return ESP_ERR_NO_MEM;
+    if (!s_queue) {
+        s_queue = heap_caps_malloc(pixels * sizeof(*s_queue),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        ESP_LOGW(TAG, "Goal component queue moved to PSRAM");
+    }
+    if (!s_seen || !s_queue) {
+        free(s_seen);
+        free(s_queue);
+        s_seen = NULL;
+        s_queue = NULL;
+        s_capacity = 0;
+        return ESP_ERR_NO_MEM;
+    }
     s_capacity = pixels;
     s_track_valid = false;
     s_missed_frames = 0;

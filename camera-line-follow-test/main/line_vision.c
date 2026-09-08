@@ -785,6 +785,33 @@ esp_err_t line_vision_init(size_t width, size_t height)
     return ESP_OK;
 }
 
+void line_vision_deinit(void)
+{
+    heap_caps_free(s_mask);
+    heap_caps_free(s_morph);
+    heap_caps_free(s_queue);
+    heap_caps_free(s_best_component);
+    heap_caps_free(s_parent);
+    heap_caps_free(s_distance);
+    heap_caps_free(s_luma);
+    heap_caps_free(s_luma_integral);
+    s_mask = NULL;
+    s_morph = NULL;
+    s_queue = NULL;
+    s_best_component = NULL;
+    s_parent = NULL;
+    s_distance = NULL;
+    s_luma = NULL;
+    s_luma_integral = NULL;
+    s_pixel_capacity = 0;
+    s_integral_capacity = 0;
+    s_previous_path_valid = false;
+    s_corridor_locked = false;
+    s_corridor_valid = false;
+    __atomic_store_n(&s_corridor_lock_requested, false, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG, "Line-vision buffers released");
+}
+
 void line_vision_set_rgb_thresholds(uint8_t red, uint8_t green, uint8_t blue)
 {
     const uint32_t packed = ((uint32_t)red << 16) |

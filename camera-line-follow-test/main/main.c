@@ -41,6 +41,8 @@
 #define DECODED_WIDTH         160
 #define DECODED_HEIGHT        120
 #define DECODED_BUFFER_BYTES  (DECODED_WIDTH * DECODED_HEIGHT * 2)
+#define LINE_DECODED_WIDTH    80
+#define LINE_DECODED_HEIGHT   60
 #define JPEG_WORK_BUFFER_BYTES 8192
 #define RGB_DEBUG_WIDTH       32
 #define RGB_DEBUG_HEIGHT      24
@@ -122,6 +124,13 @@
 #define VISION_PREVIEW_ONLY 0
 #define CALIBRATION_UART_BAUD 921600
 
+typedef enum {
+    OPERATION_LINE_FOLLOW = 0,
+    OPERATION_LINE_HANDOFF,
+    OPERATION_BALL_CAPTURE,
+    OPERATION_ERROR,
+} operation_phase_t;
+
 static const gpio_num_t s_motor_safe_stop_pins[] = {
     GPIO_NUM_5,
     GPIO_NUM_6, GPIO_NUM_15, GPIO_NUM_7,
@@ -175,8 +184,7 @@ typedef enum {
 typedef enum {
     MISSION_BALL_NONE = 0,
     MISSION_BALL_RED,
-    MISSION_BALL_WHITE,
-    MISSION_BALL_PURPLE,
+    MISSION_BALL_PURPLE = 3,
 } mission_ball_kind_t;
 
 typedef enum {
@@ -232,6 +240,10 @@ static uint8_t *s_jpeg_work_buffer;
 static portMUX_TYPE s_slot_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_display_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_display_busy;
+static size_t s_display_width;
+static size_t s_display_height;
+static volatile operation_phase_t s_operation_phase = OPERATION_LINE_FOLLOW;
+static volatile bool s_post_navigation_initialized;
 static volatile uint32_t s_received_frames;
 static volatile uint32_t s_displayed_frames;
 static volatile uint32_t s_dropped_frames;
@@ -253,7 +265,9 @@ static int s_stream_fps = 15;
 static enum uvc_frame_format s_stream_format = UVC_FRAME_FORMAT_MJPEG;
 static esp_jpeg_image_scale_t s_decode_scale = JPEG_IMAGE_SCALE_1_4;
 
-static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot);
+static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot,
+                                      size_t output_width,
+                                      size_t output_height);
 
 static esp_err_t initialize_motor_safe_stop(void)
 {
@@ -433,10 +447,9 @@ static const char *mission_push_entry_name(mission_push_entry_t entry)
 
 static const ball_vision_result_t *selected_ball_result(
     mission_ball_kind_t kind, const ball_vision_result_t *red,
-    const ball_vision_result_t *white, const ball_vision_result_t *purple)
+    const ball_vision_result_t *purple)
 {
     if (kind == MISSION_BALL_RED) return red;
-    if (kind == MISSION_BALL_WHITE) return white;
     if (kind == MISSION_BALL_PURPLE) return purple;
     return NULL;
 }
@@ -445,7 +458,6 @@ static const char *mission_ball_name(mission_ball_kind_t kind)
 {
     switch (kind) {
     case MISSION_BALL_RED: return "RED";
-    case MISSION_BALL_WHITE: return "WHITE";
     case MISSION_BALL_PURPLE: return "PURPLE";
     default: return "NONE";
     }
@@ -476,34 +488,6 @@ static bool project_ball_to_field(const ball_vision_result_t *ball,
     *field_y_mm = pose.y_mm - cosine * vehicle_right_mm +
                   sine * vehicle_forward_mm;
     return isfinite(*field_x_mm) && isfinite(*field_y_mm);
-}
-
-static mission_ball_kind_t choose_ball_nearest_goal(
-    const ball_vision_result_t *red, const ball_vision_result_t *white,
-    float goal_x_mm, float goal_y_mm)
-{
-    float red_x = 0.0f;
-    float red_y = 0.0f;
-    float white_x = 0.0f;
-    float white_y = 0.0f;
-    const bool red_valid = red->found && !red->predicted &&
-        project_ball_to_field(red, &red_x, &red_y);
-    const bool white_valid = white->found && !white->predicted &&
-        project_ball_to_field(white, &white_x, &white_y);
-    if (red_valid && !white_valid) return MISSION_BALL_RED;
-    if (white_valid && !red_valid) return MISSION_BALL_WHITE;
-    if (!red_valid && !white_valid) return MISSION_BALL_NONE;
-
-    const float red_distance = hypotf(red_x - goal_x_mm,
-                                      red_y - goal_y_mm);
-    const float white_distance = hypotf(white_x - goal_x_mm,
-                                        white_y - goal_y_mm);
-    if (fabsf(red_distance - white_distance) < 20.0f) {
-        return red->confidence >= white->confidence
-            ? MISSION_BALL_RED : MISSION_BALL_WHITE;
-    }
-    return red_distance < white_distance
-        ? MISSION_BALL_RED : MISSION_BALL_WHITE;
 }
 
 static bool mission_command_complete(const ball_capture_mission_t *mission,
@@ -1044,18 +1028,25 @@ static bool mission_update_stable_ball(
     return true;
 }
 
-static bool queue_tft_preview(const uint8_t *pixels)
+static bool queue_tft_preview(const uint8_t *pixels, size_t width,
+                              size_t height)
 {
+    if (width == 0 || height == 0 || width > DECODED_WIDTH ||
+        height > DECODED_HEIGHT) {
+        return false;
+    }
     bool reserved = false;
     portENTER_CRITICAL(&s_display_lock);
     if (!s_display_busy) {
         s_display_busy = true;
+        s_display_width = width;
+        s_display_height = height;
         reserved = true;
     }
     portEXIT_CRITICAL(&s_display_lock);
     if (!reserved) return false;
 
-    memcpy(s_display_frame, pixels, DECODED_BUFFER_BYTES);
+    memcpy(s_display_frame, pixels, width * height * 2);
     const uint8_t signal = 1;
     if (xQueueSend(s_display_queue, &signal, 0) != pdPASS) {
         portENTER_CRITICAL(&s_display_lock);
@@ -1102,7 +1093,6 @@ static void queue_push_debug_frame(
     const uint8_t *raw_pixels, int64_t captured_at_us,
     const ball_capture_mission_t *mission,
     const ball_vision_result_t *red_ball,
-    const ball_vision_result_t *white_ball,
     const ball_vision_result_t *purple_ball,
     const black_marker_result_t *marker,
     const quarter_goal_pose_result_t *goal_pose)
@@ -1125,7 +1115,6 @@ static void queue_push_debug_frame(
         .tracked_ball_field_x_mm = mission->ball_field_x_mm,
         .tracked_ball_field_y_mm = mission->ball_field_y_mm,
         .red_ball = debug_ball_detection(red_ball),
-        .white_ball = debug_ball_detection(white_ball),
         .purple_ball = debug_ball_detection(purple_ball),
         .goal = debug_goal_detection(marker),
         .corner_found = goal_pose->found,
@@ -1165,8 +1154,14 @@ static void tft_display_task(void *argument)
         if (xQueueReceive(s_display_queue, &signal, portMAX_DELAY) != pdPASS) {
             continue;
         }
+        size_t width;
+        size_t height;
+        portENTER_CRITICAL(&s_display_lock);
+        width = s_display_width;
+        height = s_display_height;
+        portEXIT_CRITICAL(&s_display_lock);
         const esp_err_t error = camera_display_show_rotated_rgb565(
-            s_display_frame, DECODED_WIDTH, DECODED_HEIGHT);
+            s_display_frame, width, height);
         if (error == ESP_OK) {
             s_displayed_frames++;
         } else {
@@ -1509,7 +1504,8 @@ static void frame_display_task(void *argument)
         esp_jpeg_image_output_t output = {0};
         esp_err_t decode_error;
         if (s_slots[slot_index].format == UVC_FRAME_FORMAT_YUYV) {
-            decode_error = downsample_yuyv_luma(&s_slots[slot_index]);
+            decode_error = downsample_yuyv_luma(
+                &s_slots[slot_index], DECODED_WIDTH, DECODED_HEIGHT);
             output.width = DECODED_WIDTH;
             output.height = DECODED_HEIGHT;
         } else {
@@ -1648,7 +1644,8 @@ static void frame_display_task(void *argument)
             const int64_t debug_now_us = esp_timer_get_time();
             if (!tuner && debug_now_us - last_tft_preview_us >=
                     TFT_PREVIEW_INTERVAL_US) {
-                if (queue_tft_preview(s_decoded_frame)) {
+                if (queue_tft_preview(s_decoded_frame, output.width,
+                                      output.height)) {
                     last_tft_preview_us = debug_now_us;
                 }
             }
@@ -1779,7 +1776,6 @@ static bool refine_precise_goal_pose(
 static void process_ball_capture_mission(
     ball_capture_mission_t *mission, const mjpeg_slot_t *slot,
     const ball_vision_result_t *red_ball,
-    const ball_vision_result_t *white_ball,
     const ball_vision_result_t *purple_ball,
     const black_marker_result_t *marker,
     const quarter_goal_pose_result_t *goal_pose, int64_t now_us)
@@ -1810,20 +1806,16 @@ static void process_ball_capture_mission(
 
     if (mission->state == MISSION_SELECT_FIRST_BALL ||
         mission->state == MISSION_SELECT_SECOND_BALL) {
-        float selection_goal_x;
-        float selection_goal_y;
-        mission_goal_geometry(mission, &selection_goal_x,
-                              &selection_goal_y);
         mission_ball_kind_t candidate;
         if (mission->target_goal_index == 1) {
-            /* Round two is purple-only, including every lost-ball retry.
-             * Never fall back to red/white when purple is absent. */
+            /* Round two is purple-only, including every lost-ball retry. */
             float purple_x, purple_y;
             candidate = project_ball_to_field(purple_ball, &purple_x, &purple_y)
                 ? MISSION_BALL_PURPLE : MISSION_BALL_NONE;
         } else {
-            candidate = choose_ball_nearest_goal(
-                red_ball, white_ball, selection_goal_x, selection_goal_y);
+            float red_x, red_y;
+            candidate = project_ball_to_field(red_ball, &red_x, &red_y)
+                ? MISSION_BALL_RED : MISSION_BALL_NONE;
         }
         if (candidate == MISSION_BALL_NONE) {
             mission->candidate_frames = 0;
@@ -1859,13 +1851,13 @@ static void process_ball_capture_mission(
                      "MISSION_BALL_CANDIDATE color=%s mode=%s; braking",
                      mission_ball_name(mission->selected_ball),
                      mission->target_goal_index == 0
-                         ? "NEAREST_UPPER_GOAL" : "PURPLE_ONLY_LOWER_GOAL");
+                         ? "RED_ONLY_UPPER_GOAL" : "PURPLE_ONLY_LOWER_GOAL");
         }
         return;
     }
 
     const ball_vision_result_t *selected = selected_ball_result(
-        mission->selected_ball, red_ball, white_ball, purple_ball);
+        mission->selected_ball, red_ball, purple_ball);
     const bool selected_real = selected && selected->found &&
                                !selected->predicted;
 
@@ -2451,6 +2443,77 @@ static void process_ball_capture_mission(
     }
 }
 
+static esp_jpeg_image_scale_t line_decode_scale_for_slot(
+    const mjpeg_slot_t *slot)
+{
+    if (slot->width >= 640 && slot->height >= 480) {
+        return JPEG_IMAGE_SCALE_1_8;
+    }
+    if (slot->width >= 320 && slot->height >= 240) {
+        return JPEG_IMAGE_SCALE_1_4;
+    }
+    return JPEG_IMAGE_SCALE_1_2;
+}
+
+static esp_err_t initialize_ball_capture_vision(void)
+{
+    ESP_RETURN_ON_ERROR(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT),
+                        TAG, "red-ball vision initialization failed");
+    ESP_RETURN_ON_ERROR(purple_ball_vision_init(DECODED_WIDTH,
+                                                 DECODED_HEIGHT),
+                        TAG, "purple-ball vision initialization failed");
+    ESP_RETURN_ON_ERROR(black_marker_vision_init(DECODED_WIDTH,
+                                                  DECODED_HEIGHT),
+                        TAG, "goal vision initialization failed");
+    black_marker_vision_set_logging(false);
+    quarter_goal_pose_set_single_corner_mode(true);
+    quarter_goal_pose_set_logging(false);
+    return ESP_OK;
+}
+
+static esp_err_t move_decode_buffer_to_psram(void)
+{
+    uint8_t *replacement = heap_caps_malloc(DECODED_BUFFER_BYTES,
+                                             MALLOC_CAP_SPIRAM |
+                                             MALLOC_CAP_8BIT);
+    ESP_RETURN_ON_FALSE(replacement != NULL, ESP_ERR_NO_MEM, TAG,
+                        "cannot move decode buffer to PSRAM");
+    heap_caps_free(s_decoded_frame);
+    s_decoded_frame = replacement;
+    ESP_LOGI(TAG,
+             "Decode buffer moved to PSRAM; internal RAM reserved for ball vision");
+    return ESP_OK;
+}
+
+static esp_err_t transition_to_ball_capture(void)
+{
+    s_operation_phase = OPERATION_LINE_HANDOFF;
+    ESP_LOGW(TAG, "COURSE COMPLETE: stopping line control before ball capture");
+    ESP_RETURN_ON_ERROR(camera_line_follow_handoff(), TAG,
+                        "line-control handoff failed");
+    line_vision_deinit();
+    ESP_RETURN_ON_ERROR(move_decode_buffer_to_psram(), TAG,
+                        "decode-buffer handoff failed");
+    ESP_RETURN_ON_ERROR(post_line_odometry_init(), TAG,
+                        "post-line odometry initialization failed");
+    ESP_RETURN_ON_ERROR(post_line_navigation_init_from_line_follow(
+                            INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
+                            INITIAL_FIELD_HEADING_DEG),
+                        TAG, "ball navigation initialization failed");
+    ESP_RETURN_ON_ERROR(initialize_ball_capture_vision(), TAG,
+                        "ball vision handoff failed");
+    s_post_navigation_initialized = true;
+    post_line_navigation_start();
+    s_operation_phase = OPERATION_BALL_CAPTURE;
+    ESP_LOGW(TAG,
+             "BALL CAPTURE START initial=(%d,%d,%ddeg) frame=%dx%d",
+             (int)lroundf(INITIAL_FIELD_X_MM),
+             (int)lroundf(INITIAL_FIELD_Y_MM),
+             (int)lroundf(INITIAL_FIELD_HEADING_DEG),
+             DECODED_WIDTH, DECODED_HEIGHT);
+    return ESP_OK;
+}
+
 static void frame_display_task(void *argument)
 {
     (void)argument;
@@ -2507,13 +2570,27 @@ static void frame_display_task(void *argument)
             continue;
         }
 
+        if (s_operation_phase == OPERATION_ERROR) {
+            release_mjpeg_slot(slot_index);
+            vTaskDelay(1);
+            continue;
+        }
+
         const int64_t decode_start_us = esp_timer_get_time();
+        const bool line_phase =
+            s_operation_phase == OPERATION_LINE_FOLLOW ||
+            s_operation_phase == OPERATION_LINE_HANDOFF;
+        const size_t decoded_width = line_phase
+            ? LINE_DECODED_WIDTH : DECODED_WIDTH;
+        const size_t decoded_height = line_phase
+            ? LINE_DECODED_HEIGHT : DECODED_HEIGHT;
         esp_jpeg_image_output_t output = {0};
         esp_err_t decode_error;
         if (s_slots[slot_index].format == UVC_FRAME_FORMAT_YUYV) {
-            decode_error = downsample_yuyv_luma(&s_slots[slot_index]);
-            output.width = DECODED_WIDTH;
-            output.height = DECODED_HEIGHT;
+            decode_error = downsample_yuyv_luma(
+                &s_slots[slot_index], decoded_width, decoded_height);
+            output.width = decoded_width;
+            output.height = decoded_height;
         } else {
             esp_jpeg_image_cfg_t jpeg_config = {
                 .indata = s_slots[slot_index].data,
@@ -2521,7 +2598,9 @@ static void frame_display_task(void *argument)
                 .outbuf = s_decoded_frame,
                 .outbuf_size = DECODED_BUFFER_BYTES,
                 .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                .out_scale = s_decode_scale,
+                .out_scale = line_phase
+                    ? line_decode_scale_for_slot(&s_slots[slot_index])
+                    : s_decode_scale,
                 .flags = {
                     .swap_color_bytes = 1,
                 },
@@ -2533,9 +2612,60 @@ static void frame_display_task(void *argument)
             decode_error = esp_jpeg_decode(&jpeg_config, &output);
         }
 
-        if (decode_error == ESP_OK && output.width == DECODED_WIDTH &&
-            output.height == DECODED_HEIGHT) {
+        if (decode_error == ESP_OK && output.width == decoded_width &&
+            output.height == decoded_height) {
             const int64_t decode_done_us = esp_timer_get_time();
+            if (line_phase) {
+                const bool rgb_debug = camera_line_follow_debug_enabled();
+                const bool tuner = camera_line_follow_tuner_enabled();
+                if (rgb_debug || tuner) {
+                    memcpy(s_debug_raw_frame, s_decoded_frame,
+                           decoded_width * decoded_height * 2);
+                }
+
+                line_vision_result_t line_result;
+                line_vision_process(s_decoded_frame, output.width,
+                                    output.height, &line_result);
+                camera_line_follow_submit(&line_result, captured_at_us);
+
+                const int64_t vision_done_us = esp_timer_get_time();
+                decode_time_us +=
+                    (uint64_t)(decode_done_us - decode_start_us);
+                vision_time_us +=
+                    (uint64_t)(vision_done_us - decode_done_us);
+                timed_frames++;
+                processed_frames++;
+                if (!tuner && vision_done_us - last_tft_preview_us >=
+                        TFT_PREVIEW_INTERVAL_US) {
+                    if (queue_tft_preview(s_decoded_frame, output.width,
+                                          output.height)) {
+                        last_tft_preview_us = vision_done_us;
+                    }
+                }
+                if (tuner && vision_done_us - last_tuner_us >=
+                        TUNER_INTERVAL_US) {
+                    emit_tuner_frame(s_debug_raw_frame, output.width,
+                                     output.height, &line_result);
+                    last_tuner_us = vision_done_us;
+                } else if (rgb_debug &&
+                           vision_done_us - last_rgb_debug_us >=
+                               RGB_DEBUG_INTERVAL_US) {
+                    emit_rgb_debug_frame(s_debug_raw_frame, output.width,
+                                         output.height, &line_result);
+                    last_rgb_debug_us = vision_done_us;
+                }
+
+                if (camera_line_follow_take_course_complete()) {
+                    const esp_err_t transition_error =
+                        transition_to_ball_capture();
+                    if (transition_error != ESP_OK) {
+                        s_operation_phase = OPERATION_ERROR;
+                        ESP_LOGE(TAG,
+                                 "BALL CAPTURE HANDOFF FAILED: %s; motors remain stopped",
+                                 esp_err_to_name(transition_error));
+                    }
+                }
+            } else {
             const bool rgb_debug = camera_line_follow_debug_enabled();
             const bool tuner = camera_line_follow_tuner_enabled();
             const bool push_debug = push_debug_stream_is_enabled();
@@ -2545,14 +2675,11 @@ static void frame_display_task(void *argument)
             }
 
             ball_vision_result_t red_ball_result;
-            ball_vision_result_t white_ball_result;
             ball_vision_result_t purple_ball_result;
             black_marker_result_t marker_result;
             quarter_goal_pose_result_t pose_result = {0};
             ball_vision_process(s_decoded_frame, output.width, output.height,
                                 &red_ball_result);
-            white_ball_vision_process(s_decoded_frame, output.width,
-                                      output.height, &white_ball_result);
             purple_ball_vision_process(s_decoded_frame, output.width,
                                        output.height, &purple_ball_result);
             black_marker_vision_process(s_decoded_frame, output.width,
@@ -2569,15 +2696,14 @@ static void frame_display_task(void *argument)
             if (!VISION_PREVIEW_ONLY) {
                 process_ball_capture_mission(
                     &mission, &s_slots[slot_index], &red_ball_result,
-                    &white_ball_result, &purple_ball_result,
-                    &marker_result, &pose_result,
+                    &purple_ball_result, &marker_result, &pose_result,
                     vision_now_us);
             }
 
             if (push_debug) {
                 queue_push_debug_frame(
                     s_debug_raw_frame, captured_at_us, &mission,
-                    &red_ball_result, &white_ball_result, &purple_ball_result,
+                    &red_ball_result, &purple_ball_result,
                     &marker_result, &pose_result);
             }
 
@@ -2585,9 +2711,6 @@ static void frame_display_task(void *argument)
                                            output.height, &pose_result);
             ball_vision_draw_overlay(s_decoded_frame, output.width,
                                      output.height, &red_ball_result);
-            ball_vision_draw_overlay_color(s_decoded_frame, output.width,
-                                           output.height, &white_ball_result,
-                                           0x07ff);
             purple_ball_vision_draw_overlay_color(
                 s_decoded_frame, output.width, output.height,
                 &purple_ball_result, 0xf81f);
@@ -2597,15 +2720,10 @@ static void frame_display_task(void *argument)
             if (vision_now_us - last_object_status_us >=
                     OBJECT_STATUS_INTERVAL_US) {
                 ESP_LOGD(TAG,
-                         "OBJECTS red=%d/%d center=(%d,%d) white=%d/%d center=(%d,%d) purple=%d/%d center=(%d,%d) goal=%d/%d center=(%d,%d) recent_goal=%d/%d localization=%s mission=%s",
+                         "OBJECTS red=%d/%d center=(%d,%d) purple=%d/%d center=(%d,%d) goal=%d/%d center=(%d,%d) recent_goal=%d/%d localization=%s mission=%s",
                          red_ball_result.found && !red_ball_result.predicted,
                          red_ball_result.confidence,
                          red_ball_result.center_x, red_ball_result.center_y,
-                         white_ball_result.found &&
-                             !white_ball_result.predicted,
-                         white_ball_result.confidence,
-                         white_ball_result.center_x,
-                         white_ball_result.center_y,
                          purple_ball_result.found &&
                              !purple_ball_result.predicted,
                          purple_ball_result.confidence,
@@ -2628,7 +2746,8 @@ static void frame_display_task(void *argument)
             processed_frames++;
             if (!tuner && vision_done_us - last_tft_preview_us >=
                     TFT_PREVIEW_INTERVAL_US) {
-                if (queue_tft_preview(s_decoded_frame)) {
+                if (queue_tft_preview(s_decoded_frame, output.width,
+                                      output.height)) {
                     last_tft_preview_us = vision_done_us;
                 }
             }
@@ -2645,6 +2764,7 @@ static void frame_display_task(void *argument)
                 emit_rgb_debug_frame(s_debug_raw_frame, output.width,
                                      output.height, &empty_result);
                 last_rgb_debug_us = vision_done_us;
+            }
             }
         } else {
             ESP_LOGW(TAG, "Frame conversion failed: %s, output=%ux%u",
@@ -2697,22 +2817,26 @@ static void frame_display_task(void *argument)
     }
 }
 
-static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot)
+static esp_err_t downsample_yuyv_luma(const mjpeg_slot_t *slot,
+                                      size_t output_width,
+                                      size_t output_height)
 {
     if (slot->format != UVC_FRAME_FORMAT_YUYV || slot->step == 0 ||
-        slot->width < DECODED_WIDTH || slot->height < DECODED_HEIGHT) {
+        output_width == 0 || output_height == 0 ||
+        output_width > DECODED_WIDTH || output_height > DECODED_HEIGHT ||
+        slot->width < output_width || slot->height < output_height) {
         return ESP_ERR_INVALID_ARG;
     }
-    for (size_t y = 0; y < DECODED_HEIGHT; ++y) {
-        const size_t source_y = y * slot->height / DECODED_HEIGHT;
+    for (size_t y = 0; y < output_height; ++y) {
+        const size_t source_y = y * slot->height / output_height;
         const uint8_t *source_row = slot->data + source_y * slot->step;
-        for (size_t x = 0; x < DECODED_WIDTH; ++x) {
-            const size_t source_x = x * slot->width / DECODED_WIDTH;
+        for (size_t x = 0; x < output_width; ++x) {
+            const size_t source_x = x * slot->width / output_width;
             const uint8_t luminance = source_row[source_x * 2];
             const uint16_t gray = ((uint16_t)(luminance >> 3) << 11) |
                                   ((uint16_t)(luminance >> 2) << 5) |
                                   (luminance >> 3);
-            const size_t destination = 2 * (y * DECODED_WIDTH + x);
+            const size_t destination = 2 * (y * output_width + x);
             s_decoded_frame[destination] = gray >> 8;
             s_decoded_frame[destination + 1] = gray & 0xff;
         }
@@ -2787,7 +2911,8 @@ static esp_err_t initialize_frame_pipeline(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG,
-             "PIPELINE decode/path-pursuit=core1 async-TFT=core0 frame=%dx%d queue=latest",
+             "PIPELINE decode/path-pursuit=core1 async-TFT=core0 line=%dx%d ball=%dx%d queue=latest",
+             LINE_DECODED_WIDTH, LINE_DECODED_HEIGHT,
              DECODED_WIDTH, DECODED_HEIGHT);
     return ESP_OK;
 }
@@ -2849,7 +2974,7 @@ void app_main(void)
         ESP_LOGI(TAG, "VISION_PREVIEW_ONLY: TFT object overlays; motors disabled");
     } else {
         ESP_LOGI(TAG,
-                 "Integrated object recognition, one-shot visual pose correction and waypoint navigation");
+                 "Integrated 9.2 LJ line following then ball capture");
     }
     ESP_LOGI(TAG, "UART0: TX=GPIO43 RX=GPIO44 baud=%d",
              CAMERA_CALIBRATION_ONLY ? CALIBRATION_UART_BAUD : 115200);
@@ -2863,30 +2988,30 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(initialize_motor_safe_stop());
+    s_post_navigation_initialized = false;
     if (CAMERA_CALIBRATION_ONLY) {
+        s_operation_phase = OPERATION_ERROR;
         ESP_LOGW(TAG,
                  "CALIBRATION_ONLY: motors stopped; TFT, vision and odometry disabled");
         ESP_ERROR_CHECK(initialize_calibration_uart());
     } else {
+        s_operation_phase = VISION_PREVIEW_ONLY
+            ? OPERATION_BALL_CAPTURE : OPERATION_LINE_FOLLOW;
         ESP_ERROR_CHECK(push_debug_stream_init());
-        if (!VISION_PREVIEW_ONLY) {
-            ESP_ERROR_CHECK(post_line_odometry_init());
-            ESP_ERROR_CHECK(post_line_navigation_init(
-                INITIAL_FIELD_X_MM, INITIAL_FIELD_Y_MM,
-                INITIAL_FIELD_HEADING_DEG));
-        }
-        ESP_ERROR_CHECK(ball_vision_init(DECODED_WIDTH, DECODED_HEIGHT));
-        ESP_ERROR_CHECK(white_ball_vision_init(DECODED_WIDTH,
-                                                DECODED_HEIGHT));
-        ESP_ERROR_CHECK(purple_ball_vision_init(DECODED_WIDTH,
-                                                DECODED_HEIGHT));
-        ESP_ERROR_CHECK(black_marker_vision_init(DECODED_WIDTH,
-                                                  DECODED_HEIGHT));
-        black_marker_vision_set_logging(false);
-        quarter_goal_pose_set_single_corner_mode(true);
-        quarter_goal_pose_set_logging(false);
         ESP_ERROR_CHECK(camera_display_init());
         ESP_ERROR_CHECK(camera_display_show_waiting());
+        if (!VISION_PREVIEW_ONLY) {
+            ESP_ERROR_CHECK(line_vision_init(LINE_DECODED_WIDTH,
+                                             LINE_DECODED_HEIGHT));
+            ESP_ERROR_CHECK(camera_line_follow_init());
+        } else {
+            ESP_ERROR_CHECK(initialize_ball_capture_vision());
+        }
+        if (!VISION_PREVIEW_ONLY) {
+            ESP_LOGW(TAG,
+                     "PHASE=LINE_FOLLOW frame=%dx%d; auto-start after stable track detection",
+                     LINE_DECODED_WIDTH, LINE_DECODED_HEIGHT);
+        }
     }
     ESP_ERROR_CHECK(initialize_frame_pipeline());
 
@@ -2941,11 +3066,18 @@ void app_main(void)
                      s_stream_width, s_stream_height, s_stream_fps,
                      s_stream_format == UVC_FRAME_FORMAT_YUYV
                          ? "YUYV" : "MJPEG");
-            if (!CAMERA_CALIBRATION_ONLY && !VISION_PREVIEW_ONLY) {
-                post_line_navigation_start();
+            if (!CAMERA_CALIBRATION_ONLY &&
+                s_post_navigation_initialized) {
+                post_line_navigation_resume();
             }
             wait_for_uvc_event(UVC_DEVICE_DISCONNECTED);
-            if (!CAMERA_CALIBRATION_ONLY && !VISION_PREVIEW_ONLY) {
+            if (!CAMERA_CALIBRATION_ONLY &&
+                (s_operation_phase == OPERATION_LINE_FOLLOW ||
+                 s_operation_phase == OPERATION_LINE_HANDOFF)) {
+                camera_line_follow_camera_disconnected();
+            }
+            if (!CAMERA_CALIBRATION_ONLY &&
+                s_post_navigation_initialized) {
                 post_line_navigation_pause();
             }
             uvc_stop_streaming(device_handle);

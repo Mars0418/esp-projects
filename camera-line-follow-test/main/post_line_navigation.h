@@ -59,6 +59,8 @@ typedef struct {
 
 esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
                                     float initial_heading_deg);
+esp_err_t post_line_navigation_init_from_line_follow(
+    float initial_x_mm, float initial_y_mm, float initial_heading_deg);
 void post_line_navigation_start(void);
 void post_line_navigation_pause(void);
 void post_line_navigation_resume(void);

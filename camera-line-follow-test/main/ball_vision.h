@@ -22,11 +22,8 @@ typedef struct {
 } ball_vision_result_t;
 
 esp_err_t ball_vision_init(size_t width, size_t height);
-esp_err_t white_ball_vision_init(size_t width, size_t height);
 void ball_vision_process(const uint8_t *rgb565, size_t width, size_t height,
                          ball_vision_result_t *result);
-void white_ball_vision_process(const uint8_t *rgb565, size_t width,
-                               size_t height, ball_vision_result_t *result);
 void ball_vision_draw_overlay(uint8_t *rgb565, size_t width, size_t height,
                               const ball_vision_result_t *result);
 void ball_vision_draw_overlay_color(uint8_t *rgb565, size_t width,

@@ -95,8 +95,6 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"tracked_ball_field_mm\":[%d,%d]}"
         ",\"red\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
-        ",\"white\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
-        ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
         ",\"purple\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
         ",\"goal\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
@@ -123,11 +121,6 @@ static int build_metadata(char *buffer, size_t capacity,
         m->red_ball.center_x, m->red_ball.center_y,
         m->red_ball.left, m->red_ball.top,
         m->red_ball.right, m->red_ball.bottom,
-        m->white_ball.found, m->white_ball.predicted,
-        m->white_ball.confidence,
-        m->white_ball.center_x, m->white_ball.center_y,
-        m->white_ball.left, m->white_ball.top,
-        m->white_ball.right, m->white_ball.bottom,
         m->purple_ball.found, m->purple_ball.predicted,
         m->purple_ball.confidence,
         m->purple_ball.center_x, m->purple_ball.center_y,

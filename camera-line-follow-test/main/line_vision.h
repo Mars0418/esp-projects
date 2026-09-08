@@ -63,6 +63,7 @@ typedef struct {
 } line_vision_rgb_thresholds_t;
 
 esp_err_t line_vision_init(size_t width, size_t height);
+void line_vision_deinit(void);
 void line_vision_set_rgb_thresholds(uint8_t red, uint8_t green, uint8_t blue);
 line_vision_rgb_thresholds_t line_vision_get_rgb_thresholds(void);
 bool line_vision_pixel_selected(size_t pixel_index);

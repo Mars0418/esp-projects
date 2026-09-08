@@ -1055,38 +1055,41 @@ static void navigation_safety_uart_task(void *argument)
     }
 }
 
-esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
-                                    float initial_heading_deg)
+static esp_err_t post_line_navigation_init_internal(
+    float initial_x_mm, float initial_y_mm, float initial_heading_deg,
+    bool reuse_motor_hardware)
 {
     post_line_odometry_pose_t odometry;
     if (!post_line_odometry_get_pose(&odometry)) return ESP_ERR_INVALID_STATE;
 
-    set_output_low(DRIVER_STBY);
-    for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
-        set_output_low(s_motors[wheel].in1);
-        set_output_low(s_motors[wheel].in2);
-    }
-    const ledc_timer_config_t timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_TIMER_10_BIT,
-        .timer_num = LEDC_TIMER_0,
-        .freq_hz = 20000,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG,
-                        "navigation PWM timer failed");
-    for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
-        const ledc_channel_config_t channel = {
-            .gpio_num = s_motors[wheel].pwm,
+    if (!reuse_motor_hardware) {
+        set_output_low(DRIVER_STBY);
+        for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
+            set_output_low(s_motors[wheel].in1);
+            set_output_low(s_motors[wheel].in2);
+        }
+        const ledc_timer_config_t timer = {
             .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = s_motors[wheel].channel,
-            .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = LEDC_TIMER_0,
-            .duty = 0,
-            .hpoint = 0,
+            .duty_resolution = LEDC_TIMER_10_BIT,
+            .timer_num = LEDC_TIMER_0,
+            .freq_hz = 20000,
+            .clk_cfg = LEDC_AUTO_CLK,
         };
-        ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), TAG,
-                            "navigation PWM channel failed");
+        ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG,
+                            "navigation PWM timer failed");
+        for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
+            const ledc_channel_config_t channel = {
+                .gpio_num = s_motors[wheel].pwm,
+                .speed_mode = LEDC_LOW_SPEED_MODE,
+                .channel = s_motors[wheel].channel,
+                .intr_type = LEDC_INTR_DISABLE,
+                .timer_sel = LEDC_TIMER_0,
+                .duty = 0,
+                .hpoint = 0,
+            };
+            ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), TAG,
+                                "navigation PWM channel failed");
+        }
     }
     coast_motors();
 
@@ -1138,10 +1141,10 @@ esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
     const int64_t now_us = esp_timer_get_time();
     s_phase_started_us = now_us;
     reset_speed_pi(&odometry, now_us);
-    const esp_err_t uart_error = uart_driver_install(
-        UART_NUM_0, 1024, 0, 0, NULL, 0);
-    if (uart_error != ESP_OK && uart_error != ESP_ERR_INVALID_STATE) {
-        return uart_error;
+    if (!uart_is_driver_installed(UART_NUM_0)) {
+        const esp_err_t uart_error = uart_driver_install(
+            UART_NUM_0, 1024, 0, 0, NULL, 0);
+        if (uart_error != ESP_OK) return uart_error;
     }
     if (xTaskCreatePinnedToCore(navigation_task, "post_navigation", 6144,
                                 NULL, 6, NULL, 0) != pdPASS) {
@@ -1152,10 +1155,24 @@ esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGW(TAG,
-             "NAV_READY initial=(%d,%d,%ddeg) dynamic_commands=1 scale=60%%",
+             "NAV_READY initial=(%d,%d,%ddeg) dynamic_commands=1 scale=60%% motor_handoff=%d",
              (int)lroundf(initial_x_mm), (int)lroundf(initial_y_mm),
-             (int)lroundf(initial_heading_deg));
+             (int)lroundf(initial_heading_deg), reuse_motor_hardware);
     return ESP_OK;
+}
+
+esp_err_t post_line_navigation_init(float initial_x_mm, float initial_y_mm,
+                                    float initial_heading_deg)
+{
+    return post_line_navigation_init_internal(
+        initial_x_mm, initial_y_mm, initial_heading_deg, false);
+}
+
+esp_err_t post_line_navigation_init_from_line_follow(
+    float initial_x_mm, float initial_y_mm, float initial_heading_deg)
+{
+    return post_line_navigation_init_internal(
+        initial_x_mm, initial_y_mm, initial_heading_deg, true);
 }
 
 void post_line_navigation_start(void)

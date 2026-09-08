@@ -64,6 +64,7 @@
 #define FOLLOW_INTEGRAL_DIVISOR 800
 #define FOLLOW_MIN_CONFIDENCE 20
 #define FOLLOW_FRAME_TIMEOUT_MS 600
+#define AUTO_START_CONFIRM_FRAMES 3
 #define TURN_HINT_ERROR 650
 #define TURN_HINT_FAR_WEIGHT 40
 #define TURN_HINT_CONFIRM_FRAMES 2
@@ -298,6 +299,10 @@ static volatile bool s_enabled;
 static volatile bool s_debug_enabled;
 static volatile bool s_tuner_enabled;
 static volatile bool s_calibration_enabled;
+static volatile bool s_course_complete;
+static volatile bool s_handoff_requested;
+static volatile bool s_handoff_ready;
+static volatile bool s_auto_start_pending;
 static char s_uart_line[64];
 static size_t s_uart_line_length;
 
@@ -1143,8 +1148,11 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
                 OBSTACLE_FINAL_LOST_FRAMES) {
                 stop_motors();
                 s_enabled = false;
+                portENTER_CRITICAL(&s_result_lock);
+                s_course_complete = true;
+                portEXIT_CRITICAL(&s_result_lock);
                 ESP_LOGW(TAG,
-                         "FINAL black line lost for %d frames: stopped",
+                         "FINAL black line lost for %d frames: course complete",
                          obstacle->final_lost_frames);
                 return true;
             }
@@ -1534,6 +1542,10 @@ static void handle_uart_command(void)
     for (int index = 0; index < count; ++index) {
         const uint8_t value = input[index];
         if (value == 'f' || value == 'F') {
+            s_auto_start_pending = false;
+            portENTER_CRITICAL(&s_result_lock);
+            s_course_complete = false;
+            portEXIT_CRITICAL(&s_result_lock);
             if (s_tuner_enabled || s_calibration_enabled) {
                 s_enabled = false;
                 stop_motors();
@@ -1556,6 +1568,7 @@ static void handle_uart_command(void)
                          "START REFUSED: no fresh track under foot gate");
             }
         } else if (value == 'x' || value == 'X' || value == ' ') {
+            s_auto_start_pending = false;
             s_enabled = false;
             stop_motors();
             ESP_LOGW(TAG, "PATH PURSUIT STOPPED");
@@ -1581,8 +1594,16 @@ static void control_task(void *argument)
     uint32_t processed_sequence = 0;
     int64_t last_report_us = 0;
     bool previous_enabled = false;
+    int auto_start_frames = 0;
 
     while (true) {
+        if (s_handoff_requested) {
+            s_enabled = false;
+            stop_motors();
+            s_handoff_ready = true;
+            ESP_LOGW(TAG, "CONTROL HANDED OFF TO BALL CAPTURE");
+            vTaskDelete(NULL);
+        }
         handle_uart_command();
         line_vision_result_t result;
         int64_t frame_us;
@@ -1599,6 +1620,21 @@ static void control_task(void *argument)
         const bool line_valid = result_ready(&result, frame_us, now_us);
         const bool foot_valid = line_valid && result.foot_track_valid;
         const bool new_frame = sequence != processed_sequence;
+
+        if (s_auto_start_pending && !s_enabled && new_frame &&
+            !s_tuner_enabled && !s_calibration_enabled) {
+            auto_start_frames = foot_valid ? auto_start_frames + 1 : 0;
+            if (auto_start_frames >= AUTO_START_CONFIRM_FRAMES) {
+                portENTER_CRITICAL(&s_result_lock);
+                s_course_complete = false;
+                portEXIT_CRITICAL(&s_result_lock);
+                s_auto_start_pending = false;
+                s_enabled = true;
+                ESP_LOGW(TAG,
+                         "PATH PURSUIT AUTO-STARTED after %d stable track frames",
+                         auto_start_frames);
+            }
+        }
 
         if (s_enabled && !previous_enabled) {
             reset_controller(&controller);
@@ -1788,6 +1824,10 @@ static void control_task(void *argument)
 
 esp_err_t camera_line_follow_init(void)
 {
+    s_course_complete = false;
+    s_handoff_requested = false;
+    s_handoff_ready = false;
+    s_auto_start_pending = true;
     set_output_low(DRIVER_STBY);
     const motor_t *motors[] = {&s_motor_a, &s_motor_b, &s_motor_d};
     for (size_t index = 0; index < 3; ++index) {
@@ -1831,7 +1871,8 @@ esp_err_t camera_line_follow_init(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGW(TAG,
-             "SAFE STOP. F=start X/SPACE=stop RGB,r,g,b DEBUG/TUNER/CALIB,0/1");
+             "SAFE STOP until %d stable track frames; F=manual start X/SPACE=stop RGB,r,g,b DEBUG/TUNER/CALIB,0/1",
+             AUTO_START_CONFIRM_FRAMES);
     ESP_LOGI(TAG,
              "Foot-track controller: gate=center-half/12rows follow=%d correction<=%d antistall=%dms/+%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",
              FOLLOW_BASE_DUTY,
@@ -1873,6 +1914,8 @@ void camera_line_follow_camera_disconnected(void)
     s_latest_frame_us = 0;
     portEXIT_CRITICAL(&s_result_lock);
     s_enabled = false;
+    s_auto_start_pending = false;
+    s_course_complete = false;
     stop_motors();
 }
 
@@ -1889,6 +1932,37 @@ bool camera_line_follow_tuner_enabled(void)
 bool camera_line_follow_calibration_enabled(void)
 {
     return s_calibration_enabled;
+}
+
+bool camera_line_follow_take_course_complete(void)
+{
+    portENTER_CRITICAL(&s_result_lock);
+    const bool complete = s_course_complete;
+    s_course_complete = false;
+    portEXIT_CRITICAL(&s_result_lock);
+    return complete;
+}
+
+esp_err_t camera_line_follow_handoff(void)
+{
+    s_handoff_requested = true;
+    for (int attempt = 0; attempt < 50 && !s_handoff_ready; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!s_handoff_ready) {
+        stop_motors();
+        return ESP_ERR_TIMEOUT;
+    }
+
+    for (size_t wheel = 0; wheel < WHEEL_COUNT; ++wheel) {
+        ESP_RETURN_ON_ERROR(gpio_isr_handler_remove(
+                                s_encoders[wheel].phase_a),
+                            TAG, "remove encoder phase A handler failed");
+        ESP_RETURN_ON_ERROR(gpio_isr_handler_remove(
+                                s_encoders[wheel].phase_b),
+                            TAG, "remove encoder phase B handler failed");
+    }
+    return ESP_OK;
 }
 
 void camera_line_follow_get_encoder_counts(int32_t *count_a,
