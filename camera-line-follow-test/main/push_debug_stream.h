@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "line_vision.h"
 
 typedef struct {
     bool found;
@@ -19,6 +20,7 @@ typedef struct {
 } push_debug_detection_t;
 
 typedef struct {
+    const char *phase_name;
     int64_t captured_at_us;
     int64_t processed_at_us;
     int mission_state;
@@ -59,6 +61,18 @@ typedef struct {
     int encoder_delta_a;
     int encoder_delta_b;
     int encoder_delta_d;
+    int stall_pulse_mask;
+    line_vision_result_t line;
+    bool line_control_valid;
+    bool line_control_enabled;
+    const char *line_control_state_name;
+    int line_pwm_a;
+    int line_pwm_d;
+    int line_boost_a;
+    int line_boost_d;
+    int line_encoder_delta_a;
+    int line_encoder_delta_d;
+    int line_distance_mm;
 } push_debug_metadata_t;
 
 esp_err_t push_debug_stream_init(void);

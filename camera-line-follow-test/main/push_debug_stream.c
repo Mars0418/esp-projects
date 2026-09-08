@@ -16,23 +16,28 @@
 #define DEBUG_UART UART_NUM_0
 #define DEBUG_NORMAL_BAUD 115200
 #define DEBUG_STREAM_BAUD 921600
-#define DEBUG_WIDTH 160
-#define DEBUG_HEIGHT 120
-#define DEBUG_RGB565_BYTES (DEBUG_WIDTH * DEBUG_HEIGHT * 2)
-#define DEBUG_RGB332_BYTES (DEBUG_WIDTH * DEBUG_HEIGHT)
+#define DEBUG_MAX_WIDTH 160
+#define DEBUG_MAX_HEIGHT 120
+#define DEBUG_MAX_RGB565_BYTES (DEBUG_MAX_WIDTH * DEBUG_MAX_HEIGHT * 2)
+#define DEBUG_MAX_RGB332_BYTES (DEBUG_MAX_WIDTH * DEBUG_MAX_HEIGHT)
 #define DEBUG_SLOT_COUNT 2
-#define DEBUG_INTERVAL_US 250000
-#define DEBUG_METADATA_BYTES 1536
+#define DEBUG_LINE_INTERVAL_US 100000
+#define DEBUG_PUSH_INTERVAL_US 250000
+#define DEBUG_METADATA_BYTES 3072
 #define DEBUG_PREFIX_BYTES 20
 #define DEBUG_PACKET_BYTES \
-    (DEBUG_PREFIX_BYTES + DEBUG_METADATA_BYTES + DEBUG_RGB332_BYTES)
+    (DEBUG_PREFIX_BYTES + DEBUG_METADATA_BYTES + DEBUG_MAX_RGB332_BYTES)
 #define DEBUG_TX_DRAIN_MS 800
 
 typedef struct {
     uint8_t *rgb565;
+    size_t width;
+    size_t height;
     push_debug_metadata_t metadata;
+    char phase_name[24];
     char mission_state_name[32];
     char push_entry_name[32];
+    char line_control_state_name[24];
     bool busy;
 } debug_slot_t;
 
@@ -84,7 +89,8 @@ static int build_metadata(char *buffer, size_t capacity,
     const push_debug_metadata_t *m = &slot->metadata;
     return snprintf(
         buffer, capacity,
-        "{\"v\":1,\"seq\":%" PRIu32 ",\"capture_us\":%" PRId64
+        "{\"v\":1,\"seq\":%" PRIu32 ",\"phase\":\"%s\""
+        ",\"capture_us\":%" PRId64
         ",\"processed_us\":%" PRId64 ",\"emitted_us\":%" PRId64
         ",\"width\":%d,\"height\":%d,\"format\":\"RGB332\""
         ",\"stream\":{\"queued\":%" PRIu32 ",\"dropped\":%" PRIu32 "}"
@@ -107,9 +113,22 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"visual_target_mm\":[%d,%d]"
         ",\"reverse_stall_floor_pwm\":%d"
         ",\"wheel_pwm\":[%d,%d,%d]"
-        ",\"encoder_delta\":[%d,%d,%d]}}",
-        sequence, m->captured_at_us, m->processed_at_us, emitted_at_us,
-        DEBUG_WIDTH, DEBUG_HEIGHT, s_queued_frames, s_dropped_frames,
+        ",\"encoder_delta\":[%d,%d,%d]"
+        ",\"stall_pulse_mask\":%d}"
+        ",\"line\":{\"found\":%d,\"confidence\":%d"
+        ",\"threshold\":%d,\"contrast\":%d,\"area\":%d"
+        ",\"near\":[%d,%d],\"far\":[%d,%d]"
+        ",\"errors\":{\"lateral\":%d,\"heading\":%d,\"steering\":%d}"
+        ",\"foot\":{\"valid\":%d,\"centered\":%d,\"pixels\":%d"
+        ",\"center_pixels\":%d,\"path_length\":%d,\"error\":%d}"
+        ",\"turn\":{\"direction\":%d,\"angle_deg\":%d,\"confidence\":%d}"
+        ",\"control\":{\"valid\":%d,\"enabled\":%d,\"state\":\"%s\""
+        ",\"pwm\":[%d,%d],\"boost\":[%d,%d]"
+        ",\"encoder_delta\":[%d,%d],\"distance_mm\":%d}}}",
+        sequence, slot->phase_name,
+        m->captured_at_us, m->processed_at_us, emitted_at_us,
+        (int)slot->width, (int)slot->height,
+        s_queued_frames, s_dropped_frames,
         m->mission_state, slot->mission_state_name,
         m->push_entry, slot->push_entry_name, m->selected_ball,
         m->target_goal, m->ball_held, m->visual_goal_locked,
@@ -141,7 +160,25 @@ static int build_metadata(char *buffer, size_t capacity,
         (int)m->visual_target_forward_mm,
         m->reverse_stall_duty_floor,
         m->wheel_pwm_a, m->wheel_pwm_b, m->wheel_pwm_d,
-        m->encoder_delta_a, m->encoder_delta_b, m->encoder_delta_d);
+        m->encoder_delta_a, m->encoder_delta_b, m->encoder_delta_d,
+        m->stall_pulse_mask,
+        m->line.found, m->line.confidence, m->line.threshold,
+        m->line.contrast, m->line.component_area,
+        m->line.near_lookahead_x, m->line.near_lookahead_y,
+        m->line.lookahead_x, m->line.lookahead_y,
+        m->line.lateral_error, m->line.heading_error,
+        m->line.steering_error,
+        m->line.foot_track_valid, m->line.foot_track_centered,
+        m->line.foot_pixel_count, m->line.foot_center_pixel_count,
+        m->line.foot_path_length_pixels, m->line.foot_lateral_error,
+        m->line.turn_direction, m->line.turn_angle_deg,
+        m->line.turn_confidence,
+        m->line_control_valid, m->line_control_enabled,
+        slot->line_control_state_name,
+        m->line_pwm_a, m->line_pwm_d,
+        m->line_boost_a, m->line_boost_d,
+        m->line_encoder_delta_a, m->line_encoder_delta_d,
+        m->line_distance_mm);
 }
 
 static void release_slot(int slot_index)
@@ -176,21 +213,22 @@ static void debug_stream_task(void *argument)
         }
 
         uint8_t *rgb332 = s_packet + DEBUG_PREFIX_BYTES + metadata_length;
-        for (size_t pixel = 0; pixel < DEBUG_RGB332_BYTES; ++pixel) {
+        const size_t pixel_count = slot->width * slot->height;
+        for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
             rgb332[pixel] = rgb565_to_rgb332(slot->rgb565 + pixel * 2);
         }
 
         memcpy(s_packet, s_magic, sizeof(s_magic));
         write_u32_le(s_packet + 8, (uint32_t)metadata_length);
-        write_u32_le(s_packet + 12, DEBUG_RGB332_BYTES);
+        write_u32_le(s_packet + 12, (uint32_t)pixel_count);
         uint32_t crc = crc32_update(0xffffffffU,
                                     s_packet + DEBUG_PREFIX_BYTES,
                                     (size_t)metadata_length +
-                                        DEBUG_RGB332_BYTES) ^ 0xffffffffU;
+                                        pixel_count) ^ 0xffffffffU;
         write_u32_le(s_packet + 16, crc);
 
         const size_t packet_length = DEBUG_PREFIX_BYTES +
-            (size_t)metadata_length + DEBUG_RGB332_BYTES;
+            (size_t)metadata_length + pixel_count;
         if (s_enabled && uart_write_bytes(DEBUG_UART, s_packet,
                                           packet_length) < 0) {
             s_dropped_frames++;
@@ -207,7 +245,7 @@ esp_err_t push_debug_stream_init(void)
 
     for (int index = 0; index < DEBUG_SLOT_COUNT; ++index) {
         s_slots[index].rgb565 = heap_caps_malloc(
-            DEBUG_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            DEBUG_MAX_RGB565_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_slots[index].rgb565 == NULL) return ESP_ERR_NO_MEM;
     }
     s_packet = heap_caps_malloc(DEBUG_PACKET_BYTES,
@@ -258,9 +296,12 @@ bool push_debug_stream_queue_frame(const uint8_t *rgb565, size_t width,
                                    size_t height,
                                    const push_debug_metadata_t *metadata)
 {
+    const int64_t interval_us = width <= 80 && height <= 60
+        ? DEBUG_LINE_INTERVAL_US : DEBUG_PUSH_INTERVAL_US;
     if (!s_enabled || rgb565 == NULL || metadata == NULL ||
-        width != DEBUG_WIDTH || height != DEBUG_HEIGHT ||
-        metadata->processed_at_us - s_last_queued_us < DEBUG_INTERVAL_US) {
+        width == 0 || height == 0 ||
+        width > DEBUG_MAX_WIDTH || height > DEBUG_MAX_HEIGHT ||
+        metadata->processed_at_us - s_last_queued_us < interval_us) {
         return false;
     }
 
@@ -280,8 +321,13 @@ bool push_debug_stream_queue_frame(const uint8_t *rgb565, size_t width,
     }
 
     debug_slot_t *slot = &s_slots[slot_index];
-    memcpy(slot->rgb565, rgb565, DEBUG_RGB565_BYTES);
+    slot->width = width;
+    slot->height = height;
+    memcpy(slot->rgb565, rgb565, width * height * 2);
     slot->metadata = *metadata;
+    snprintf(slot->phase_name, sizeof(slot->phase_name), "%s",
+             metadata->phase_name != NULL ? metadata->phase_name : "UNKNOWN");
+    slot->metadata.phase_name = slot->phase_name;
     snprintf(slot->mission_state_name, sizeof(slot->mission_state_name),
              "%s", metadata->mission_state_name != NULL
                  ? metadata->mission_state_name : "UNKNOWN");
@@ -290,6 +336,12 @@ bool push_debug_stream_queue_frame(const uint8_t *rgb565, size_t width,
              "%s", metadata->push_entry_name != NULL
                  ? metadata->push_entry_name : "NONE");
     slot->metadata.push_entry_name = slot->push_entry_name;
+    snprintf(slot->line_control_state_name,
+             sizeof(slot->line_control_state_name), "%s",
+             metadata->line_control_state_name != NULL
+                 ? metadata->line_control_state_name : "NONE");
+    slot->metadata.line_control_state_name =
+        slot->line_control_state_name;
     if (xQueueSend(s_queue, &slot_index, 0) != pdPASS) {
         release_slot(slot_index);
         s_dropped_frames++;

@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "push_debug_stream.h"
 
 #define DRIVER_STBY GPIO_NUM_5
 
@@ -249,6 +250,7 @@ typedef struct {
     int near_samples;
     int align_direction;
     int align_attempts;
+    bool align_before_final;
     int reacquire_frames;
     int final_lost_frames;
     int latest_distance_mm;
@@ -293,6 +295,7 @@ static int s_forward_pi_output_d;
 
 static portMUX_TYPE s_result_lock = portMUX_INITIALIZER_UNLOCKED;
 static line_vision_result_t s_latest_result;
+static camera_line_follow_debug_status_t s_debug_status;
 static int64_t s_latest_frame_us;
 static uint32_t s_result_sequence;
 static volatile bool s_enabled;
@@ -700,6 +703,7 @@ static void start_obstacle_left(obstacle_controller_t *obstacle,
                                 int64_t now_us)
 {
     stop_motors();
+    obstacle->align_before_final = false;
     obstacle->state = OBSTACLE_STRAFE_LEFT;
     obstacle->state_started_us = now_us;
     obstacle->near_samples = 0;
@@ -717,6 +721,8 @@ static void start_obstacle_left(obstacle_controller_t *obstacle,
 static void start_obstacle_wait(obstacle_controller_t *obstacle,
                                 int64_t now_us)
 {
+    obstacle->align_before_final = false;
+    obstacle->align_attempts = 0;
     obstacle->state = OBSTACLE_WAIT_BEFORE_LEFT;
     obstacle->state_started_us = now_us;
     obstacle->near_samples = 0;
@@ -747,7 +753,8 @@ static void start_obstacle_alignment_pulse(
     drive_obstacle_alignment_pivot(obstacle->align_direction,
                                    OBSTACLE_ALIGN_PRIMARY_DUTY);
     ESP_LOGW(TAG,
-             "OBSTACLE ALIGN attempt=%d heading=%d direction=%d pulse=%d/%dms",
+             "OBSTACLE ALIGN phase=%s attempt=%d heading=%d direction=%d pulse=%d/%dms",
+             obstacle->align_before_final ? "RETURN_TO_LINE" : "PRE_BYPASS",
              obstacle->align_attempts, heading_error,
              obstacle->align_direction, OBSTACLE_ALIGN_PRIMARY_MS,
              OBSTACLE_ALIGN_COUNTER_MS);
@@ -985,6 +992,7 @@ static void start_final_forward(obstacle_controller_t *obstacle,
                                 pursuit_controller_t *controller,
                                 int64_t now_us)
 {
+    obstacle->align_before_final = false;
     obstacle->state = OBSTACLE_FINAL_FORWARD;
     obstacle->state_started_us = now_us;
     obstacle->final_lost_frames = 0;
@@ -994,6 +1002,17 @@ static void start_final_forward(obstacle_controller_t *obstacle,
     drive_wheels(controller->a_command, controller->d_command);
     ESP_LOGW(TAG,
              "OBSTACLE BYPASS COMPLETE: FINAL LINE FOLLOW, turns disabled");
+}
+
+static void continue_after_obstacle_alignment(
+    obstacle_controller_t *obstacle, pursuit_controller_t *controller,
+    int64_t now_us)
+{
+    if (obstacle->align_before_final) {
+        start_final_forward(obstacle, controller, now_us);
+    } else {
+        start_obstacle_left(obstacle, now_us);
+    }
 }
 
 /* Return true while the obstacle/final-course state machine owns all motors. */
@@ -1063,20 +1082,23 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
             ESP_LOGW(TAG,
                      "OBSTACLE ALIGN line unavailable after attempt=%d; continue",
                      obstacle->align_attempts);
-            start_obstacle_left(obstacle, now_us);
+            continue_after_obstacle_alignment(
+                obstacle, controller, now_us);
         } else if (abs(result->heading_error) <=
                        OBSTACLE_ALIGN_HEADING_DEADBAND) {
             ESP_LOGW(TAG,
                      "OBSTACLE ALIGN complete attempt=%d heading=%d",
                      obstacle->align_attempts, result->heading_error);
-            start_obstacle_left(obstacle, now_us);
+            continue_after_obstacle_alignment(
+                obstacle, controller, now_us);
         } else if (obstacle->align_attempts >=
                        OBSTACLE_ALIGN_MAX_ATTEMPTS) {
             ESP_LOGW(TAG,
                      "OBSTACLE ALIGN limit heading=%d attempts=%d; continue",
                      result->heading_error,
                      obstacle->align_attempts);
-            start_obstacle_left(obstacle, now_us);
+            continue_after_obstacle_alignment(
+                obstacle, controller, now_us);
         } else {
             start_obstacle_alignment_pulse(
                 obstacle, result->heading_error, now_us);
@@ -1135,7 +1157,23 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
             fail_obstacle_action(obstacle,
                                  "right wheels did not settle");
         } else if (wheels_have_settled(obstacle, now_us)) {
-            start_final_forward(obstacle, controller, now_us);
+            obstacle->align_before_final = true;
+            obstacle->align_attempts = 0;
+            if (line_valid && result->foot_track_valid &&
+                abs(result->heading_error) >
+                    OBSTACLE_ALIGN_HEADING_DEADBAND) {
+                ESP_LOGW(TAG,
+                         "OBSTACLE RETURN ALIGN heading=%d before final line follow",
+                         result->heading_error);
+                start_obstacle_alignment_pulse(
+                    obstacle, result->heading_error, now_us);
+            } else {
+                ESP_LOGW(TAG,
+                         "OBSTACLE RETURN ALIGN already acceptable heading=%d line=%d foot=%d",
+                         result->heading_error, line_valid,
+                         result->foot_track_valid);
+                start_final_forward(obstacle, controller, now_us);
+            }
         }
         return true;
     case OBSTACLE_FINAL_FORWARD:
@@ -1524,6 +1562,13 @@ static void process_uart_line(void)
             esp_log_level_set("*", ESP_LOG_INFO);
             ESP_LOGI(TAG, "RGB_DEBUG enabled=0; normal logs resumed");
         }
+    } else if (sscanf(s_uart_line, "VSTREAM,%d", &enabled) == 1) {
+        const esp_err_t error =
+            push_debug_stream_set_enabled(enabled != 0);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "VSTREAM command failed: %s",
+                     esp_err_to_name(error));
+        }
     } else if (strcmp(s_uart_line, "STATUS") == 0) {
         const line_vision_rgb_thresholds_t thresholds =
             line_vision_get_rgb_thresholds();
@@ -1793,14 +1838,30 @@ static void control_task(void *argument)
             }
         }
 
+        const char *state = obstacle.state != OBSTACLE_IDLE
+            ? obstacle_state_name(obstacle.state)
+            : (controller.pivot_active ? "PIVOT" :
+                (controller.turn_armed ? "READY" : "FOLLOW"));
+        camera_line_follow_debug_status_t debug_status = {
+            .valid = true,
+            .enabled = s_enabled,
+            .pwm_a = controller.a_command,
+            .pwm_d = controller.d_command,
+            .boost_a = controller.speed_pi_output_a,
+            .boost_d = controller.speed_pi_output_d,
+            .encoder_delta_a = controller.speed_delta_a,
+            .encoder_delta_d = controller.speed_delta_d,
+            .distance_mm = obstacle.latest_distance_mm,
+        };
+        snprintf(debug_status.state, sizeof(debug_status.state), "%s", state);
+        portENTER_CRITICAL(&s_result_lock);
+        s_debug_status = debug_status;
+        portEXIT_CRITICAL(&s_result_lock);
+
         if (now_us - last_report_us >=
             (int64_t)FOLLOW_STATUS_INTERVAL_MS * 1000) {
             const int64_t age_ms = frame_us > 0 ? (now_us - frame_us) / 1000
                                                 : -1;
-            const char *state = obstacle.state != OBSTACLE_IDLE
-                ? obstacle_state_name(obstacle.state)
-                : (controller.pivot_active ? "PIVOT" :
-                    (controller.turn_armed ? "READY" : "FOLLOW"));
             ESP_LOGI(TAG,
                      "RUN en=%d state=%s line=%d foot=%d err=%d corr=%d pwm=%d/%d boost=%d/%d enc=%d/%d dist=%dmm age=%lldms",
                      s_enabled,
@@ -1932,6 +1993,16 @@ bool camera_line_follow_tuner_enabled(void)
 bool camera_line_follow_calibration_enabled(void)
 {
     return s_calibration_enabled;
+}
+
+bool camera_line_follow_get_debug_status(
+    camera_line_follow_debug_status_t *status)
+{
+    if (status == NULL) return false;
+    portENTER_CRITICAL(&s_result_lock);
+    *status = s_debug_status;
+    portEXIT_CRITICAL(&s_result_lock);
+    return status->valid;
 }
 
 bool camera_line_follow_take_course_complete(void)

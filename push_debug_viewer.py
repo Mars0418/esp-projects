@@ -1,4 +1,4 @@
-"""Live, synchronized camera and navigation debugger for ball pushing."""
+"""Live, synchronized debugger for line following and ball capture."""
 
 from __future__ import annotations
 
@@ -193,7 +193,9 @@ class SerialWorker:
 
 
 class PushDebugViewer:
-    def __init__(self, root: tk.Tk, initial_port: str, repository: Path) -> None:
+    def __init__(
+        self, root: tk.Tk, initial_port: str, repository: Path, auto_connect: bool
+    ) -> None:
         self.root = root
         self.repository = repository
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -207,7 +209,7 @@ class PushDebugViewer:
         self.record_file = None
         self.record_directory: Path | None = None
 
-        root.title("ESP32 Push Vision Debugger")
+        root.title("ESP32 Integrated Mission Debugger")
         root.geometry("1040x700")
         root.minsize(900, 620)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -222,6 +224,8 @@ class PushDebugViewer:
         self._build_ui()
         self.refresh_ports()
         root.after(30, self._poll_events)
+        if auto_connect:
+            root.after(250, self.toggle_connection)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=10)
@@ -249,15 +253,15 @@ class PushDebugViewer:
 
         content = ttk.Panedwindow(outer, orient="horizontal")
         content.pack(fill="both", expand=True, pady=(10, 0))
-        image_panel = ttk.LabelFrame(
-            content, text="160x120 algorithm frame (pixel origin: top-left)", padding=8
+        self.image_panel = ttk.LabelFrame(
+            content, text="Algorithm frame", padding=8
         )
         details_panel = ttk.LabelFrame(content, text="Synchronized decision", padding=8)
-        content.add(image_panel, weight=3)
+        content.add(self.image_panel, weight=3)
         content.add(details_panel, weight=2)
 
         self.canvas = tk.Canvas(
-            image_panel, width=640, height=480, background="#111111",
+            self.image_panel, width=640, height=480, background="#111111",
             highlightthickness=0
         )
         self.canvas.pack(fill="both", expand=True)
@@ -327,8 +331,9 @@ class PushDebugViewer:
 
     def _start_recording(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.record_directory = self.repository / "captures" / f"push-debug-{stamp}"
+        self.record_directory = self.repository / "captures" / f"mission-debug-{stamp}"
         (self.record_directory / "frames").mkdir(parents=True, exist_ok=True)
+        (self.record_directory / "metadata").mkdir(parents=True, exist_ok=True)
         self.record_file = (self.record_directory / "telemetry.jsonl").open(
             "w", encoding="utf-8", buffering=1
         )
@@ -346,6 +351,7 @@ class PushDebugViewer:
                 if event == "frame":
                     frame = payload
                     assert isinstance(frame, DebugFrame)
+                    self._record_frame(frame)
                     if newest is not None:
                         self.host_dropped_frames += 1
                     newest = frame
@@ -378,12 +384,19 @@ class PushDebugViewer:
         offset_y = (canvas_height - shown_height) // 2
         self.canvas.delete("all")
         self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.photo)
-        self._draw_detection(metadata.get("goal"), "#ffd54f", scale, offset_x, offset_y)
-        self._draw_detection(metadata.get("red"), "#ff3b30", scale, offset_x, offset_y)
-        self._draw_detection(metadata.get("purple"), "#ff00ff", scale, offset_x, offset_y)
+        phase = str(metadata.get("phase", "BALL_CAPTURE"))
+        self.image_panel.configure(
+            text=f"{phase} algorithm frame ({width}x{height}, origin: top-left)"
+        )
+        if phase == "LINE_FOLLOW":
+            self._draw_line_result(metadata.get("line"), scale, offset_x, offset_y)
+        else:
+            self._draw_detection(metadata.get("goal"), "#ffd54f", scale, offset_x, offset_y)
+            self._draw_detection(metadata.get("red"), "#ff3b30", scale, offset_x, offset_y)
+            self._draw_detection(metadata.get("purple"), "#ff00ff", scale, offset_x, offset_y)
 
         goal = metadata.get("goal")
-        if isinstance(goal, dict) and goal.get("corner_found"):
+        if phase != "LINE_FOLLOW" and isinstance(goal, dict) and goal.get("corner_found"):
             corner = goal.get("corner", [-1, -1])
             if isinstance(corner, list) and len(corner) == 2:
                 x = offset_x + int(corner[0]) * scale
@@ -419,7 +432,33 @@ class PushDebugViewer:
 
         mission = metadata.get("mission", {})
         navigation = metadata.get("navigation", {})
-        if isinstance(mission, dict):
+        line = metadata.get("line", {})
+        if phase == "LINE_FOLLOW" and isinstance(line, dict):
+            foot = line.get("foot", {})
+            turn = line.get("turn", {})
+            control = line.get("control", {})
+            errors = line.get("errors", {})
+            self.mission_var.set(
+                f"Line: found {int(bool(line.get('found')))} | confidence "
+                f"{line.get('confidence', 0)} | threshold {line.get('threshold', 0)} | "
+                f"contrast {line.get('contrast', 0)}"
+            )
+            if isinstance(control, dict):
+                self.control_var.set(
+                    f"Control: {control.get('state', '?')} | enabled "
+                    f"{int(bool(control.get('enabled')))} | PWM {control.get('pwm', [])} | "
+                    f"boost {control.get('boost', [])} | enc {control.get('encoder_delta', [])} | "
+                    f"distance {control.get('distance_mm', -1)} mm"
+                )
+            if isinstance(foot, dict) and isinstance(turn, dict) and isinstance(errors, dict):
+                self.objects_var.set(
+                    f"Track: foot {int(bool(foot.get('valid')))} centered "
+                    f"{int(bool(foot.get('centered')))} | errors L/H/S="
+                    f"{errors.get('lateral', 0)}/{errors.get('heading', 0)}/"
+                    f"{errors.get('steering', 0)} | turn dir={turn.get('direction', 0)} "
+                    f"angle={turn.get('angle_deg', 0)} confidence={turn.get('confidence', 0)}"
+                )
+        elif isinstance(mission, dict):
             ball_names = {0: "NONE", 1: "RED", 3: "PURPLE"}
             goal_names = {0: "UPPER", 1: "LOWER"}
             selected = ball_names.get(int(mission.get("selected_ball", 0)), "?")
@@ -428,7 +467,7 @@ class PushDebugViewer:
                 f"Mission: {mission.get('state', '?')} | selected {selected} | "
                 f"goal {target} | ball held {int(bool(mission.get('ball_held')))}"
             )
-        if isinstance(navigation, dict):
+        if phase != "LINE_FOLLOW" and isinstance(navigation, dict):
             source = navigation.get("source", "?")
             pose = navigation.get("pose_mm_deg", [0, 0, 0])
             target = navigation.get("target_field_mm", [0, 0])
@@ -442,18 +481,46 @@ class PushDebugViewer:
                     f"target=({target[0]},{target[1]}), remaining={distance} mm"
                 )
             self.control_var.set(f"Control: {source} | {detail}")
-        self.objects_var.set(
-            "Objects: " + " | ".join(
-                self._object_summary(name, metadata.get(name))
-                for name in ("red", "purple", "goal")
+        if phase != "LINE_FOLLOW":
+            self.objects_var.set(
+                "Objects: " + " | ".join(
+                    self._object_summary(name, metadata.get(name))
+                    for name in ("red", "purple", "goal")
+                )
             )
-        )
 
         self.metadata_text.configure(state="normal")
         self.metadata_text.delete("1.0", "end")
         self.metadata_text.insert("1.0", json.dumps(metadata, indent=2, ensure_ascii=False))
         self.metadata_text.configure(state="disabled")
-        self._record_frame(frame, ppm)
+
+    def _draw_line_result(
+        self, value: object, scale: int, offset_x: int, offset_y: int
+    ) -> None:
+        if not isinstance(value, dict) or not value.get("found"):
+            return
+        near = value.get("near", [-1, -1])
+        far = value.get("far", [-1, -1])
+        if not (
+            isinstance(near, list)
+            and len(near) == 2
+            and isinstance(far, list)
+            and len(far) == 2
+        ):
+            return
+        nx, ny = int(near[0]), int(near[1])
+        fx, fy = int(far[0]), int(far[1])
+        if min(nx, ny, fx, fy) < 0:
+            return
+        nx = offset_x + nx * scale
+        ny = offset_y + ny * scale
+        fx = offset_x + fx * scale
+        fy = offset_y + fy * scale
+        self.canvas.create_line(nx, ny, fx, fy, fill="#00e5ff", width=2)
+        for x, y, color in ((nx, ny, "#00ff72"), (fx, fy, "#ffcc00")):
+            radius = max(3, scale)
+            self.canvas.create_line(x - radius, y, x + radius, y, fill=color, width=2)
+            self.canvas.create_line(x, y - radius, x, y + radius, fill=color, width=2)
 
     def _draw_detection(
         self, value: object, color: str, scale: int, offset_x: int, offset_y: int
@@ -481,13 +548,23 @@ class PushDebugViewer:
         center = value.get("center", [-1, -1])
         return f"{name}={int(real)}/{value.get('confidence', 0)}@{center}"
 
-    def _record_frame(self, frame: DebugFrame, ppm: bytes) -> None:
+    def _record_frame(self, frame: DebugFrame) -> None:
         if self.record_file is None or self.record_directory is None:
             return
         sequence = int(frame.metadata["seq"])
         self.record_file.write(json.dumps(frame.metadata, ensure_ascii=False) + "\n")
+        width = int(frame.metadata["width"])
+        height = int(frame.metadata["height"])
+        ppm = (
+            f"P6\n{width} {height}\n255\n".encode("ascii")
+            + rgb332_to_rgb888(frame.rgb332)
+        )
         frame_path = self.record_directory / "frames" / f"{sequence:08d}.ppm"
         frame_path.write_bytes(ppm)
+        metadata_path = self.record_directory / "metadata" / f"{sequence:08d}.json"
+        metadata_path.write_text(
+            json.dumps(frame.metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
     def close(self) -> None:
         self.disconnect()
@@ -497,6 +574,7 @@ class PushDebugViewer:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", default="", help="initial serial port, e.g. COM15")
+    parser.add_argument("--connect", action="store_true", help="connect on startup")
     return parser.parse_args()
 
 
@@ -504,7 +582,7 @@ def main() -> int:
     args = parse_args()
     repository = Path(__file__).resolve().parent
     root = tk.Tk()
-    PushDebugViewer(root, args.port.upper(), repository)
+    PushDebugViewer(root, args.port.upper(), repository, args.connect)
     root.mainloop()
     return 0
 

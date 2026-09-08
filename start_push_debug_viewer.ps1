@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$Port = ""
+    [string]$Port = "",
+    [switch]$AutoConnect
 )
 
 Set-StrictMode -Version Latest
@@ -43,6 +44,9 @@ if (-not $selectedPython) {
 $arguments = @(Join-Path $PSScriptRoot "push_debug_viewer.py")
 if ($Port) {
     $arguments += @("--port", $Port.ToUpperInvariant())
+}
+if ($AutoConnect) {
+    $arguments += "--connect"
 }
 
 Write-Host "Using Python at $selectedPython"

@@ -54,6 +54,9 @@
 #define NAV_VISUAL_PUSH_STALE_MS 500
 #define NAV_VISUAL_LATERAL_PULSE_MS 80
 #define NAV_VISUAL_CENTER_DEADBAND 0.0875f
+#define NAV_GOAL_BLOB_STEERING_PULSE_MS 100
+#define NAV_GOAL_BLOB_STEERING_KP 1.50f
+#define NAV_GOAL_BLOB_MAX_TURN 0.20f
 #define NAV_VISUAL_FORWARD_STOP_ERROR 0.30f
 #define NAV_VISUAL_LATERAL_FILTER_NEW 0.35f
 #define NAV_VISUAL_LATERAL_KP 1.50f
@@ -77,9 +80,13 @@
 #define NAV_SPEED_KI_DIV 120
 #define NAV_SPEED_INTEGRAL_LIMIT 3000
 #define NAV_SPEED_OUTPUT_LIMIT 60
-#define NAV_STALL_ENCODER_DELTA_MAX 1
-#define NAV_STALL_CONFIRM_MS 300
+#define NAV_STALL_ENCODER_DELTA_MAX 6
 #define NAV_STALL_KICK 30
+#define NAV_STALL_FULL_BOOST_MS 300
+#define NAV_STALL_PULSE_CONFIRM_MS 450
+#define NAV_STALL_PULSE_MS 120
+#define NAV_STALL_PULSE_COOLDOWN_MS 700
+#define NAV_STALL_PULSE_EXTRA_DUTY 60
 #define NAV_REVERSE_PROGRESS_EPSILON_MM 2.0f
 #define NAV_REVERSE_STALL_CONFIRM_MS 300
 #define NAV_REVERSE_STALL_DUTY_START 180
@@ -140,6 +147,7 @@ static float s_target_y_mm;
 static float s_target_heading_rad;
 static float s_target_tolerance_mm;
 static float s_command_scale;
+static bool s_push_b_only_steering;
 static int64_t s_command_timeout_us;
 static int64_t s_phase_started_us;
 static int64_t s_brake_until_us;
@@ -152,6 +160,9 @@ static int s_pi_output[NAV_WHEEL_COUNT];
 static int s_applied_duty[NAV_WHEEL_COUNT];
 static int s_encoder_delta[NAV_WHEEL_COUNT];
 static int64_t s_stall_started_us[NAV_WHEEL_COUNT];
+static int64_t s_stall_pulse_until_us[NAV_WHEEL_COUNT];
+static int64_t s_stall_pulse_next_us[NAV_WHEEL_COUNT];
+static int s_stall_pulse_mask;
 static uint32_t s_reverse_progress_command_id;
 static float s_reverse_progress_reference_mm;
 static int64_t s_reverse_progress_at_us;
@@ -248,6 +259,7 @@ static void prepare_motor(const navigation_motor_t *motor, int command)
 
 static void coast_motors(void)
 {
+    s_stall_pulse_mask = 0;
     for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
         prepare_motor(&s_motors[wheel], 0);
     }
@@ -256,6 +268,7 @@ static void coast_motors(void)
 
 static void brake_motors(void)
 {
+    s_stall_pulse_mask = 0;
     for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
         s_applied_duty[wheel] = 0;
         ESP_ERROR_CHECK(gpio_set_level(s_motors[wheel].in1, 1));
@@ -280,7 +293,10 @@ static void reset_speed_pi(const post_line_odometry_pose_t *odometry,
         s_pi_output[wheel] = 0;
         s_encoder_delta[wheel] = 0;
         s_stall_started_us[wheel] = 0;
+        s_stall_pulse_until_us[wheel] = 0;
+        s_stall_pulse_next_us[wheel] = 0;
     }
+    s_stall_pulse_mask = 0;
     s_last_pi_us = now_us;
 }
 
@@ -307,6 +323,8 @@ static void update_speed_pi(const float wheel_request[NAV_WHEEL_COUNT],
             s_integral[wheel] = 0;
             s_pi_output[wheel] = 0;
             s_stall_started_us[wheel] = 0;
+            s_stall_pulse_until_us[wheel] = 0;
+            s_stall_pulse_next_us[wheel] = 0;
             s_previous_sign[wheel] = sign;
             continue;
         }
@@ -320,16 +338,41 @@ static void update_speed_pi(const float wheel_request[NAV_WHEEL_COUNT],
                      s_integral[wheel] / NAV_SPEED_KI_DIV;
         output = clamp_int(output, -NAV_SPEED_OUTPUT_LIMIT,
                            NAV_SPEED_OUTPUT_LIMIT);
-        if (delta <= NAV_STALL_ENCODER_DELTA_MAX) {
+        const bool under_speed =
+            delta <= NAV_STALL_ENCODER_DELTA_MAX &&
+            delta * 4 < target * 3;
+        if (under_speed) {
             if (s_stall_started_us[wheel] == 0) {
                 s_stall_started_us[wheel] = now_us;
-            } else if (now_us - s_stall_started_us[wheel] >=
-                           (int64_t)NAV_STALL_CONFIRM_MS * 1000 &&
-                       output < NAV_STALL_KICK) {
-                output = NAV_STALL_KICK;
+            }
+            /* Match the line follower's proven start-up kick, then escalate
+             * deterministically instead of waiting for the PI integral. */
+            if (output < NAV_STALL_KICK) output = NAV_STALL_KICK;
+            const int64_t stalled_us =
+                now_us - s_stall_started_us[wheel];
+            if (stalled_us >=
+                    (int64_t)NAV_STALL_FULL_BOOST_MS * 1000) {
+                output = NAV_SPEED_OUTPUT_LIMIT;
+            }
+            if (stalled_us >=
+                    (int64_t)NAV_STALL_PULSE_CONFIRM_MS * 1000 &&
+                now_us >= s_stall_pulse_next_us[wheel]) {
+                s_stall_pulse_until_us[wheel] = now_us +
+                    (int64_t)NAV_STALL_PULSE_MS * 1000;
+                s_stall_pulse_next_us[wheel] = now_us +
+                    (int64_t)NAV_STALL_PULSE_COOLDOWN_MS * 1000;
+                ESP_LOGW(TAG,
+                         "STALL_PULSE wheel=%c duration=%dms duty=%d",
+                         wheel == WHEEL_A ? 'A' :
+                             (wheel == WHEEL_B ? 'B' : 'D'),
+                         NAV_STALL_PULSE_MS,
+                         clamp_int(s_motors[wheel].maximum_duty +
+                                       NAV_STALL_PULSE_EXTRA_DUTY,
+                                   0, 1023));
             }
         } else {
             s_stall_started_us[wheel] = 0;
+            s_stall_pulse_until_us[wheel] = 0;
         }
         s_pi_output[wheel] = output;
     }
@@ -393,9 +436,12 @@ static void apply_wheel_requests(
 {
     update_speed_pi(wheel_request, odometry, now_us);
     bool active = false;
+    int pulse_mask = 0;
     for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
         const float magnitude = fabsf(wheel_request[wheel]);
         if (magnitude < NAV_COMPONENT_DEADBAND) {
+            s_stall_pulse_until_us[wheel] = 0;
+            s_stall_pulse_next_us[wheel] = 0;
             prepare_motor(&s_motors[wheel], 0);
             continue;
         }
@@ -409,10 +455,19 @@ static void apply_wheel_requests(
                              motor->minimum_duty,
                              NAV_REVERSE_STALL_DUTY_MAX);
         }
+        const int request_sign = wheel_request[wheel] > 0.0f ? 1 : -1;
+        if (request_sign == s_previous_sign[wheel] &&
+            now_us < s_stall_pulse_until_us[wheel]) {
+            duty = clamp_int(
+                motor->maximum_duty + NAV_STALL_PULSE_EXTRA_DUTY,
+                motor->minimum_duty, 1023);
+            pulse_mask |= 1 << wheel;
+        }
         const int signed_duty = wheel_request[wheel] > 0.0f ? duty : -duty;
         prepare_motor(motor, signed_duty);
         active = true;
     }
+    s_stall_pulse_mask = pulse_mask;
     ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY, active ? 1 : 0));
 }
 
@@ -485,7 +540,7 @@ static void apply_path_request(
 static void apply_visual_goal_request(
     float right_mm, float forward_mm, float steering_weight,
     const post_line_odometry_pose_t *odometry, int64_t now_us,
-    float command_scale, uint32_t command_id)
+    float command_scale, bool b_only_steering, uint32_t command_id)
 {
     const float safe_forward = fmaxf(forward_mm, 50.0f);
     float angle_error = atan2f(right_mm, safe_forward);
@@ -497,23 +552,29 @@ static void apply_visual_goal_request(
         -NAV_VISUAL_GOAL_MAX_TURN, NAV_VISUAL_GOAL_MAX_TURN) *
         steering_weight;
     const float absolute_angle = fabsf(angle_error);
-    float forward_scale = absolute_angle <=
-            NAV_VISUAL_GOAL_FULL_SPEED_RAD
-        ? 1.0f
-        : clamp_float(
-              1.0f - (absolute_angle - NAV_VISUAL_GOAL_FULL_SPEED_RAD) /
-                  (NAV_VISUAL_GOAL_SLOW_ANGLE_RAD -
-                   NAV_VISUAL_GOAL_FULL_SPEED_RAD),
-              NAV_VISUAL_GOAL_MIN_FORWARD, 1.0f);
-    forward_scale = fmaxf(
-        NAV_VISUAL_GOAL_MIN_FORWARD,
-        forward_scale *
-            (NAV_VISUAL_GOAL_MIN_FORWARD +
-             (1.0f - NAV_VISUAL_GOAL_MIN_FORWARD) * steering_weight));
+    float forward_scale = 1.0f;
+    if (!b_only_steering) {
+        forward_scale = absolute_angle <=
+                NAV_VISUAL_GOAL_FULL_SPEED_RAD
+            ? 1.0f
+            : clamp_float(
+                  1.0f - (absolute_angle -
+                          NAV_VISUAL_GOAL_FULL_SPEED_RAD) /
+                      (NAV_VISUAL_GOAL_SLOW_ANGLE_RAD -
+                       NAV_VISUAL_GOAL_FULL_SPEED_RAD),
+                  NAV_VISUAL_GOAL_MIN_FORWARD, 1.0f);
+        forward_scale = fmaxf(
+            NAV_VISUAL_GOAL_MIN_FORWARD,
+            forward_scale *
+                (NAV_VISUAL_GOAL_MIN_FORWARD +
+                 (1.0f - NAV_VISUAL_GOAL_MIN_FORWARD) *
+                     steering_weight));
+    }
+    const float front_turn = b_only_steering ? 0.0f : turn;
     float wheel_request[NAV_WHEEL_COUNT] = {
-        0.8660254f * forward_scale + turn,
+        0.8660254f * forward_scale + front_turn,
         turn,
-        -0.8660254f * forward_scale + turn,
+        -0.8660254f * forward_scale + front_turn,
     };
     if (navigation_motion_allowed(command_id)) {
         apply_scaled_wheel_requests(wheel_request, odometry, now_us,
@@ -575,6 +636,7 @@ static void publish_pose(post_line_navigation_pose_t pose,
     pose.encoder_delta_a = s_encoder_delta[WHEEL_A];
     pose.encoder_delta_b = s_encoder_delta[WHEEL_B];
     pose.encoder_delta_d = s_encoder_delta[WHEEL_D];
+    pose.stall_pulse_mask = s_stall_pulse_mask;
     portENTER_CRITICAL(&s_lock);
     if (anchor_revision != s_anchor_revision) {
         portEXIT_CRITICAL(&s_lock);
@@ -629,6 +691,7 @@ static void navigation_task(void *argument)
         float target_heading;
         float target_tolerance;
         float command_scale;
+        bool push_b_only_steering;
         int64_t command_timeout_us;
         int64_t phase_started_us;
         int64_t brake_until_us;
@@ -659,6 +722,7 @@ static void navigation_task(void *argument)
         target_heading = s_target_heading_rad;
         target_tolerance = s_target_tolerance_mm;
         command_scale = s_command_scale;
+        push_b_only_steering = s_push_b_only_steering;
         command_timeout_us = s_command_timeout_us;
         phase_started_us = s_phase_started_us;
         brake_until_us = s_brake_until_us;
@@ -692,6 +756,10 @@ static void navigation_task(void *argument)
         const bool visual_lateral_pulse = visual_push_active &&
             now_us - visual_push_updated_us <=
                 (int64_t)NAV_VISUAL_LATERAL_PULSE_MS * 1000;
+        const bool visual_goal_blob_pulse =
+            visual_push_active && push_b_only_steering &&
+            now_us - visual_push_updated_us <=
+                (int64_t)NAV_GOAL_BLOB_STEERING_PULSE_MS * 1000;
         const bool visual_goal_active =
             command == POST_NAV_COMMAND_PUSH && visual_goal_mode;
         const int64_t visual_goal_age_us = visual_goal_active
@@ -720,7 +788,10 @@ static void navigation_task(void *argument)
         const float visual_goal_forward_mm =
             cosf(pose.heading_rad) * visual_goal_dx +
             sinf(pose.heading_rad) * visual_goal_dy;
-        pose.visual_control_active = visual_goal_fresh && started &&
+        const bool visual_push_control_active = push_b_only_steering
+            ? visual_goal_blob_pulse : visual_push_active;
+        pose.visual_control_active =
+            (visual_goal_fresh || visual_push_control_active) && started &&
             !stopped && !paused && !settling;
         pose.visual_target_right_mm = visual_goal_right_mm;
         pose.visual_target_forward_mm = visual_goal_forward_mm;
@@ -879,7 +950,8 @@ static void navigation_task(void *argument)
                     apply_visual_goal_request(
                         visual_goal_right_mm, visual_goal_forward_mm,
                         1.0f, &odometry, now_us,
-                        command_scale, command_id);
+                        command_scale, push_b_only_steering,
+                        command_id);
                 } else if (path_command) {
                     if (distance <= target_tolerance) {
                         if (path_require_final_heading) {
@@ -930,16 +1002,30 @@ static void navigation_task(void *argument)
                         NAV_DRIVE_HEADING_DEADBAND_RAD) {
                         heading_error = 0.0f;
                     }
-                    const float turn = clamp_float(
-                        NAV_HEADING_KP * heading_error,
-                        -NAV_MAX_TURN_COMPONENT, NAV_MAX_TURN_COMPONENT);
+                    float turn = push_b_only_steering
+                        ? 0.0f
+                        : clamp_float(
+                              NAV_HEADING_KP * heading_error,
+                              -NAV_MAX_TURN_COMPONENT,
+                              NAV_MAX_TURN_COMPONENT);
                     float body_right = 0.0f;
                     float forward_scale = translation_scale * drive_direction;
                     if (visual_push_active) {
                         const float absolute_error =
                             fabsf(visual_push_right_error);
-                        if (absolute_error <=
-                                NAV_VISUAL_CENTER_DEADBAND) {
+                        if (push_b_only_steering) {
+                            if (visual_goal_blob_pulse) {
+                                turn = absolute_error <=
+                                        NAV_VISUAL_CENTER_DEADBAND
+                                    ? 0.0f
+                                    : clamp_float(
+                                          NAV_GOAL_BLOB_STEERING_KP *
+                                              visual_push_right_error,
+                                          -NAV_GOAL_BLOB_MAX_TURN,
+                                          NAV_GOAL_BLOB_MAX_TURN);
+                            }
+                        } else if (absolute_error <=
+                                       NAV_VISUAL_CENTER_DEADBAND) {
                             body_right = 0.0f;
                         } else {
                             if (visual_lateral_pulse) {
@@ -965,12 +1051,16 @@ static void navigation_task(void *argument)
                             forward_scale *= centering_progress;
                         }
                     }
+                    const float front_turn =
+                        command == POST_NAV_COMMAND_PUSH &&
+                                push_b_only_steering
+                            ? 0.0f : turn;
                     float wheel_request[NAV_WHEEL_COUNT] = {
                         -0.5f * body_right +
-                            0.8660254f * forward_scale + turn,
+                            0.8660254f * forward_scale + front_turn,
                         body_right + turn,
                         -0.5f * body_right -
-                            0.8660254f * forward_scale + turn,
+                            0.8660254f * forward_scale + front_turn,
                     };
                     if (navigation_motion_allowed(command_id)) {
                         const int minimum_active_duty = reverse_drive
@@ -1002,6 +1092,14 @@ static void navigation_task(void *argument)
                          (int)lroundf(status.y_mm),
                          (int)lroundf(visual_goal_right_mm),
                          (int)lroundf(visual_goal_forward_mm));
+            } else if (visual_push_control_active) {
+                ESP_LOGI(TAG,
+                         "CONTROL source=%s odometry=(x=%dmm,y=%dmm) horizontal_error=%d%%",
+                         push_b_only_steering
+                             ? "VISION_GOAL_BLOB" : "VISION_BALL",
+                         (int)lroundf(status.x_mm),
+                         (int)lroundf(status.y_mm),
+                         (int)lroundf(visual_push_right_error * 100.0f));
             } else {
                 ESP_LOGI(TAG,
                          "CONTROL source=ODOMETRY odometry=(x=%dmm,y=%dmm)",
@@ -1137,6 +1235,7 @@ static esp_err_t post_line_navigation_init_internal(
     s_target_heading_rad = initial_heading_deg * NAV_PI / 180.0f;
     s_target_tolerance_mm = 45.0f;
     s_command_scale = NAV_COMMAND_SCALE;
+    s_push_b_only_steering = false;
     s_command_timeout_us = (int64_t)NAV_MOVE_TIMEOUT_MS * 1000;
     const int64_t now_us = esp_timer_get_time();
     s_phase_started_us = now_us;
@@ -1299,7 +1398,9 @@ bool post_line_navigation_rotate_to(float heading_deg, float speed_scale,
 
 bool post_line_navigation_push_to(float x_mm, float y_mm,
                                   float heading_deg, float tolerance_mm,
-                                  float speed_scale, uint32_t *command_id)
+                                  float speed_scale,
+                                  bool b_only_steering,
+                                  uint32_t *command_id)
 {
     if (!isfinite(x_mm) || !isfinite(y_mm) || !isfinite(heading_deg) ||
         tolerance_mm <= 0.0f || speed_scale <= 0.0f ||
@@ -1332,6 +1433,7 @@ bool post_line_navigation_push_to(float x_mm, float y_mm,
     s_target_heading_rad = normalize_radians(heading_deg * NAV_PI / 180.0f);
     s_target_tolerance_mm = tolerance_mm;
     s_command_scale = speed_scale;
+    s_push_b_only_steering = b_only_steering;
     s_command_timeout_us = (int64_t)NAV_MOVE_TIMEOUT_MS * 1000;
     s_paused = false;
     s_settling = false;
@@ -1347,11 +1449,12 @@ bool post_line_navigation_push_to(float x_mm, float y_mm,
     if (command_id) *command_id = issued_id;
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGW(TAG,
-             "PUSH_COMMAND id=%lu target=(%d,%d) heading=%ddeg tolerance=%d scale=%d%%",
+             "PUSH_COMMAND id=%lu target=(%d,%d) heading=%ddeg tolerance=%d scale=%d%% steering=%s",
              (unsigned long)issued_id, (int)lroundf(x_mm),
              (int)lroundf(y_mm), (int)lroundf(heading_deg),
              (int)lroundf(tolerance_mm),
-             (int)lroundf(speed_scale * 100.0f));
+             (int)lroundf(speed_scale * 100.0f),
+             b_only_steering ? "B_ONLY" : "THREE_WHEEL");
     return true;
 }
 
