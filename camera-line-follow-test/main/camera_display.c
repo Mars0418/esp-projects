@@ -1,6 +1,7 @@
 #include "camera_display.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -24,6 +25,37 @@
 static const char *TAG = "CAMERA_TFT";
 static spi_device_handle_t s_tft;
 static uint8_t *s_framebuffer;
+
+typedef struct {
+    char character;
+    uint8_t rows[7];
+} glyph_t;
+
+static const glyph_t s_font[] = {
+    {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+    {'+', {0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00}},
+    {'-', {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}},
+    {'0', {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}},
+    {'1', {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}},
+    {'2', {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}},
+    {'3', {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e}},
+    {'4', {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}},
+    {'5', {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e}},
+    {'6', {0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e}},
+    {'7', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}},
+    {'9', {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e}},
+    {'A', {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}},
+    {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}},
+    {'D', {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}},
+    {'I', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f}},
+    {'M', {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}},
+    {'O', {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
+    {'P', {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}},
+    {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}},
+    {'S', {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}},
+    {'T', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+};
 
 static esp_err_t tft_write(bool data_mode, const void *data, size_t length)
 {
@@ -106,6 +138,59 @@ static void set_pixel(size_t x, size_t y, uint16_t color)
     const size_t offset = 2 * (y * TFT_WIDTH + x);
     s_framebuffer[offset] = color >> 8;
     s_framebuffer[offset + 1] = color & 0xff;
+}
+
+static const uint8_t *font_rows(char character)
+{
+    for (size_t index = 0;
+         index < sizeof(s_font) / sizeof(s_font[0]); ++index) {
+        if (s_font[index].character == character) {
+            return s_font[index].rows;
+        }
+    }
+    return s_font[0].rows;
+}
+
+static void fill_rectangle(int x, int y, int width, int height,
+                           uint16_t color)
+{
+    for (int row = y; row < y + height; ++row) {
+        if (row < 0 || row >= TFT_HEIGHT) continue;
+        for (int column = x; column < x + width; ++column) {
+            if (column < 0 || column >= TFT_WIDTH) continue;
+            set_pixel((size_t)column, (size_t)row, color);
+        }
+    }
+}
+
+static void draw_character(int x, int y, char character, int scale,
+                           uint16_t color)
+{
+    const uint8_t *rows = font_rows(character);
+    for (int row = 0; row < 7; ++row) {
+        for (int column = 0; column < 5; ++column) {
+            if (rows[row] & (1U << (4 - column))) {
+                fill_rectangle(x + column * scale, y + row * scale,
+                               scale, scale, color);
+            }
+        }
+    }
+}
+
+static void draw_text(int x, int y, const char *text, int scale,
+                      uint16_t color)
+{
+    while (*text != '\0') {
+        draw_character(x, y, *text++, scale, color);
+        x += 6 * scale;
+    }
+}
+
+static int clamp_rpm(int rpm)
+{
+    if (rpm < -999) return -999;
+    if (rpm > 999) return 999;
+    return rpm;
 }
 
 esp_err_t camera_display_init(void)
@@ -198,49 +283,30 @@ esp_err_t camera_display_init(void)
     return ESP_OK;
 }
 
-esp_err_t camera_display_show_waiting(void)
+esp_err_t camera_display_show_telemetry(int rpm_a, int rpm_b, int rpm_d,
+                                        int distance_mm,
+                                        bool distance_valid)
 {
+    char line[16];
     memset(s_framebuffer, 0, TFT_WIDTH * TFT_HEIGHT * 2);
-    for (size_t y = 42; y < 118; ++y) {
-        for (size_t x = 18; x < 110; ++x) {
-            const bool border = x < 22 || x >= 106 || y < 46 || y >= 114;
-            set_pixel(x, y, border ? 0x07ff : 0x0010);
-        }
-    }
-    return tft_send_frame();
-}
 
-esp_err_t camera_display_show_rotated_rgb565(const uint8_t *pixels,
-                                              size_t width,
-                                              size_t height)
-{
-    ESP_RETURN_ON_FALSE(pixels != NULL && width <= TFT_HEIGHT &&
-                        height <= TFT_WIDTH, ESP_ERR_INVALID_ARG, TAG,
-                        "invalid camera frame dimensions");
+    fill_rectangle(2, 2, TFT_WIDTH - 4, 2, 0xffff);
+    fill_rectangle(2, TFT_HEIGHT - 4, TFT_WIDTH - 4, 2, 0xffff);
+    draw_text(10, 10, "MOTOR RPM", 2, 0xffff);
 
-    size_t scale = TFT_WIDTH / height;
-    const size_t vertical_scale = TFT_HEIGHT / width;
-    if (vertical_scale < scale) scale = vertical_scale;
-    if (scale == 0) scale = 1;
-    const size_t x_offset = (TFT_WIDTH - height * scale) / 2;
-    const size_t y_offset = (TFT_HEIGHT - width * scale) / 2;
-    memset(s_framebuffer, 0, TFT_WIDTH * TFT_HEIGHT * 2);
-    for (size_t source_y = 0; source_y < height; ++source_y) {
-        for (size_t source_x = 0; source_x < width; ++source_x) {
-            const size_t source_offset = 2 * (source_y * width + source_x);
-            const uint16_t color =
-                ((uint16_t)pixels[source_offset] << 8) |
-                pixels[source_offset + 1];
-            const size_t rotated_x = height - 1 - source_y;
-            const size_t rotated_y = source_x;
-            for (size_t scale_y = 0; scale_y < scale; ++scale_y) {
-                for (size_t scale_x = 0; scale_x < scale; ++scale_x) {
-                    set_pixel(x_offset + rotated_x * scale + scale_x,
-                              y_offset + rotated_y * scale + scale_y,
-                              color);
-                }
-            }
-        }
+    snprintf(line, sizeof(line), "A %+4d", clamp_rpm(rpm_a));
+    draw_text(16, 39, line, 2, 0x07ff);
+    snprintf(line, sizeof(line), "B %+4d", clamp_rpm(rpm_b));
+    draw_text(16, 65, line, 2, 0xfd20);
+    snprintf(line, sizeof(line), "D %+4d", clamp_rpm(rpm_d));
+    draw_text(16, 91, line, 2, 0x07e0);
+
+    if (distance_valid && distance_mm >= 0) {
+        if (distance_mm > 9999) distance_mm = 9999;
+        snprintf(line, sizeof(line), "DIST %d MM", distance_mm);
+    } else {
+        snprintf(line, sizeof(line), "DIST --- MM");
     }
+    draw_text(4, 126, line, 1, 0xffff);
     return tft_send_frame();
 }
