@@ -44,7 +44,8 @@
 #define ENCODER_D_PHASE_A_GPIO GPIO_NUM_2
 #define ENCODER_D_PHASE_B_GPIO GPIO_NUM_1
 
-#define FOLLOW_BASE_DUTY 170
+#define FOLLOW_BASE_DUTY 180
+#define FINAL_FOLLOW_BASE_DUTY 170
 #define FOLLOW_MIN_FORWARD_DUTY 150
 #define FOLLOW_MAX_FORWARD_DUTY 270
 #define FOLLOW_SPEED_PI_UPDATE_MS 150
@@ -55,7 +56,7 @@
 #define FOLLOW_SPEED_PI_INTEGRAL_MAX 3000
 #define FOLLOW_SPEED_PI_OUTPUT_MAX 50
 #define FOLLOW_SPEED_STALL_DELTA_MAX 6
-#define FOLLOW_SPEED_STALL_KICK 30
+#define FOLLOW_SPEED_STALL_KICK 40
 #define FOLLOW_PROPORTIONAL_GAIN 180
 #define FOLLOW_CORRECTION_MAX 120
 #define FOLLOW_CORRECTION_STEP 24
@@ -135,23 +136,13 @@
 #define OBSTACLE_REACQUIRE_CONFIRM_FRAMES 2
 #define OBSTACLE_CAMERA_CENTER_ERROR_MAX 260
 #define OBSTACLE_RIGHT_SYNC_CORRECTION_MAX 35
-#define OBSTACLE_RETURN_CENTER_ERROR_MAX 220
+#define OBSTACLE_RETURN_CENTER_ERROR_MAX 260
 #define OBSTACLE_RETURN_CENTER_PULSE_MS 80
 #define OBSTACLE_RETURN_CENTER_SPEED_PERCENT 100
 #define OBSTACLE_RETURN_READY_FRAMES 3
-#define OBSTACLE_RETURN_ALIGN_TIMEOUT_MS 6000
-#define OBSTACLE_RETURN_HEADING_JUMP_MAX 350
-#define OBSTACLE_HORIZONTAL_MIN_X_SPAN 6
-#define OBSTACLE_FINAL_CROSSBAR_FRAMES 2
-#define OBSTACLE_FINAL_CROSSING_DISTANCE_MM 80
-#define OBSTACLE_FINAL_WHEEL_DIAMETER_MM 55
-#define OBSTACLE_FINAL_CROSSING_TARGET_COUNTS \
-    ((ENCODER_COUNTS_PER_REV * OBSTACLE_FINAL_CROSSING_DISTANCE_MM * 113 + \
-      OBSTACLE_FINAL_WHEEL_DIAMETER_MM * 355 / 2) / \
-     (OBSTACLE_FINAL_WHEEL_DIAMETER_MM * 355))
-#define OBSTACLE_FINAL_CROSSING_DUTY 160
-#define OBSTACLE_FINAL_CROSSING_TIMEOUT_MS 2000
+#define OBSTACLE_RETURN_CHECK_TIMEOUT_MS 6000
 #define OBSTACLE_FINAL_BRAKE_MS 200
+#define OBSTACLE_FINAL_TIMEOUT_MS 10000
 #define OBSTACLE_FINAL_LOST_FRAMES 3
 
 #define KIWI_STRAFE_DIAGONAL_DUTY 150
@@ -261,7 +252,6 @@ typedef enum {
     OBSTACLE_STRAFE_RIGHT_SETTLE,
     OBSTACLE_RETURN_CENTER,
     OBSTACLE_FINAL_FORWARD,
-    OBSTACLE_FINAL_CROSSING,
     OBSTACLE_FINAL_BRAKE,
 } obstacle_state_t;
 
@@ -272,11 +262,9 @@ typedef struct {
     int align_attempts;
     int return_center_attempts;
     bool align_before_final;
-    bool return_heading_locked;
-    int return_heading_reference;
     int reacquire_frames;
-    int final_crossbar_frames;
     int final_lost_frames;
+    bool final_course_complete;
     int latest_distance_mm;
     int64_t next_ultrasonic_sample_us;
     int64_t state_started_us;
@@ -681,7 +669,6 @@ static const char *obstacle_state_name(obstacle_state_t state)
     case OBSTACLE_STRAFE_RIGHT_SETTLE: return "RIGHT_SETTLE";
     case OBSTACLE_RETURN_CENTER: return "RETURN_CENTER";
     case OBSTACLE_FINAL_FORWARD: return "FINAL";
-    case OBSTACLE_FINAL_CROSSING: return "FINAL_CROSS";
     case OBSTACLE_FINAL_BRAKE: return "FINAL_BRAKE";
     default: return "INVALID";
     }
@@ -1023,41 +1010,25 @@ static void start_final_forward(obstacle_controller_t *obstacle,
     obstacle->align_before_final = false;
     obstacle->state = OBSTACLE_FINAL_FORWARD;
     obstacle->state_started_us = now_us;
-    obstacle->final_crossbar_frames = 0;
     obstacle->final_lost_frames = 0;
+    obstacle->final_course_complete = false;
     reset_controller(controller);
-    controller->a_command = FOLLOW_BASE_DUTY;
-    controller->d_command = FOLLOW_BASE_DUTY;
+    controller->a_command = FINAL_FOLLOW_BASE_DUTY;
+    controller->d_command = FINAL_FOLLOW_BASE_DUTY;
     drive_wheels(controller->a_command, controller->d_command);
     ESP_LOGW(TAG,
              "OBSTACLE BYPASS COMPLETE: FINAL LINE FOLLOW, turns disabled");
 }
 
 static void start_final_brake(obstacle_controller_t *obstacle,
-                              const char *reason, int64_t now_us)
+                              const char *reason, int64_t now_us, bool complete)
 {
+    obstacle->final_course_complete = complete;
     obstacle->state = OBSTACLE_FINAL_BRAKE;
     obstacle->state_started_us = now_us;
     brake_motors();
     ESP_LOGW(TAG, "FINAL BRAKE reason=%s duration=%dms",
              reason, OBSTACLE_FINAL_BRAKE_MS);
-}
-
-static void start_final_crossing(obstacle_controller_t *obstacle,
-                                 pursuit_controller_t *controller,
-                                 int64_t now_us)
-{
-    obstacle->state = OBSTACLE_FINAL_CROSSING;
-    obstacle->state_started_us = now_us;
-    obstacle->forward_start_a_count = s_encoders[WHEEL_A].count;
-    obstacle->forward_start_d_count = s_encoders[WHEEL_D].count;
-    reset_controller(controller);
-    apply_tracking_control(0, OBSTACLE_FINAL_CROSSING_DUTY,
-                           controller);
-    ESP_LOGW(TAG,
-             "FINAL T crossbar confirmed: advance %dmm target=%d counts",
-             OBSTACLE_FINAL_CROSSING_DISTANCE_MM,
-             OBSTACLE_FINAL_CROSSING_TARGET_COUNTS);
 }
 
 static void start_return_alignment_check(
@@ -1066,17 +1037,6 @@ static void start_return_alignment_check(
     obstacle->state = OBSTACLE_ALIGN_SETTLE;
     obstacle->state_started_us = now_us;
     brake_motors();
-}
-
-static bool return_path_is_horizontal(
-    const line_vision_result_t *result)
-{
-    const int x_span = abs(
-        result->lookahead_x - result->near_lookahead_x);
-    const int y_span = abs(
-        result->lookahead_y - result->near_lookahead_y);
-    return x_span >= OBSTACLE_HORIZONTAL_MIN_X_SPAN &&
-           x_span * 5 >= y_span * 4;
 }
 
 static void start_return_center_pulse(
@@ -1174,9 +1134,9 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
         if (obstacle->align_before_final) {
             const int return_elapsed_ms = (int)(
                 (now_us - obstacle->return_align_started_us) / 1000);
-            if (return_elapsed_ms >= OBSTACLE_RETURN_ALIGN_TIMEOUT_MS) {
+            if (return_elapsed_ms >= OBSTACLE_RETURN_CHECK_TIMEOUT_MS) {
                 fail_obstacle_action(
-                    obstacle, "return visual alignment timeout");
+                    obstacle, "return line centering timeout");
                 return true;
             }
             if (!new_frame) return true;
@@ -1193,48 +1153,11 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
                     obstacle, result->foot_lateral_error, now_us);
                 return true;
             }
-            const bool horizontal_path =
-                return_path_is_horizontal(result);
-            if (horizontal_path &&
-                !obstacle->return_heading_locked) {
-                obstacle->return_heading_locked = true;
-                obstacle->return_heading_reference = 0;
-            }
-            const bool heading_jump =
-                !horizontal_path &&
-                obstacle->return_heading_locked &&
-                abs(result->heading_error -
-                    obstacle->return_heading_reference) >
-                    OBSTACLE_RETURN_HEADING_JUMP_MAX;
-            const bool heading_ignored =
-                horizontal_path || heading_jump;
-            if (!heading_ignored &&
-                abs(result->heading_error) >
-                    OBSTACLE_ALIGN_HEADING_DEADBAND) {
-                obstacle->reacquire_frames = 0;
-                start_obstacle_alignment_pulse(
-                    obstacle, result->heading_error, now_us);
-                return true;
-            }
-            if (!heading_ignored) {
-                if (!obstacle->return_heading_locked) {
-                    obstacle->return_heading_locked = true;
-                    obstacle->return_heading_reference =
-                        result->heading_error;
-                } else {
-                    obstacle->return_heading_reference =
-                        (3 * obstacle->return_heading_reference +
-                         result->heading_error) / 4;
-                }
-            }
+            /* After bypass, centre the foot line only. Branch-dependent
+             * lookahead headings must not trigger another pivot here. */
             obstacle->reacquire_frames++;
-            ESP_LOGI(TAG,
-                     "OBSTACLE RETURN READY lateral=%d heading=%d ignored=%s reference=%d stable=%d/%d",
-                     result->foot_lateral_error, result->heading_error,
-                     horizontal_path ? "HORIZONTAL" :
-                         (heading_jump ? "JUMP" : "NO"),
-                     obstacle->return_heading_reference,
-                     obstacle->reacquire_frames,
+            ESP_LOGI(TAG, "OBSTACLE RETURN READY lateral=%d stable=%d/%d; no heading pivot",
+                     result->foot_lateral_error, obstacle->reacquire_frames,
                      OBSTACLE_RETURN_READY_FRAMES);
             if (obstacle->reacquire_frames >=
                     OBSTACLE_RETURN_READY_FRAMES) {
@@ -1324,14 +1247,11 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
             obstacle->align_before_final = true;
             obstacle->align_attempts = 0;
             obstacle->return_center_attempts = 0;
-            obstacle->return_heading_locked = false;
-            obstacle->return_heading_reference = 0;
             obstacle->reacquire_frames = 0;
             obstacle->return_align_started_us = now_us;
             ESP_LOGW(TAG,
-                     "OBSTACLE RETURN ALIGN begin; require lateral<=%d heading<=%d stable=%d frames",
+                     "OBSTACLE RETURN CENTER CHECK lateral<=%d stable=%d frames; turns disabled",
                      OBSTACLE_RETURN_CENTER_ERROR_MAX,
-                     OBSTACLE_ALIGN_HEADING_DEADBAND,
                      OBSTACLE_RETURN_READY_FRAMES);
             start_return_alignment_check(obstacle, now_us);
         }
@@ -1345,74 +1265,36 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
         }
         return true;
     case OBSTACLE_FINAL_FORWARD:
+        if (elapsed_ms >= OBSTACLE_FINAL_TIMEOUT_MS) {
+            controller->a_command = controller->d_command = 0;
+            start_final_brake(obstacle, "final straight timeout; no ball handoff", now_us, false);
+            return true;
+        }
         if (new_frame) {
             const bool foot_valid =
                 line_valid && result->foot_track_valid;
-            const bool crossbar =
-                foot_valid && return_path_is_horizontal(result);
-            obstacle->final_crossbar_frames = crossbar
-                ? obstacle->final_crossbar_frames + 1 : 0;
             obstacle->final_lost_frames = foot_valid
                 ? 0 : obstacle->final_lost_frames + 1;
-            if (crossbar) {
-                brake_motors();
-                if (obstacle->final_crossbar_frames >=
-                    OBSTACLE_FINAL_CROSSBAR_FRAMES) {
-                    start_final_crossing(obstacle, controller, now_us);
-                } else {
-                    ESP_LOGI(TAG,
-                             "FINAL T crossbar candidate %d/%d: braking",
-                             obstacle->final_crossbar_frames,
-                             OBSTACLE_FINAL_CROSSBAR_FRAMES);
-                }
-                return true;
-            }
             if (obstacle->final_lost_frames >=
                 OBSTACLE_FINAL_LOST_FRAMES) {
-                start_final_brake(obstacle, "black line lost", now_us);
+                start_final_brake(obstacle, "black line lost", now_us, true);
                 return true;
             }
             if (foot_valid) {
                 /* Reuse ordinary foot-position correction, but deliberately
                  * skip all turn and pivot states. */
                 apply_tracking_control(result->foot_lateral_error,
-                                       FOLLOW_BASE_DUTY, controller);
+                                       FINAL_FOLLOW_BASE_DUTY, controller);
                 return true;
             }
-            /* Do not repeat the last boosted PWM while confirming that the
-             * finish line has disappeared. */
+            /* Keep stopped between missing frames as well as on each frame. */
+            controller->a_command = controller->d_command = 0;
             brake_motors();
             return true;
         }
-        drive_wheels(controller->a_command, controller->d_command);
+        if (obstacle->final_lost_frames > 0) brake_motors();
+        else drive_wheels(controller->a_command, controller->d_command);
         return true;
-    case OBSTACLE_FINAL_CROSSING: {
-        const int progress_a = abs(
-            s_encoders[WHEEL_A].count -
-            obstacle->forward_start_a_count);
-        const int progress_d = abs(
-            s_encoders[WHEEL_D].count -
-            obstacle->forward_start_d_count);
-        const int progress = (progress_a + progress_d) / 2;
-        if (progress >= OBSTACLE_FINAL_CROSSING_TARGET_COUNTS) {
-            ESP_LOGW(TAG,
-                     "FINAL crossing reached A=%d D=%d average=%d",
-                     progress_a, progress_d, progress);
-            start_final_brake(obstacle, "vehicle center at finish",
-                              now_us);
-            return true;
-        }
-        if (elapsed_ms >= OBSTACLE_FINAL_CROSSING_TIMEOUT_MS) {
-            ESP_LOGW(TAG,
-                     "FINAL crossing timeout A=%d D=%d average=%d; stopping",
-                     progress_a, progress_d, progress);
-            start_final_brake(obstacle, "crossing timeout", now_us);
-            return true;
-        }
-        apply_tracking_control(0, OBSTACLE_FINAL_CROSSING_DUTY,
-                               controller);
-        return true;
-    }
     case OBSTACLE_FINAL_BRAKE:
         if (elapsed_ms < OBSTACLE_FINAL_BRAKE_MS) {
             brake_motors();
@@ -1421,9 +1303,9 @@ static bool update_obstacle_action(obstacle_controller_t *obstacle,
         stop_motors();
         s_enabled = false;
         portENTER_CRITICAL(&s_result_lock);
-        s_course_complete = true;
+        s_course_complete = obstacle->final_course_complete;
         portEXIT_CRITICAL(&s_result_lock);
-        ESP_LOGW(TAG, "FINAL STOP complete; handing off to ball capture");
+        ESP_LOGW(TAG, "FINAL STOP handoff=%d", obstacle->final_course_complete);
         return true;
     default:
         fail_obstacle_action(obstacle, "invalid obstacle state");
@@ -2109,7 +1991,7 @@ esp_err_t camera_line_follow_init(void)
     s_course_complete = false;
     s_handoff_requested = false;
     s_handoff_ready = false;
-    s_auto_start_pending = true;
+    s_auto_start_pending = !INTEGRATED_SIMPLE_MISSION;
     set_output_low(DRIVER_STBY);
     const motor_t *motors[] = {&s_motor_a, &s_motor_b, &s_motor_d};
     for (size_t index = 0; index < 3; ++index) {

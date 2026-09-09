@@ -40,6 +40,7 @@ typedef struct {
     push_debug_detection_t goal;
     bool corner_found;
     int corner_confidence;
+    int goal_ball_gap_mm;
     int corner_x;
     int corner_y;
     bool navigation_valid;

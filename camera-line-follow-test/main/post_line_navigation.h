@@ -22,6 +22,7 @@ typedef enum {
     POST_NAV_COMMAND_PUSH,
     POST_NAV_COMMAND_REVERSE,
     POST_NAV_COMMAND_PATH,
+    POST_NAV_COMMAND_VISUAL_PULSE,
 } post_line_navigation_command_t;
 
 #define POST_LINE_NAVIGATION_MAX_PATH_POINTS 8
@@ -66,6 +67,11 @@ void post_line_navigation_start(void);
 void post_line_navigation_pause(void);
 void post_line_navigation_resume(void);
 void post_line_navigation_stop(void);
+void post_line_navigation_stop_at_goal(void);
+void post_line_navigation_pause_at_goal(void);
+bool post_line_navigation_take_simple_start(void);
+bool post_line_navigation_visual_pulse(float forward, float right, float turn, bool rear_only,
+                                       int duration_ms, float speed_scale);
 bool post_line_navigation_move_to(float x_mm, float y_mm,
                                   float tolerance_mm, float speed_scale,
                                   uint32_t *command_id);
@@ -91,3 +97,6 @@ bool post_line_navigation_correct_pose(float x_mm, float y_mm,
                                        float heading_deg);
 bool post_line_navigation_get_pose(post_line_navigation_pose_t *pose);
 const char *post_line_navigation_state_name(post_line_navigation_state_t state);
+
+/* Keep a camera-driven autonomous command alive for at most another 500 ms. */
+void post_line_navigation_refresh_camera_guard(uint32_t command_id);

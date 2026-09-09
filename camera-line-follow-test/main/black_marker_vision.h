@@ -40,3 +40,5 @@ goal_dark_thresholds_t black_marker_vision_get_thresholds(void);
 void black_marker_vision_set_thresholds(goal_dark_thresholds_t thresholds);
 void black_marker_vision_set_logging(bool enabled);
 bool black_marker_vision_pixel_is_goal(const uint8_t *rgb565, size_t index);
+
+void black_marker_vision_reset_tracking(void);

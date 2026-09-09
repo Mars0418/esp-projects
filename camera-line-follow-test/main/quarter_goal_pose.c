@@ -1094,3 +1094,30 @@ void quarter_goal_pose_draw_overlay(uint8_t *rgb565, size_t width,
                   result->origin_y_raw + delta, origin_color);
     }
 }
+
+bool quarter_goal_pose_ball_gap(const uint8_t *rgb565, size_t width, size_t height,
+    const black_marker_result_t *goal, float ball_right_mm, float ball_forward_mm,
+    float *gap_mm)
+{
+    if (!gap_mm) return false;
+    *gap_mm = INFINITY;
+    if (!rgb565 || !goal || !goal->found || goal->predicted ||
+        width != CALIBRATED_WIDTH || height != CALIBRATED_HEIGHT ||
+        !isfinite(ball_right_mm) || !isfinite(ball_forward_mm)) return false;
+    float nearest[3] = {INFINITY, INFINITY, INFINITY};
+    for (int y=clamp_int(goal->top,0,(int)height-1); y<=goal->bottom && y<(int)height; ++y) {
+        for (int x=clamp_int(goal->left,0,(int)width-1); x<=goal->right && x<(int)width; ++x) {
+            point_t point;
+            if (!selected_pixel(rgb565,width,goal,x,y,&point)) continue;
+            float dx=point.x-ball_right_mm, dy=point.y-ball_forward_mm;
+            if (fabsf(dx)>60 || dy < -30) continue;
+            float distance=hypotf(dx,dy);
+            for (int i=0;i<3;++i) if (distance<nearest[i]) {
+                for (int j=2;j>i;--j) nearest[j]=nearest[j-1];
+                nearest[i]=distance; break;
+            }
+        }
+    }
+    *gap_mm=nearest[2];
+    return isfinite(*gap_mm);
+}

@@ -1,6 +1,25 @@
 cmake_minimum_required(VERSION 3.16)
 
 set(COMPONENTS main)
-set(PROJECT_VER "cam-p41-ballcapturer")
+option(SIMPLE_BALL_TEST "Direct, manually started red then purple ball test" OFF)
+option(INTEGRATED_SIMPLE_MISSION "Line and obstacle course followed by simple two-ball push" OFF)
+if(INTEGRATED_SIMPLE_MISSION AND NOT SIMPLE_BALL_TEST)
+    message(FATAL_ERROR "INTEGRATED_SIMPLE_MISSION requires SIMPLE_BALL_TEST")
+endif()
+if(INTEGRATED_SIMPLE_MISSION)
+    set(PROJECT_VER "cam-course-two-v23")
+elseif(SIMPLE_BALL_TEST)
+    set(PROJECT_VER "cam-simple-two-v23")
+else()
+    set(PROJECT_VER "cam-p41-ballcapturer")
+endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(camera-line-follow-test)
+
+# JPEG decoding dominates the frame budget; keep speed optimization independent
+# of the application's debug-friendly SDK configuration.
+option(VISION_SPEED_OPTIMIZATION "Optimize JPEG and vision code for throughput" ON)
+if(VISION_SPEED_OPTIMIZATION)
+    target_compile_options(__idf_espressif__esp_jpeg PRIVATE -O2)
+    target_compile_options(__idf_main PRIVATE -O2)
+endif()

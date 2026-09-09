@@ -1,4 +1,5 @@
 #include "post_line_navigation.h"
+#include "straight_sync.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -133,6 +134,10 @@ static const navigation_motor_t s_motors[NAV_WHEEL_COUNT] = {
 };
 
 static const char *TAG = "post_nav";
+/* Written and consumed exclusively by navigation_task. */
+static int s_straight_sync_pwm[NAV_WHEEL_COUNT];
+static bool s_direct_push_active;
+static int s_push_heading_pwm;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static navigation_anchor_t s_anchor;
 static post_line_navigation_pose_t s_pose;
@@ -142,6 +147,13 @@ static bool s_stopped;
 static bool s_settling;
 static post_line_navigation_command_t s_command;
 static uint32_t s_command_id;
+static uint32_t s_camera_guard_command_id;
+static int64_t s_camera_guard_until_us;
+static bool s_simple_start_requested;
+static float s_pulse_forward, s_pulse_right, s_pulse_turn;
+static float s_pulse_speed_scale;
+static bool s_pulse_rear_only;
+static int64_t s_pulse_expires_us;
 static float s_target_x_mm;
 static float s_target_y_mm;
 static float s_target_heading_rad;
@@ -304,11 +316,16 @@ static void update_speed_pi(const float wheel_request[NAV_WHEEL_COUNT],
                             const post_line_odometry_pose_t *odometry,
                             int64_t now_us)
 {
-    if (now_us - s_last_pi_us <
-        (int64_t)NAV_SPEED_PI_INTERVAL_MS * 1000) return;
+    const int interval_ms = s_direct_push_active ? 50 : NAV_SPEED_PI_INTERVAL_MS;
+    if (now_us - s_last_pi_us < (int64_t)interval_ms * 1000) return;
 
     const int32_t counts[NAV_WHEEL_COUNT] = {
         odometry->count_a, odometry->count_b, odometry->count_d};
+    /* In fixed-base push mode, balance measured A/D speeds rather than fight
+     * a stale absolute 42-count target. Common forward effort stays at 250. */
+    const int push_target = straight_sync_speed_target(
+        abs(count_delta(counts[0], s_previous_counts[0])),
+        abs(count_delta(counts[2], s_previous_counts[2])));
     for (size_t wheel = 0; wheel < NAV_WHEEL_COUNT; ++wheel) {
         const float magnitude = fabsf(wheel_request[wheel]);
         const int sign = magnitude >= NAV_COMPONENT_DEADBAND
@@ -319,7 +336,8 @@ static void update_speed_pi(const float wheel_request[NAV_WHEEL_COUNT],
         const int delta = abs(signed_delta);
         s_encoder_delta[wheel] = signed_delta;
         s_previous_counts[wheel] = counts[wheel];
-        if (sign == 0 || sign != s_previous_sign[wheel]) {
+        if (sign == 0 || (sign != s_previous_sign[wheel] &&
+                          !(s_direct_push_active && wheel != 1 && s_previous_sign[wheel] == 0))) {
             s_integral[wheel] = 0;
             s_pi_output[wheel] = 0;
             s_stall_started_us[wheel] = 0;
@@ -328,14 +346,16 @@ static void update_speed_pi(const float wheel_request[NAV_WHEEL_COUNT],
             s_previous_sign[wheel] = sign;
             continue;
         }
-        const int target = (int)lroundf(
-            magnitude * NAV_SPEED_TARGET_COUNTS);
+        s_previous_sign[wheel] = sign;
+        const int target = s_direct_push_active && wheel != 1 ? push_target :
+            (int)lroundf(magnitude * NAV_SPEED_TARGET_COUNTS);
         const int error = target - delta;
         s_integral[wheel] = clamp_int(
             s_integral[wheel] + error,
             -NAV_SPEED_INTEGRAL_LIMIT, NAV_SPEED_INTEGRAL_LIMIT);
-        int output = error / NAV_SPEED_KP_DIV +
-                     s_integral[wheel] / NAV_SPEED_KI_DIV;
+        int output = s_direct_push_active && wheel != 1
+            ? error / 2 + s_integral[wheel] / 60
+            : error / NAV_SPEED_KP_DIV + s_integral[wheel] / NAV_SPEED_KI_DIV;
         output = clamp_int(output, -NAV_SPEED_OUTPUT_LIMIT,
                            NAV_SPEED_OUTPUT_LIMIT);
         const bool under_speed =
@@ -446,17 +466,21 @@ static void apply_wheel_requests(
             continue;
         }
         const navigation_motor_t *motor = &s_motors[wheel];
-        const int feedforward = motor->minimum_duty + (int)lroundf(
+        const bool direct_push_wheel = s_direct_push_active && wheel != 1;
+        const int feedforward = direct_push_wheel ? 250 : motor->minimum_duty + (int)lroundf(
             magnitude * (motor->maximum_duty - motor->minimum_duty));
-        int duty = clamp_int(feedforward + s_pi_output[wheel],
+        int duty = clamp_int(feedforward + s_pi_output[wheel] + s_straight_sync_pwm[wheel],
                              motor->minimum_duty, motor->maximum_duty);
+        if (direct_push_wheel)
+            duty = straight_sync_push_duty(s_pi_output[wheel], s_straight_sync_pwm[wheel] +
+                                          (wheel == WHEEL_A ? s_push_heading_pwm : -s_push_heading_pwm));
         if (minimum_active_duty > duty) {
             duty = clamp_int(minimum_active_duty,
                              motor->minimum_duty,
                              NAV_REVERSE_STALL_DUTY_MAX);
         }
         const int request_sign = wheel_request[wheel] > 0.0f ? 1 : -1;
-        if (request_sign == s_previous_sign[wheel] &&
+        if (!direct_push_wheel && request_sign == s_previous_sign[wheel] &&
             now_us < s_stall_pulse_until_us[wheel]) {
             duty = clamp_int(
                 motor->maximum_duty + NAV_STALL_PULSE_EXTRA_DUTY,
@@ -666,11 +690,20 @@ static void publish_pose(post_line_navigation_pose_t pose,
 static void navigation_task(void *argument)
 {
     (void)argument;
+    straight_sync_t straight_sync = {0};
+    bool previous_direct_push = false;
+    bool shot_heading_valid = false;
+    float shot_heading_rad = 0;
     TickType_t last_wake = xTaskGetTickCount();
     while (true) {
         const int64_t now_us = esp_timer_get_time();
         post_line_odometry_pose_t odometry;
+        memset(s_straight_sync_pwm, 0, sizeof(s_straight_sync_pwm));
+        s_direct_push_active = false;
+        s_push_heading_pwm = 0;
         if (!post_line_odometry_get_pose(&odometry)) {
+            straight_sync.active = false;
+            previous_direct_push = false;
             coast_motors();
             vTaskDelayUntil(&last_wake,
                             pdMS_TO_TICKS(NAV_CONTROL_INTERVAL_MS));
@@ -695,6 +728,9 @@ static void navigation_task(void *argument)
         int64_t command_timeout_us;
         int64_t phase_started_us;
         int64_t brake_until_us;
+        float pulse_forward, pulse_right, pulse_turn, pulse_speed_scale;
+        bool pulse_rear_only;
+        int64_t pulse_expires_us;
         size_t path_point_count;
         size_t path_point_index;
         bool path_require_final_heading;
@@ -709,6 +745,12 @@ static void navigation_task(void *argument)
         int64_t visual_goal_enabled_us;
         int64_t visual_goal_updated_us;
         portENTER_CRITICAL(&s_lock);
+        if (s_camera_guard_until_us != 0 && s_camera_guard_command_id == s_command_id &&
+            s_command != POST_NAV_COMMAND_NONE && !s_paused && !s_stopped &&
+            now_us >= s_camera_guard_until_us) {
+            s_stopped = true;
+            s_brake_until_us = now_us + 200000;
+        }
         anchor = s_anchor;
         anchor_revision = s_anchor_revision;
         started = s_started;
@@ -726,6 +768,12 @@ static void navigation_task(void *argument)
         command_timeout_us = s_command_timeout_us;
         phase_started_us = s_phase_started_us;
         brake_until_us = s_brake_until_us;
+        pulse_forward = s_pulse_forward;
+        pulse_right = s_pulse_right;
+        pulse_speed_scale = s_pulse_speed_scale;
+        pulse_turn = s_pulse_turn;
+        pulse_rear_only = s_pulse_rear_only;
+        pulse_expires_us = s_pulse_expires_us;
         path_point_count = s_path_point_count;
         path_point_index = s_path_point_index;
         path_require_final_heading = s_path_require_final_heading;
@@ -742,7 +790,33 @@ static void navigation_task(void *argument)
         reset_pi = s_reset_pi_requested;
         s_reset_pi_requested = false;
         portEXIT_CRITICAL(&s_lock);
-        if (reset_pi) reset_speed_pi(&odometry, now_us);
+        if (reset_pi) {
+            reset_speed_pi(&odometry, now_us);
+            straight_sync.active = false;
+        }
+        const bool straight_active = started && !stopped && !paused && !settling &&
+            command == POST_NAV_COMMAND_VISUAL_PULSE && now_us < pulse_expires_us &&
+            pulse_forward > 0 && pulse_right == 0 && pulse_turn == 0;
+        /* Only the full straight-shot request uses the 250 PWM base.
+         * Alignment approach stays at its existing 0.50 scale. */
+        s_direct_push_active = straight_active && pulse_forward == 1.0f && pulse_speed_scale == 1.0f;
+        const bool shot_requested = started && !stopped && !paused && !settling &&
+            command == POST_NAV_COMMAND_VISUAL_PULSE && pulse_forward == 1.0f &&
+            pulse_right == 0 && pulse_turn == 0 && pulse_speed_scale == 1.0f;
+        if (!shot_requested) shot_heading_valid = false;
+        if (shot_requested && !shot_heading_valid) {
+            shot_heading_rad = odometry.heading_rad;
+            shot_heading_valid = true;
+        }
+        if (s_direct_push_active)
+            s_push_heading_pwm = straight_push_heading_pwm(shot_heading_rad, odometry.heading_rad);
+        if (s_direct_push_active != previous_direct_push) {
+            reset_speed_pi(&odometry, now_us);
+            previous_direct_push = s_direct_push_active;
+        }
+        straight_sync_update(&straight_sync, straight_active, odometry.count_a, odometry.count_d);
+        s_straight_sync_pwm[0] = straight_sync.pwm_a;
+        s_straight_sync_pwm[2] = straight_sync.pwm_d;
         if (command != POST_NAV_COMMAND_REVERSE) {
             reset_reverse_progress_watchdog();
         }
@@ -796,7 +870,8 @@ static void navigation_task(void *argument)
         pose.visual_target_right_mm = visual_goal_right_mm;
         pose.visual_target_forward_mm = visual_goal_forward_mm;
         if (stopped || !started || command == POST_NAV_COMMAND_NONE) {
-            coast_motors();
+            if (stopped && now_us < brake_until_us) brake_motors();
+            else coast_motors();
             publish_pose(pose, anchor_revision);
         } else if (paused) {
             if (now_us < brake_until_us) brake_motors();
@@ -826,6 +901,21 @@ static void navigation_task(void *argument)
                          (int)lroundf(pose.heading_deg));
             } else {
                 coast_motors();
+            }
+            publish_pose(pose, anchor_revision);
+        } else if (command == POST_NAV_COMMAND_VISUAL_PULSE) {
+            if (now_us < pulse_expires_us && navigation_motion_allowed(command_id)) {
+                const float front_turn = pulse_rear_only ? 0.0f : pulse_turn;
+                float wheels[NAV_WHEEL_COUNT] = {
+                    -0.5f * pulse_right + 0.8660254f * pulse_forward + front_turn,
+                    pulse_right + pulse_turn,
+                    -0.5f * pulse_right - 0.8660254f * pulse_forward + front_turn,
+                };
+                apply_scaled_wheel_requests(wheels, &odometry, now_us, pulse_speed_scale, 0);
+                pose.visual_control_active = true;
+            } else {
+                if (now_us < pulse_expires_us + 80000) brake_motors();
+                else coast_motors();
             }
             publish_pose(pose, anchor_revision);
         } else if (command == POST_NAV_COMMAND_ROTATE) {
@@ -1131,6 +1221,13 @@ static void navigation_safety_uart_task(void *argument)
             if (input[index] == '\r' || input[index] == '\n') {
                 if (line_length > 0) {
                     line[line_length] = '\0';
+#if SIMPLE_BALL_TEST
+                    if (strcmp(line, "SIMPLE,1") == 0) {
+                        portENTER_CRITICAL(&s_lock);
+                        if (!s_started && !s_stopped) s_simple_start_requested = true;
+                        portEXIT_CRITICAL(&s_lock);
+                    }
+#endif
                     int enabled;
                     if (sscanf(line, "VSTREAM,%d", &enabled) == 1) {
                         const esp_err_t error =
@@ -1304,11 +1401,71 @@ void post_line_navigation_resume(void)
     portEXIT_CRITICAL(&s_lock);
 }
 
+void post_line_navigation_pause_at_goal(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (s_started && !s_stopped && !s_paused) {
+        s_paused = true;
+        s_brake_until_us = now_us + 200000;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
+void post_line_navigation_stop_at_goal(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (!s_stopped) s_brake_until_us = now_us + 200000;
+    s_stopped = true;
+    portEXIT_CRITICAL(&s_lock);
+}
+
 void post_line_navigation_stop(void)
 {
     portENTER_CRITICAL(&s_lock);
     s_stopped = true;
     portEXIT_CRITICAL(&s_lock);
+}
+
+bool post_line_navigation_take_simple_start(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    const bool request = s_simple_start_requested && !s_stopped;
+    s_simple_start_requested = false;
+    portEXIT_CRITICAL(&s_lock);
+    return request;
+}
+
+bool post_line_navigation_visual_pulse(float forward, float right, float turn, bool rear_only,
+                                       int duration_ms, float speed_scale)
+{
+    if (!isfinite(forward) || !isfinite(right) || fabsf(right) > 0.5f ||
+        !isfinite(turn) || forward < -0.5f ||
+        forward > 1.0f || fabsf(turn) > 0.5f ||
+        !isfinite(speed_scale) || speed_scale <= 0 || speed_scale > 1.00f ||
+        duration_ms < 10 || duration_ms > 500 ||
+        (duration_ms > 120 && (turn != 0.0f || rear_only))) return false;
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (!s_started || s_stopped || s_paused) {
+        portEXIT_CRITICAL(&s_lock);
+        return false;
+    }
+    if (s_command != POST_NAV_COMMAND_VISUAL_PULSE)
+        s_reset_pi_requested = true;
+    s_command = POST_NAV_COMMAND_VISUAL_PULSE;
+    s_command_id++;
+    s_settling = false;
+    s_pulse_forward = forward;
+    s_pulse_right = right;
+    s_pulse_speed_scale = speed_scale;
+    s_pulse_turn = turn;
+    s_pulse_rear_only = rear_only;
+    s_pulse_expires_us = now + ((forward != 0 || right != 0 || turn != 0)
+        ? (int64_t)duration_ms * 1000 : 0);
+    portEXIT_CRITICAL(&s_lock);
+    return true;
 }
 
 bool post_line_navigation_move_to(float x_mm, float y_mm,
@@ -1689,4 +1846,15 @@ bool post_line_navigation_get_pose(post_line_navigation_pose_t *pose)
     *pose = s_pose;
     portEXIT_CRITICAL(&s_lock);
     return pose->valid;
+}
+
+void post_line_navigation_refresh_camera_guard(uint32_t command_id)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    if (s_command_id == command_id && !s_stopped) {
+        s_camera_guard_command_id = command_id;
+        s_camera_guard_until_us = now + 500000;
+    }
+    portEXIT_CRITICAL(&s_lock);
 }

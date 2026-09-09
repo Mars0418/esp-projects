@@ -35,7 +35,7 @@ MAX_PAYLOAD_BYTES = 65536
 @dataclass(frozen=True)
 class DebugFrame:
     metadata: dict[str, object]
-    rgb332: bytes
+    pixels: bytes
 
 
 def rgb332_to_rgb888(source: bytes) -> bytes:
@@ -51,6 +51,36 @@ def rgb332_to_rgb888(source: bytes) -> bytes:
     return bytes(destination)
 
 
+def frame_rgb888(frame: DebugFrame) -> bytes:
+    if frame.metadata.get("format") == "RGB332":
+        return rgb332_to_rgb888(frame.pixels)
+    output = bytearray()
+    for (v,) in struct.iter_unpack(">H", frame.pixels):
+        output.extend((((v >> 11) & 31) * 255 // 31,
+                       ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31))
+    return bytes(output)
+
+
+def upright_simple_frame(metadata: dict, rgb: bytes) -> tuple[dict, bytes]:
+    """Display-only rotation; recorded frames and controller keep raw coordinates."""
+    import copy
+    result = copy.deepcopy(metadata)
+    w, h = int(result["width"]), int(result["height"])
+    for key in ("red", "purple", "goal"):
+        item = result.get(key)
+        if not isinstance(item, dict):
+            continue
+        if item.get("found"):
+            x, y = item["center"]
+            item["center"] = [w-1-x, h-1-y]
+            left, top, right, bottom = item["box"]
+            item["box"] = [w-1-right, h-1-bottom, w-1-left, h-1-top]
+        if item.get("corner_found"):
+            x, y = item["corner"]
+            item["corner"] = [w-1-x, h-1-y]
+    return result, b"".join(rgb[i:i+3] for i in range(len(rgb)-3, -1, -3))
+
+
 class SerialWorker:
     def __init__(self, events: queue.Queue[tuple[str, object]]) -> None:
         self.events = events
@@ -64,8 +94,9 @@ class SerialWorker:
         return self.port is not None and self.port.is_open
 
     def connect(self, port_name: str) -> None:
+        # Set reset-control lines before opening the ESP32 port.
         port = serial.Serial(
-            port_name,
+            None,
             NORMAL_BAUD,
             timeout=0.05,
             write_timeout=1.0,
@@ -74,15 +105,22 @@ class SerialWorker:
         )
         port.dtr = False
         port.rts = False
+        port.port = port_name
+        port.open()
+        # Some USB-UART adapters reset the board even when DTR/RTS are preset.
+        # Let boot output finish before sending a command into the new RX task.
+        boot_deadline = time.monotonic() + 4.0
+        while time.monotonic() < boot_deadline:
+            port.read(512)
         port.reset_input_buffer()
 
         handshake = bytearray()
-        deadline = time.monotonic() + 2.5
+        deadline = time.monotonic() + 6.0
         next_request = 0.0
         while SWITCH_MARKER not in handshake and time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_request:
-                port.write(b"VSTREAM,1\n")
+                port.write(b"\nVSTREAM,1\n")
                 port.flush()
                 next_request = now + 0.35
             handshake.extend(port.read(512))
@@ -182,7 +220,8 @@ class SerialWorker:
                 metadata = json.loads(metadata_raw.decode("ascii"))
                 width = int(metadata["width"])
                 height = int(metadata["height"])
-                if metadata.get("format") != "RGB332" or len(payload) != width * height:
+                pixel_bytes = {"RGB332": 1, "RGB565BE": 2}.get(metadata.get("format"), 0)
+                if pixel_bytes == 0 or len(payload) != width * height * pixel_bytes:
                     raise ValueError("invalid frame geometry")
             except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
                 self.events.put(("bad_frame", str(exc)))
@@ -210,7 +249,7 @@ class PushDebugViewer:
         self.record_directory: Path | None = None
 
         root.title("ESP32 Integrated Mission Debugger")
-        root.geometry("1040x700")
+        root.geometry("1180x740")
         root.minsize(900, 620)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -243,6 +282,10 @@ class PushDebugViewer:
             toolbar, text="Connect", command=self.toggle_connection
         )
         self.connect_button.pack(side="left", padx=6)
+        self.simple_start_button = ttk.Button(
+            toolbar, text="开始红球→紫球", command=self.start_simple_push, state="disabled"
+        )
+        self.simple_start_button.pack(side="left", padx=4)
         ttk.Button(toolbar, text="Emergency stop", command=self.emergency_stop).pack(
             side="left", padx=(8, 0)
         )
@@ -285,12 +328,12 @@ class PushDebugViewer:
 
     def refresh_ports(self) -> None:
         ports = sorted(list_ports.comports(), key=lambda item: item.device)
-        devices = [item.device.upper() for item in ports]
+        devices = [item.device for item in ports]
         self.port_descriptions = {
-            item.device.upper(): item.description or "Serial device" for item in ports
+            item.device: item.description or "Serial device" for item in ports
         }
         self.port_box["values"] = devices
-        if self.port_var.get().upper() not in devices:
+        if self.port_var.get() not in devices:
             self.port_var.set(devices[0] if len(devices) == 1 else "")
         if not devices:
             self.status_var.set("No serial port found")
@@ -299,7 +342,7 @@ class PushDebugViewer:
         if self.serial_worker.connected:
             self.disconnect()
             return
-        port_name = self.port_var.get().strip().upper()
+        port_name = self.port_var.get().strip()
         if not port_name:
             messagebox.showerror("Connection", "Select the ESP32 serial port.")
             return
@@ -318,6 +361,7 @@ class PushDebugViewer:
             self._start_recording()
 
     def disconnect(self) -> None:
+        self.simple_start_button.configure(state="disabled")
         self.serial_worker.disconnect()
         self._stop_recording()
         self.connect_button.configure(text="Connect")
@@ -326,6 +370,13 @@ class PushDebugViewer:
     def emergency_stop(self) -> None:
         try:
             self.serial_worker.write(b"X")
+        except serial.SerialException as exc:
+            self.events.put(("error", str(exc)))
+
+    def start_simple_push(self) -> None:
+        try:
+            self.serial_worker.write(b"F" if getattr(self, "start_line_course", False) else b"SIMPLE,1\n")
+            self.simple_start_button.configure(state="disabled")
         except serial.SerialException as exc:
             self.events.put(("error", str(exc)))
 
@@ -370,7 +421,9 @@ class PushDebugViewer:
         metadata = frame.metadata
         width = int(metadata["width"])
         height = int(metadata["height"])
-        rgb888 = rgb332_to_rgb888(frame.rgb332)
+        rgb888 = frame_rgb888(frame)
+        if metadata.get("phase") in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH"):
+            metadata, rgb888 = upright_simple_frame(metadata, rgb888)
         ppm = f"P6\n{width} {height}\n255\n".encode("ascii") + rgb888
         base_photo = tk.PhotoImage(data=ppm, format="PPM")
 
@@ -386,7 +439,9 @@ class PushDebugViewer:
         self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.photo)
         phase = str(metadata.get("phase", "BALL_CAPTURE"))
         self.image_panel.configure(
-            text=f"{phase} algorithm frame ({width}x{height}, origin: top-left)"
+            text=("推球画面（已转正；橙线：车→球，青线：球→门）"
+                  if phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH") else
+                  f"{phase} algorithm frame ({width}x{height}, origin: top-left)")
         )
         if phase == "LINE_FOLLOW":
             self._draw_line_result(metadata.get("line"), scale, offset_x, offset_y)
@@ -394,6 +449,43 @@ class PushDebugViewer:
             self._draw_detection(metadata.get("goal"), "#ffd54f", scale, offset_x, offset_y)
             self._draw_detection(metadata.get("red"), "#ff3b30", scale, offset_x, offset_y)
             self._draw_detection(metadata.get("purple"), "#ff00ff", scale, offset_x, offset_y)
+
+        if phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH"):
+            for band_y in (60, 80):
+                self.canvas.create_line(offset_x, offset_y + band_y * scale,
+                                        offset_x + width * scale, offset_y + band_y * scale,
+                                        fill="#88bb88", dash=(3, 5))
+            self.canvas.create_text(offset_x+5, offset_y+61*scale, anchor="nw",
+                                    text="瞄准时球心目标区域", fill="#88bb88")
+            ball_key = "purple" if metadata.get("mission", {}).get("selected_ball") == 3 else "red"
+            red, target = metadata.get(ball_key, {}), metadata.get("goal", {})
+            if red.get("found") and not red.get("predicted"):
+                bx, by = red["center"]
+                ax, ay = (width-1)/2, height-1
+                self.canvas.create_line(
+                    offset_x + ax * scale, offset_y + ay * scale,
+                    offset_x + bx * scale, offset_y + by * scale,
+                    fill="#ff9f0a", width=3, arrow=tk.LAST)
+                # Extend the vehicle-to-ball ray to show a miss at the goal.
+                if (target.get("found") and not target.get("predicted")
+                        and target.get("corner_found")):
+                    gx, gy = target["corner"]
+                    self.canvas.create_line(
+                        offset_x + bx * scale, offset_y + by * scale,
+                        offset_x + gx * scale, offset_y + gy * scale,
+                        fill="#00e5ff", width=3, arrow=tk.LAST)
+                    if ay-by > 1:
+                        ex = ax + (bx-ax)*(ay-gy)/(ay-by)
+                        ex = max(0, min(width-1, ex))
+                        self.canvas.create_line(
+                            offset_x + bx * scale, offset_y + by * scale,
+                            offset_x + ex * scale, offset_y + gy * scale,
+                            fill="#ff9f0a", width=1, dash=(5, 4))
+                    tx, ty = offset_x + gx * scale, offset_y + gy * scale
+                    self.canvas.create_oval(tx-6, ty-6, tx+6, ty+6,
+                                            outline="#00e5ff", width=2)
+                    self.canvas.create_text(tx+9, ty, anchor="w", text="直角瞄准点",
+                                            fill="#00e5ff")
 
         goal = metadata.get("goal")
         if phase != "LINE_FOLLOW" and isinstance(goal, dict) and goal.get("corner_found"):
@@ -404,6 +496,12 @@ class PushDebugViewer:
                 radius = 5
                 self.canvas.create_line(x - radius, y, x + radius, y, fill="#00ff72", width=2)
                 self.canvas.create_line(x, y - radius, x, y + radius, fill="#00ff72", width=2)
+
+        if phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH"):
+            gap = metadata.get("goal", {}).get("ball_gap_mm", -1)
+            self.canvas.create_text(offset_x+5, offset_y+5, anchor="nw",
+                text=(f"距球门区域约 {gap} mm；≤180 mm 停车" if gap >= 0
+                      else "等待球门距离；≤180 mm 停车"), fill="#ffd54f")
 
         now = time.monotonic()
         self.frame_times.append(now)
@@ -431,6 +529,15 @@ class PushDebugViewer:
         )
 
         mission = metadata.get("mission", {})
+        self.start_line_course = phase == "LINE_FOLLOW"
+        line_control = metadata.get("line", {}).get("control", {})
+        can_start = (self.start_line_course and not line_control.get("enabled", False)) or (
+            phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH") and
+            isinstance(mission, dict) and mission.get("state") == "WAIT_START")
+        self.simple_start_button.configure(
+            text="开始循迹→避障→推球" if self.start_line_course else "开始红球→紫球",
+            state="normal" if can_start and self.serial_worker.connected else "disabled"
+        )
         navigation = metadata.get("navigation", {})
         line = metadata.get("line", {})
         if phase == "LINE_FOLLOW" and isinstance(line, dict):
@@ -462,10 +569,13 @@ class PushDebugViewer:
             ball_names = {0: "NONE", 1: "RED", 3: "PURPLE"}
             goal_names = {0: "UPPER", 1: "LOWER"}
             selected = ball_names.get(int(mission.get("selected_ball", 0)), "?")
-            target = goal_names.get(int(mission.get("target_goal", -1)), "?")
+            target = ("BLACK CORNER" if phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH")
+                      else goal_names.get(int(mission.get("target_goal", -1)), "?"))
             self.mission_var.set(
                 f"Mission: {mission.get('state', '?')} | selected {selected} | "
                 f"goal {target} | ball held {int(bool(mission.get('ball_held')))}"
+                + (f" | reason {mission.get('push_entry', '?')}"
+                   if phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH") else "")
             )
         if phase != "LINE_FOLLOW" and isinstance(navigation, dict):
             source = navigation.get("source", "?")
@@ -557,10 +667,12 @@ class PushDebugViewer:
         height = int(frame.metadata["height"])
         ppm = (
             f"P6\n{width} {height}\n255\n".encode("ascii")
-            + rgb332_to_rgb888(frame.rgb332)
+            + frame_rgb888(frame)
         )
         frame_path = self.record_directory / "frames" / f"{sequence:08d}.ppm"
         frame_path.write_bytes(ppm)
+        if frame.metadata.get("format") == "RGB565BE":
+            frame_path.with_suffix(".rgb565").write_bytes(frame.pixels)
         metadata_path = self.record_directory / "metadata" / f"{sequence:08d}.json"
         metadata_path.write_text(
             json.dumps(frame.metadata, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -582,7 +694,7 @@ def main() -> int:
     args = parse_args()
     repository = Path(__file__).resolve().parent
     root = tk.Tk()
-    PushDebugViewer(root, args.port.upper(), repository, args.connect)
+    PushDebugViewer(root, args.port, repository, args.connect)
     root.mainloop()
     return 0
 

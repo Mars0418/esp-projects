@@ -7,9 +7,9 @@
 #include "esp_log.h"
 
 #define GOAL_MIN_PIXELS 20
-#define GOAL_MIN_SIDE_PIXELS 5
-#define GOAL_TRUST_ROI_WIDTH 100
-#define GOAL_TRUST_ROI_HEIGHT 90
+#define GOAL_MIN_SIDE_PIXELS 4
+#define GOAL_MAX_ASPECT_RATIO 8
+#define GOAL_BORDER_MARGIN 3
 #define GOAL_MAX_MISS_FRAMES 1
 #define GOAL_POSITION_DEADBAND_PIXELS 2
 #define GOAL_POSITION_SNAP_DISTANCE_PIXELS 12
@@ -66,6 +66,13 @@ static void clear_pending_jump(void)
 {
     s_pending_jump_valid = false;
     s_pending_jump_count = 0;
+}
+
+void black_marker_vision_reset_tracking(void)
+{
+    s_track_valid = false;
+    s_missed_frames = 0;
+    clear_pending_jump();
 }
 
 static bool confirm_low_confidence_jump(int x, int y)
@@ -274,26 +281,26 @@ void black_marker_vision_process(const uint8_t *rgb565, size_t width,
         const int ring_luminance = ring_pixels > 0
                                        ? ring_luminance_sum / ring_pixels : 0;
         const int contrast = ring_luminance - dark_luminance;
-        const int center_x = (int)((sum_x + area / 2) / area);
-        const int center_y = (int)((sum_y + area / 2) / area);
-        const int trust_left = ((int)width - GOAL_TRUST_ROI_WIDTH) / 2;
-        const int trust_top = ((int)height - GOAL_TRUST_ROI_HEIGHT) / 2;
-        const int trust_right = trust_left + GOAL_TRUST_ROI_WIDTH - 1;
-        const int trust_bottom = trust_top + GOAL_TRUST_ROI_HEIGHT - 1;
 
         /* A quarter disk remains a compact, substantially filled component
          * under perspective. Thin court lines fail aspect/fill; neutral-dark
          * and local contrast reject coloured objects and soft shadows. */
         if (area < GOAL_MIN_PIXELS || short_side < GOAL_MIN_SIDE_PIXELS ||
-            long_side > short_side * 3 || fill_percent < 35 ||
+            long_side > short_side * GOAL_MAX_ASPECT_RATIO || fill_percent < 30 ||
             fill_percent > 94 || contrast < 35 ||
-            center_x < trust_left || center_x > trust_right ||
-            center_y < trust_top || center_y > trust_bottom) {
+            ((short_side == 4 || long_side > short_side * 5) &&
+             (area < 30 || contrast < 50 || fill_percent < 45)) ||
+            min_x < GOAL_BORDER_MARGIN || max_x >= (int)width - GOAL_BORDER_MARGIN ||
+            min_y < GOAL_BORDER_MARGIN || max_y >= (int)height - GOAL_BORDER_MARGIN) {
             continue;
         }
 
         const int area_points = clamp_int(area / 3, 0, 25);
-        const int fill_points = clamp_int(25 - abs(fill_percent - 78), 0, 25);
+        /* Perspective and 4-row rasterization turn quarter disks into wedges.
+         * Do not penalize valid 50--85% occupancy as if all views were circles. */
+        const int fill_error = fill_percent < 50 ? 50 - fill_percent :
+                               (fill_percent > 85 ? fill_percent - 85 : 0);
+        const int fill_points = clamp_int(25 - fill_error, 0, 25);
         const int shape_points = short_side * 20 / long_side;
         const int contrast_points = clamp_int((contrast - 20) / 2, 0, 30);
         const int confidence = clamp_int(area_points + fill_points +

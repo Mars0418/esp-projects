@@ -70,3 +70,9 @@ bool quarter_goal_pose_project_ground_pixel(float raw_x, float raw_y,
 void quarter_goal_pose_draw_overlay(uint8_t *rgb565, size_t width,
                                     size_t height,
                                     const quarter_goal_pose_result_t *result);
+
+/* Distance from ball ground contact to visible dark goal pixels ahead of it,
+ * within a 60 mm lateral corridor. Requires three supporting pixels. */
+bool quarter_goal_pose_ball_gap(const uint8_t *rgb565, size_t width, size_t height,
+    const black_marker_result_t *goal, float ball_right_mm, float ball_forward_mm,
+    float *gap_mm);

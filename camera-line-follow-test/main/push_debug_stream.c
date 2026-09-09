@@ -26,7 +26,7 @@
 #define DEBUG_METADATA_BYTES 3072
 #define DEBUG_PREFIX_BYTES 20
 #define DEBUG_PACKET_BYTES \
-    (DEBUG_PREFIX_BYTES + DEBUG_METADATA_BYTES + DEBUG_MAX_RGB332_BYTES)
+    (DEBUG_PREFIX_BYTES + DEBUG_METADATA_BYTES + DEBUG_MAX_RGB565_BYTES)
 #define DEBUG_TX_DRAIN_MS 800
 
 typedef struct {
@@ -92,7 +92,7 @@ static int build_metadata(char *buffer, size_t capacity,
         "{\"v\":1,\"seq\":%" PRIu32 ",\"phase\":\"%s\""
         ",\"capture_us\":%" PRId64
         ",\"processed_us\":%" PRId64 ",\"emitted_us\":%" PRId64
-        ",\"width\":%d,\"height\":%d,\"format\":\"RGB332\""
+        ",\"width\":%d,\"height\":%d,\"format\":\"%s\""
         ",\"stream\":{\"queued\":%" PRIu32 ",\"dropped\":%" PRIu32 "}"
         ",\"mission\":{\"state_id\":%d,\"state\":\"%s\""
         ",\"push_entry_id\":%d,\"push_entry\":\"%s\""
@@ -105,7 +105,7 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]}"
         ",\"goal\":{\"found\":%d,\"predicted\":%d,\"confidence\":%d"
         ",\"center\":[%d,%d],\"box\":[%d,%d,%d,%d]"
-        ",\"corner_found\":%d,\"corner_confidence\":%d"
+        ",\"ball_gap_mm\":%d,\"corner_found\":%d,\"corner_confidence\":%d"
         ",\"corner\":[%d,%d]}"
         ",\"navigation\":{\"valid\":%d,\"state\":%d,\"command\":%d"
         ",\"source\":\"%s\",\"pose_mm_deg\":[%d,%d,%d]"
@@ -127,7 +127,7 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"encoder_delta\":[%d,%d],\"distance_mm\":%d}}}",
         sequence, slot->phase_name,
         m->captured_at_us, m->processed_at_us, emitted_at_us,
-        (int)slot->width, (int)slot->height,
+        (int)slot->width, (int)slot->height, SIMPLE_BALL_TEST ? "RGB565BE" : "RGB332",
         s_queued_frames, s_dropped_frames,
         m->mission_state, slot->mission_state_name,
         m->push_entry, slot->push_entry_name, m->selected_ball,
@@ -148,7 +148,7 @@ static int build_metadata(char *buffer, size_t capacity,
         m->goal.found, m->goal.predicted, m->goal.confidence,
         m->goal.center_x, m->goal.center_y,
         m->goal.left, m->goal.top, m->goal.right, m->goal.bottom,
-        m->corner_found, m->corner_confidence, m->corner_x, m->corner_y,
+        m->goal_ball_gap_mm, m->corner_found, m->corner_confidence, m->corner_x, m->corner_y,
         m->navigation_valid, m->navigation_state, m->navigation_command,
         m->visual_control_active ? "VISION" : "ODOMETRY",
         (int)m->vehicle_x_mm, (int)m->vehicle_y_mm,
@@ -212,23 +212,24 @@ static void debug_stream_task(void *argument)
             continue;
         }
 
-        uint8_t *rgb332 = s_packet + DEBUG_PREFIX_BYTES + metadata_length;
+        uint8_t *payload = s_packet + DEBUG_PREFIX_BYTES + metadata_length;
         const size_t pixel_count = slot->width * slot->height;
-        for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
-            rgb332[pixel] = rgb565_to_rgb332(slot->rgb565 + pixel * 2);
-        }
+        const size_t payload_bytes = pixel_count * (SIMPLE_BALL_TEST ? 2 : 1);
+        if (SIMPLE_BALL_TEST) memcpy(payload, slot->rgb565, payload_bytes);
+        else for (size_t pixel = 0; pixel < pixel_count; ++pixel)
+            payload[pixel] = rgb565_to_rgb332(slot->rgb565 + pixel * 2);
 
         memcpy(s_packet, s_magic, sizeof(s_magic));
         write_u32_le(s_packet + 8, (uint32_t)metadata_length);
-        write_u32_le(s_packet + 12, (uint32_t)pixel_count);
+        write_u32_le(s_packet + 12, (uint32_t)payload_bytes);
         uint32_t crc = crc32_update(0xffffffffU,
                                     s_packet + DEBUG_PREFIX_BYTES,
                                     (size_t)metadata_length +
-                                        pixel_count) ^ 0xffffffffU;
+                                        payload_bytes) ^ 0xffffffffU;
         write_u32_le(s_packet + 16, crc);
 
         const size_t packet_length = DEBUG_PREFIX_BYTES +
-            (size_t)metadata_length + pixel_count;
+            (size_t)metadata_length + payload_bytes;
         if (s_enabled && uart_write_bytes(DEBUG_UART, s_packet,
                                           packet_length) < 0) {
             s_dropped_frames++;
