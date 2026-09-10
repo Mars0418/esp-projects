@@ -1,4 +1,6 @@
 #include "camera_line_follow.h"
+#include "tour_guide.h"
+#include "tour_corner.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -312,6 +314,14 @@ static camera_line_follow_debug_status_t s_debug_status;
 static int64_t s_latest_frame_us;
 static uint32_t s_result_sequence;
 static volatile bool s_enabled;
+static bool s_tour_started;
+static bool s_tour_corner_seen;
+static bool s_tour_corner_complete;
+static int s_tour_straight_frames;
+static int s_tour_corner_count;
+static int64_t s_tour_rearm_after_us;
+static int64_t s_tour_dwell_until_us;
+static bool s_tour_pending_pivot;
 static volatile bool s_debug_enabled;
 static volatile bool s_tuner_enabled;
 static volatile bool s_calibration_enabled;
@@ -1690,6 +1700,7 @@ static void handle_uart_command(void)
     for (int index = 0; index < count; ++index) {
         const uint8_t value = input[index];
         if (value == 'f' || value == 'F') {
+            if (!tour_guide_departure_ready(esp_timer_get_time()) || s_tour_started) continue;
             s_auto_start_pending = false;
             portENTER_CRITICAL(&s_result_lock);
             s_course_complete = false;
@@ -1715,11 +1726,12 @@ static void handle_uart_command(void)
                 ESP_LOGW(TAG,
                          "START REFUSED: no fresh track under foot gate");
             }
-        } else if (value == 'x' || value == 'X' || value == ' ') {
+        } else if (value == 'x' || value == 'X' || value == ' ' || value == 3) {
             s_auto_start_pending = false;
             s_enabled = false;
             stop_motors();
-            ESP_LOGW(TAG, "PATH PURSUIT STOPPED");
+            tour_guide_stop();
+            ESP_LOGW(TAG, "TOUR ABORTED: reboot to restart");
         } else if (value == '\r' || value == '\n') {
             if (s_uart_line_length > 0) process_uart_line();
         } else if (value >= 32 && value <= 126) {
@@ -1769,7 +1781,22 @@ static void control_task(void *argument)
         const bool foot_valid = line_valid && result.foot_track_valid;
         const bool new_frame = sequence != processed_sequence;
 
-        if (s_auto_start_pending && !s_enabled && new_frame &&
+        if (s_tour_corner_seen && !s_tour_dwell_until_us &&
+            !controller.pivot_active) {
+            if (tour_corner_rearm_ready(now_us, s_tour_rearm_after_us,
+                    new_frame, foot_valid && !result.big_turn &&
+                    abs(result.heading_error) < 200, &s_tour_straight_frames)) {
+                s_tour_corner_complete = true;
+                s_tour_corner_seen = false;
+                controller.turn_armed = false;
+                clear_pending_turn_hint(&controller);
+                controller.turn_arm_ignore_until_us = now_us;
+                ESP_LOGI(TAG, "TOUR CORNER %d PASSED: ready for next corner", s_tour_corner_count);
+            }
+        }
+
+        if (!s_tour_started && tour_guide_departure_ready(now_us) &&
+            s_auto_start_pending && !s_enabled && new_frame &&
             !s_tuner_enabled && !s_calibration_enabled) {
             auto_start_frames = foot_valid ? auto_start_frames + 1 : 0;
             if (auto_start_frames >= AUTO_START_CONFIRM_FRAMES) {
@@ -1785,6 +1812,7 @@ static void control_task(void *argument)
         }
 
         if (s_enabled && !previous_enabled) {
+            s_tour_started = true;
             reset_controller(&controller);
             reset_obstacle_controller(&obstacle, now_us);
         } else if (!s_enabled && previous_enabled) {
@@ -1792,7 +1820,7 @@ static void control_task(void *argument)
         }
 
         bool ultrasonic_sample_ready = false;
-        if (obstacle.state == OBSTACLE_IDLE &&
+        if (false && obstacle.state == OBSTACLE_IDLE &&
             !s_tuner_enabled && !s_calibration_enabled &&
             !s_debug_enabled) {
             ultrasonic_sample_ready =
@@ -1800,6 +1828,7 @@ static void control_task(void *argument)
         }
 
         if (!s_enabled) {
+            if (s_tour_started) tour_guide_stop();
             reset_controller(&controller);
         } else if (!frame_fresh) {
             s_enabled = false;
@@ -1807,15 +1836,40 @@ static void control_task(void *argument)
             reset_controller(&controller);
             reset_obstacle_controller(&obstacle, now_us);
             ESP_LOGE(TAG, "STALE CAMERA FRAME: motors stopped");
+        } else if (s_tour_dwell_until_us > 0) {
+            brake_motors();
+            controller.a_command = controller.d_command = 0;
+            if (now_us >= s_tour_dwell_until_us) {
+                s_tour_dwell_until_us = 0;
+                if (s_tour_pending_pivot) {
+                    s_tour_pending_pivot = false;
+                    start_pivot(&controller, now_us);
+                }
+            }
+            if (new_frame) processed_sequence = sequence;
+        } else if (new_frame && !s_tour_corner_seen &&
+                   controller.clean_straight_frames >= TURN_CLEAN_STRAIGHT_FRAMES &&
+                   result.big_turn && result.turn_angle_deg >= 25 &&
+                   result.turn_confidence >= 50 && result.corner_path_distance <= 22) {
+            s_tour_corner_seen = true;
+            s_tour_corner_complete = false;
+            s_tour_straight_frames = 0;
+            ++s_tour_corner_count;
+            s_tour_dwell_until_us = now_us + 2000000;
+            s_tour_rearm_after_us = s_tour_dwell_until_us + 500000;
+            brake_motors();
+            controller.a_command = controller.d_command = 0;
+            processed_sequence = sequence;
+            ESP_LOGI(TAG, "TOUR CORNER %d: braking for 2000ms", s_tour_corner_count);
         } else {
-            if (check_obstacle_trigger(&obstacle,
+            if (false && check_obstacle_trigger(&obstacle,
                                        ultrasonic_sample_ready,
                                        now_us)) {
                 reset_controller(&controller);
             }
 
             const bool obstacle_owns_motors =
-                update_obstacle_action(&obstacle, &controller, &result,
+                false && update_obstacle_action(&obstacle, &controller, &result,
                                        line_valid, new_frame, now_us);
             if (obstacle_owns_motors) {
                 if (new_frame) processed_sequence = sequence;
@@ -1855,8 +1909,10 @@ static void control_task(void *argument)
                         const int completed_direction =
                             controller.turn_direction;
                         reset_controller(&controller);
-                        controller.turn_arm_ignore_until_us = now_us +
-                            (int64_t)TURN_REARM_COOLDOWN_MS * 1000;
+                        s_tour_corner_complete = true;
+                        s_tour_straight_frames = 0;
+                        s_tour_rearm_after_us = now_us + 500000;
+                        controller.turn_arm_ignore_until_us = s_tour_rearm_after_us;
                         apply_follow_control(&result, &controller);
                         ESP_LOGW(TAG,
                                  "PIVOT COMPLETE direction=%d after %lldms foot=%d center=%d heading=%d",
@@ -1915,7 +1971,18 @@ static void control_task(void *argument)
                              line_valid, result.foot_pixel_count,
                              result.foot_center_pixel_count,
                              result.foot_path_length_pixels);
-                    start_pivot(&controller, now_us);
+                    if (!s_tour_corner_seen) {
+                        s_tour_corner_seen = true;
+                        s_tour_corner_complete = false;
+                        s_tour_straight_frames = 0;
+                        ++s_tour_corner_count;
+                        s_tour_pending_pivot = true;
+                        s_tour_dwell_until_us = now_us + 2000000;
+                        s_tour_rearm_after_us = s_tour_dwell_until_us + 500000;
+                        brake_motors();
+                        controller.a_command = controller.d_command = 0;
+                        ESP_LOGI(TAG, "TOUR CORNER %d: braking for 2000ms before pivot", s_tour_corner_count);
+                    } else start_pivot(&controller, now_us);
                 } else if (controller.turn_armed) {
                     controller.a_command = 0;
                     controller.d_command = 0;
@@ -1926,14 +1993,14 @@ static void control_task(void *argument)
                 } else if (controller.foot_lost_frames <
                                FOOT_LOST_STOP_FRAMES &&
                            controller.initialized) {
-                    drive_wheels(controller.a_command,
-                                 controller.d_command);
+                    brake_motors();
                 } else if (controller.foot_lost_frames >=
                            FOOT_LOST_STOP_FRAMES) {
                     s_enabled = false;
                     stop_motors();
                     ESP_LOGW(TAG,
-                             "FOOT TRACK LOST for %d frames without ready turn: stopped",
+                             "TOUR %s: line absent for %d frames; reboot to restart",
+                             s_tour_corner_complete ? "END" : "FAULT_BEFORE_FINAL_LEG",
                              controller.foot_lost_frames);
                 }
             }
@@ -1943,7 +2010,7 @@ static void control_task(void *argument)
 
         const char *state = obstacle.state != OBSTACLE_IDLE
             ? obstacle_state_name(obstacle.state)
-            : (controller.pivot_active ? "PIVOT" :
+            : (s_tour_dwell_until_us ? "TOUR_DWELL" : controller.pivot_active ? "PIVOT" :
                 (controller.turn_armed ? "READY" : "FOLLOW"));
         camera_line_follow_debug_status_t debug_status = {
             .valid = true,
@@ -1982,6 +2049,7 @@ static void control_task(void *argument)
             last_report_us = now_us;
         }
         previous_enabled = s_enabled;
+        processed_sequence = sequence;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -1991,7 +2059,7 @@ esp_err_t camera_line_follow_init(void)
     s_course_complete = false;
     s_handoff_requested = false;
     s_handoff_ready = false;
-    s_auto_start_pending = !INTEGRATED_SIMPLE_MISSION;
+    s_auto_start_pending = true;
     set_output_low(DRIVER_STBY);
     const motor_t *motors[] = {&s_motor_a, &s_motor_b, &s_motor_d};
     for (size_t index = 0; index < 3; ++index) {
@@ -2035,7 +2103,7 @@ esp_err_t camera_line_follow_init(void)
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGW(TAG,
-             "SAFE STOP until %d stable track frames; F=manual start X/SPACE=stop RGB,r,g,b DEBUG/TUNER/CALIB,0/1",
+             "TOUR WAIT_DIGIT then %d stable track frames; X/SPACE=latched stop",
              AUTO_START_CONFIRM_FRAMES);
     ESP_LOGI(TAG,
              "Foot-track controller: gate=center-half/12rows follow=%d correction<=%d antistall=%dms/+%d pivot=%d/%d reacquire=%dframes hint=%d@weight%d foot-lost=%dframes timeout=%dms",

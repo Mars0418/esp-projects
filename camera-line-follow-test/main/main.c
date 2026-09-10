@@ -9,6 +9,7 @@
 #include "black_marker_vision.h"
 #include "camera_display.h"
 #include "camera_line_follow.h"
+#include "tour_guide.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
@@ -1042,96 +1043,6 @@ static void queue_line_debug_frame(const uint8_t *raw_pixels,
                                   LINE_DECODED_HEIGHT, &metadata);
 }
 
-static void tft_display_task(void *argument)
-{
-    (void)argument;
-    int32_t previous_counts[3] = {0};
-    int64_t previous_sample_us = 0;
-    bool previous_source_post_odometry = false;
-    bool previous_counts_valid = false;
-    TickType_t last_wake = xTaskGetTickCount();
-
-    while (true) {
-        const int64_t now_us = esp_timer_get_time();
-        const operation_phase_t phase = s_operation_phase;
-        const bool line_source =
-            phase == OPERATION_LINE_FOLLOW ||
-            phase == OPERATION_LINE_HANDOFF;
-        const bool post_source = !line_source && s_post_navigation_initialized;
-        int32_t counts[3] = {0};
-        bool counts_valid = false;
-
-        if (post_source) {
-            post_line_odometry_pose_t pose = {0};
-            if (post_line_odometry_get_pose(&pose)) {
-                counts[0] = pose.count_a;
-                counts[1] = pose.count_b;
-                counts[2] = pose.count_d;
-                counts_valid = true;
-            }
-        } else if (line_source) {
-            camera_line_follow_get_encoder_counts(
-                &counts[0], &counts[1], &counts[2]);
-            counts_valid = true;
-        }
-
-        int rpm[3] = {0};
-        if (counts_valid && previous_counts_valid &&
-            post_source == previous_source_post_odometry) {
-            const int64_t elapsed_us = now_us - previous_sample_us;
-            if (elapsed_us > 0) {
-                const float counts_per_revolution[3] = {
-                    POST_ODOM_A_COUNTS_PER_REV,
-                    POST_ODOM_B_COUNTS_PER_REV,
-                    POST_ODOM_D_COUNTS_PER_REV,
-                };
-                const float encoder_sign[3] = {
-                    POST_ODOM_A_ENCODER_SIGN,
-                    POST_ODOM_B_ENCODER_SIGN,
-                    POST_ODOM_D_ENCODER_SIGN,
-                };
-                for (size_t wheel = 0; wheel < 3; ++wheel) {
-                    const int32_t delta = (int32_t)(
-                        (uint32_t)counts[wheel] -
-                        (uint32_t)previous_counts[wheel]);
-                    rpm[wheel] = (int)lroundf(
-                        delta * encoder_sign[wheel] * 60000000.0f /
-                        (counts_per_revolution[wheel] * elapsed_us));
-                }
-            }
-        }
-
-        if (counts_valid) {
-            memcpy(previous_counts, counts, sizeof(previous_counts));
-            previous_sample_us = now_us;
-            previous_source_post_odometry = post_source;
-            previous_counts_valid = true;
-        } else {
-            previous_counts_valid = false;
-        }
-
-        int distance_mm = -1;
-        bool distance_valid = false;
-        if (line_source) {
-            camera_line_follow_debug_status_t status = {0};
-            if (camera_line_follow_get_debug_status(&status) &&
-                status.distance_mm >= 0) {
-                distance_mm = status.distance_mm;
-                distance_valid = true;
-            }
-        }
-
-        const esp_err_t error = camera_display_show_telemetry(
-            rpm[0], rpm[1], rpm[2], distance_mm, distance_valid);
-        if (error != ESP_OK) {
-            ESP_LOGW(TAG, "TFT telemetry failed: %s",
-                     esp_err_to_name(error));
-        }
-        xTaskDelayUntil(&last_wake,
-                        pdMS_TO_TICKS(TFT_TELEMETRY_INTERVAL_MS));
-    }
-}
-
 static void emit_rgb_debug_frame(const uint8_t *raw_pixels,
                                  size_t width, size_t height,
                                  const line_vision_result_t *result)
@@ -1486,6 +1397,12 @@ static void frame_display_task(void *argument)
         }
         if (decode_error == ESP_OK && output.width == DECODED_WIDTH &&
             output.height == DECODED_HEIGHT) {
+            if (digit_phase) {
+                tour_guide_process_digit(s_decoded_frame, captured_at_us);
+                release_mjpeg_slot(slot_index);
+                vTaskDelay(1);
+                continue;
+            }
             const int64_t decode_done_us = esp_timer_get_time();
             const bool rgb_debug = camera_line_follow_debug_enabled();
             const bool tuner = camera_line_follow_tuner_enabled();
@@ -2560,9 +2477,10 @@ static void frame_display_task(void *argument)
         const bool line_phase =
             s_operation_phase == OPERATION_LINE_FOLLOW ||
             s_operation_phase == OPERATION_LINE_HANDOFF;
-        const size_t decoded_width = line_phase
+        const bool digit_phase = tour_guide_waiting();
+        const size_t decoded_width = line_phase && !digit_phase
             ? LINE_DECODED_WIDTH : DECODED_WIDTH;
-        const size_t decoded_height = line_phase
+        const size_t decoded_height = line_phase && !digit_phase
             ? LINE_DECODED_HEIGHT : DECODED_HEIGHT;
         esp_jpeg_image_output_t output = {0};
         esp_err_t decode_error;
@@ -2578,7 +2496,7 @@ static void frame_display_task(void *argument)
                 .outbuf = s_decoded_frame,
                 .outbuf_size = DECODED_BUFFER_BYTES,
                 .out_format = JPEG_IMAGE_FORMAT_RGB565,
-                .out_scale = line_phase
+                .out_scale = line_phase && !digit_phase
                     ? line_decode_scale_for_slot(&s_slots[slot_index])
                     : s_decode_scale,
                 .flags = {
@@ -2594,6 +2512,12 @@ static void frame_display_task(void *argument)
 
         if (decode_error == ESP_OK && output.width == decoded_width &&
             output.height == decoded_height) {
+            if (digit_phase) {
+                tour_guide_process_digit(s_decoded_frame, captured_at_us);
+                release_mjpeg_slot(slot_index);
+                vTaskDelay(1);
+                continue;
+            }
             const int64_t decode_done_us = esp_timer_get_time();
             if (line_phase) {
                 const bool rgb_debug = camera_line_follow_debug_enabled();
@@ -2604,6 +2528,13 @@ static void frame_display_task(void *argument)
                            decoded_width * decoded_height * 2);
                 }
 
+                static int64_t last_preview_us;
+                if (decode_done_us - last_preview_us >= 100000) {
+                    const esp_err_t display_error = camera_display_show_rotated_rgb565(
+                        s_decoded_frame, output.width, output.height);
+                    if (display_error != ESP_OK) ESP_LOGW(TAG, "Camera preview: %s", esp_err_to_name(display_error));
+                    last_preview_us = decode_done_us;
+                }
                 line_vision_result_t line_result;
                 line_vision_process(s_decoded_frame, output.width,
                                     output.height, &line_result);
@@ -2633,7 +2564,7 @@ static void frame_display_task(void *argument)
                     last_rgb_debug_us = vision_done_us;
                 }
 
-                if (camera_line_follow_take_course_complete()) {
+                if (false && camera_line_follow_take_course_complete()) {
                     const esp_err_t transition_error =
                         transition_to_ball_capture();
                     if (transition_error != ESP_OK) {
@@ -3019,14 +2950,8 @@ static esp_err_t initialize_frame_pipeline(void)
                                 NULL, 4, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    if (!CAMERA_CALIBRATION_ONLY) {
-        if (xTaskCreatePinnedToCore(tft_display_task, "tft_telemetry", 4096,
-                                    NULL, 2, NULL, 0) != pdPASS) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
     ESP_LOGI(TAG,
-             "PIPELINE decode/path-pursuit=core1 TFT-telemetry=core0 line=%dx%d ball=%dx%d queue=latest",
+             "PIPELINE decode/path-pursuit=core1 TFT-camera=core1 line=%dx%d ball=%dx%d queue=latest",
              LINE_DECODED_WIDTH, LINE_DECODED_HEIGHT,
              DECODED_WIDTH, DECODED_HEIGHT);
     return ESP_OK;
@@ -3129,7 +3054,7 @@ void app_main(void)
             ? OPERATION_BALL_CAPTURE : OPERATION_LINE_FOLLOW;
         ESP_ERROR_CHECK(push_debug_stream_init());
         ESP_ERROR_CHECK(camera_display_init());
-        ESP_ERROR_CHECK(camera_display_show_telemetry(0, 0, 0, -1, false));
+        ESP_ERROR_CHECK(camera_display_show_waiting());
         if (SIMPLE_BALL_TEST && !INTEGRATED_SIMPLE_MISSION) {
             ESP_ERROR_CHECK(post_line_odometry_init());
             ESP_ERROR_CHECK(post_line_navigation_init(0, 0, 0));
@@ -3139,6 +3064,7 @@ void app_main(void)
         } else if (!VISION_PREVIEW_ONLY) {
             ESP_ERROR_CHECK(line_vision_init(LINE_DECODED_WIDTH,
                                              LINE_DECODED_HEIGHT));
+            ESP_ERROR_CHECK(tour_guide_init());
             ESP_ERROR_CHECK(camera_line_follow_init());
         } else {
             ESP_ERROR_CHECK(initialize_ball_capture_vision());

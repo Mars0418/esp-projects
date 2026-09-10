@@ -1,3 +1,9 @@
+## 智能导览分支
+
+当前分支 `innovative-function-smart-tour`：数字 1 选左路、2 选右路，每个拐点停留 2 秒，线路结束停车；TFT 显示实时摄像画面及数字识别结果。
+
+[导览使用、构建与验证说明](camera-line-follow-test/SMART_TOUR.md)。当前版本 `smart-tour-v3` 已编译、通过主机测试并烧录 COM6；实车路线与屏幕效果仍需现场验证。
+
 # ESP32-S3 小车工程
 
 小车键盘遥控主工程是 `tb6612-motor-a-test`，当前编译入口为

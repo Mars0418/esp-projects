@@ -1,7 +1,6 @@
 #include "camera_display.h"
 
 #include <stdbool.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -11,6 +10,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #define TFT_HOST       SPI2_HOST
 #define TFT_PIN_SCLK   GPIO_NUM_3
@@ -20,42 +20,12 @@
 #define TFT_WIDTH      128
 #define TFT_HEIGHT     160
 #define TFT_SPI_HZ     (20 * 1000 * 1000)
-#define TFT_SPI_CHUNK  8192
+#define TFT_SPI_CHUNK  4096
 
 static const char *TAG = "CAMERA_TFT";
 static spi_device_handle_t s_tft;
 static uint8_t *s_framebuffer;
-
-typedef struct {
-    char character;
-    uint8_t rows[7];
-} glyph_t;
-
-static const glyph_t s_font[] = {
-    {' ', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
-    {'+', {0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00}},
-    {'-', {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}},
-    {'0', {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}},
-    {'1', {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}},
-    {'2', {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}},
-    {'3', {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e}},
-    {'4', {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}},
-    {'5', {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e}},
-    {'6', {0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e}},
-    {'7', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
-    {'8', {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}},
-    {'9', {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e}},
-    {'A', {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}},
-    {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}},
-    {'D', {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}},
-    {'I', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1f}},
-    {'M', {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}},
-    {'O', {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}},
-    {'P', {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}},
-    {'R', {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}},
-    {'S', {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}},
-    {'T', {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
-};
+static SemaphoreHandle_t s_display_mutex;
 
 static esp_err_t tft_write(bool data_mode, const void *data, size_t length)
 {
@@ -103,10 +73,7 @@ static esp_err_t tft_pixel_data(const void *data, size_t length)
             .length = chunk * 8,
             .tx_buffer = bytes + offset,
         };
-        /* The framebuffer is DMA-capable. Interrupt-driven transfers let
-         * the higher-priority USB camera task run on core 0 while SPI is
-         * shifting the pixels, instead of busy-waiting for every chunk. */
-        result = spi_device_transmit(s_tft, &transaction);
+        result = spi_device_polling_transmit(s_tft, &transaction);
         if (result != ESP_OK) {
             break;
         }
@@ -140,61 +107,10 @@ static void set_pixel(size_t x, size_t y, uint16_t color)
     s_framebuffer[offset + 1] = color & 0xff;
 }
 
-static const uint8_t *font_rows(char character)
-{
-    for (size_t index = 0;
-         index < sizeof(s_font) / sizeof(s_font[0]); ++index) {
-        if (s_font[index].character == character) {
-            return s_font[index].rows;
-        }
-    }
-    return s_font[0].rows;
-}
-
-static void fill_rectangle(int x, int y, int width, int height,
-                           uint16_t color)
-{
-    for (int row = y; row < y + height; ++row) {
-        if (row < 0 || row >= TFT_HEIGHT) continue;
-        for (int column = x; column < x + width; ++column) {
-            if (column < 0 || column >= TFT_WIDTH) continue;
-            set_pixel((size_t)column, (size_t)row, color);
-        }
-    }
-}
-
-static void draw_character(int x, int y, char character, int scale,
-                           uint16_t color)
-{
-    const uint8_t *rows = font_rows(character);
-    for (int row = 0; row < 7; ++row) {
-        for (int column = 0; column < 5; ++column) {
-            if (rows[row] & (1U << (4 - column))) {
-                fill_rectangle(x + column * scale, y + row * scale,
-                               scale, scale, color);
-            }
-        }
-    }
-}
-
-static void draw_text(int x, int y, const char *text, int scale,
-                      uint16_t color)
-{
-    while (*text != '\0') {
-        draw_character(x, y, *text++, scale, color);
-        x += 6 * scale;
-    }
-}
-
-static int clamp_rpm(int rpm)
-{
-    if (rpm < -999) return -999;
-    if (rpm > 999) return 999;
-    return rpm;
-}
-
 esp_err_t camera_display_init(void)
 {
+    s_display_mutex=xSemaphoreCreateMutex();
+    if (!s_display_mutex) return ESP_ERR_NO_MEM;
     const spi_bus_config_t bus_config = {
         .mosi_io_num = TFT_PIN_MOSI,
         .miso_io_num = GPIO_NUM_NC,
@@ -283,30 +199,97 @@ esp_err_t camera_display_init(void)
     return ESP_OK;
 }
 
-esp_err_t camera_display_show_telemetry(int rpm_a, int rpm_b, int rpm_d,
-                                        int distance_mm,
-                                        bool distance_valid)
+esp_err_t camera_display_show_waiting(void)
 {
-    char line[16];
+    xSemaphoreTake(s_display_mutex,portMAX_DELAY);
     memset(s_framebuffer, 0, TFT_WIDTH * TFT_HEIGHT * 2);
-
-    fill_rectangle(2, 2, TFT_WIDTH - 4, 2, 0xffff);
-    fill_rectangle(2, TFT_HEIGHT - 4, TFT_WIDTH - 4, 2, 0xffff);
-    draw_text(10, 10, "MOTOR RPM", 2, 0xffff);
-
-    snprintf(line, sizeof(line), "A %+4d", clamp_rpm(rpm_a));
-    draw_text(16, 39, line, 2, 0x07ff);
-    snprintf(line, sizeof(line), "B %+4d", clamp_rpm(rpm_b));
-    draw_text(16, 65, line, 2, 0xfd20);
-    snprintf(line, sizeof(line), "D %+4d", clamp_rpm(rpm_d));
-    draw_text(16, 91, line, 2, 0x07e0);
-
-    if (distance_valid && distance_mm >= 0) {
-        if (distance_mm > 9999) distance_mm = 9999;
-        snprintf(line, sizeof(line), "DIST %d MM", distance_mm);
-    } else {
-        snprintf(line, sizeof(line), "DIST --- MM");
+    for (size_t y = 42; y < 118; ++y) {
+        for (size_t x = 18; x < 110; ++x) {
+            const bool border = x < 22 || x >= 106 || y < 46 || y >= 114;
+            set_pixel(x, y, border ? 0x07ff : 0x0010);
+        }
     }
-    draw_text(4, 126, line, 1, 0xffff);
-    return tft_send_frame();
+    esp_err_t err=tft_send_frame();
+    xSemaphoreGive(s_display_mutex);
+    return err;
+}
+
+esp_err_t camera_display_show_rotated_rgb565(const uint8_t *pixels,
+                                              size_t width,
+                                              size_t height)
+{
+    ESP_RETURN_ON_FALSE(pixels != NULL && width <= TFT_HEIGHT &&
+                        height <= TFT_WIDTH, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid camera frame dimensions");
+    xSemaphoreTake(s_display_mutex,portMAX_DELAY);
+
+    memset(s_framebuffer, 0, TFT_WIDTH * TFT_HEIGHT * 2);
+    const size_t scale = width <= 80 && height <= 60 ? 2 : 1;
+    const size_t x_offset = (TFT_WIDTH - height * scale) / 2;
+    const size_t y_offset = (TFT_HEIGHT - width * scale) / 2;
+    for (size_t sy = 0; sy < height; ++sy) {
+        for (size_t sx = 0; sx < width; ++sx) {
+            const size_t source = 2 * (sy * width + sx);
+            for (size_t dy = 0; dy < scale; ++dy) {
+                for (size_t dx = 0; dx < scale; ++dx) {
+                    const size_t x = x_offset + (height - 1 - sy) * scale + dx;
+                    const size_t y = y_offset + sx * scale + dy;
+                    const size_t destination = 2 * (y * TFT_WIDTH + x);
+                    s_framebuffer[destination] = pixels[source];
+                    s_framebuffer[destination + 1] = pixels[source + 1];
+                }
+            }
+        }
+    }
+    esp_err_t err=tft_send_frame();
+    xSemaphoreGive(s_display_mutex);
+    return err;
+}
+
+static void box(int x,int y,int w,int h,uint16_t color)
+{
+    if(x<0||y<0||x+w>128||y+h>160||w<1||h<1) return;
+    for(int i=x;i<x+w;++i) {set_pixel(i,y,color);set_pixel(i,y+h-1,color);}
+    for(int i=y;i<y+h;++i) {set_pixel(x,i,color);set_pixel(x+w-1,i,color);}
+}
+static void number(int x,int y,int n,int scale,uint16_t color)
+{
+    static const uint8_t font[11][5]={
+        {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},
+        {7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},{7,5,7,5,7},{7,5,7,1,7},{0,0,7,0,0}};
+    if(n<0||n>9)n=10;
+    for(int row=0;row<5;++row)for(int col=0;col<3;++col)
+        if(font[n][row]&(1<<(2-col)))
+            for(int dy=0;dy<scale;++dy)for(int dx=0;dx<scale;++dx)
+                set_pixel(x+col*scale+dx,y+row*scale+dy,color);
+}
+esp_err_t camera_display_show_digit(const uint8_t *pixels,const uint8_t input[784],
+                                    const digit_region_t *r,int digit,float score,bool stable)
+{
+    xSemaphoreTake(s_display_mutex,portMAX_DELAY);
+    memset(s_framebuffer,0,128*160*2);
+    for(int sy=0;sy<120;++sy)for(int sx=0;sx<160;++sx) {
+        int p=(sy*160+sx)*2;
+        set_pixel(4+119-sy,sx,((uint16_t)pixels[p]<<8)|pixels[p+1]);
+    }
+    box(4+DIGIT_ROI_X,DIGIT_ROI_Y,DIGIT_ROI_SIZE,DIGIT_ROI_SIZE,0xffe0);
+    if(r->valid)box(4+r->x,r->y,r->width,r->height,stable?0x07e0:0x07ff);
+    for(int y=0;y<26;++y)for(int x=0;x<128;++x)set_pixel(x,y,0);
+    for(int y=132;y<160;++y)for(int x=0;x<128;++x)set_pixel(x,y,0);
+    number(58,3,digit,4,stable?0x07e0:0xffe0);
+    for(int y=0;y<28;++y)for(int x=0;x<28;++x) {
+        int v=input[y*28+x];
+        set_pixel(x+2,y+132,((v>>3)<<11)|((v>>2)<<5)|(v>>3));
+    }
+    int percent=(int)(score*100+0.5f);
+    if(percent>100)percent=100;
+    number(42,134,percent/100,3,0xffff);
+    number(54,134,(percent/10)%10,3,0xffff);
+    number(66,134,percent%10,3,0xffff);
+    box(42,153,80,5,0x7bef);
+    for(int x=43;x<43+percent*78/100;++x)
+        for(int y=154;y<157;++y)set_pixel(x,y,stable?0x07e0:0xffe0);
+    esp_err_t err=tft_send_frame();
+    xSemaphoreGive(s_display_mutex);
+    return err;
 }

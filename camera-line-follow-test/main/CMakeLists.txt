@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "purple_ball_vision.c" "ball_vision.c"
+    SRCS "tour_guide.c" "digit_model.c" "digit_vision.c" "digit_gate.c" "purple_ball_vision.c" "ball_vision.c"
          "black_marker_vision.c" "quarter_goal_pose.c"
          "post_line_odometry.c" "post_line_navigation.c" "line_vision.c"
          "push_debug_stream.c" "main.c" "camera_display.c"

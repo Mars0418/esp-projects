@@ -13,6 +13,7 @@ elseif(SIMPLE_BALL_TEST)
 else()
     set(PROJECT_VER "cam-p41-ballcapturer")
 endif()
+set(PROJECT_VER "smart-tour-v3")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(camera-line-follow-test)
 

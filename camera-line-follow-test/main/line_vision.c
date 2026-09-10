@@ -1,4 +1,5 @@
 #include "line_vision.h"
+#include "tour_guide.h"
 
 #include <limits.h>
 #include <math.h>
@@ -27,7 +28,7 @@
 #define CORNER_MIN_SEGMENT_SAMPLES 3
 #define CORNER_LOCAL_RADIUS 3
 #define CORNER_MIN_VECTOR_LENGTH_SQUARED 9
-#define CORNER_MIN_ANGLE_DEG 45
+#define CORNER_MIN_ANGLE_DEG 25
 #define CORNER_MIN_IMPROVEMENT_PERCENT 15
 #define STRAIGHT_CORRIDOR_HALF_WIDTH 9
 #define STRAIGHT_CORRIDOR_MIN_VECTOR_SQUARED 25
@@ -519,6 +520,21 @@ static int trace_component_path(size_t width, size_t height,
         }
     }
 
+    const int route = tour_guide_route();
+    if (route == 1 || route == 2) {
+        int left_tip = -1, right_tip = -1;
+        /* Only bias a genuine fork straddling the anchor. Preserve the
+         * original longest-path tracing on a single straight/bent line. */
+        for (size_t i = 0; i < component_count; ++i) {
+            const int candidate = s_best_component[i];
+            if (s_parent[candidate] == UINT16_MAX ||
+                s_distance[candidate] < FOOT_MIN_PATH_PIXELS) continue;
+            const int delta = candidate % (int)width - anchor % (int)width;
+            if (delta >= 10 && (left_tip < 0 || s_distance[candidate] > s_distance[left_tip])) left_tip = candidate;
+            if (delta <= -10 && (right_tip < 0 || s_distance[candidate] > s_distance[right_tip])) right_tip = candidate;
+        }
+        if (left_tip >= 0 && right_tip >= 0) farthest = route == 1 ? left_tip : right_tip;
+    }
     size_t path_length = 0;
     int pixel = farthest;
     while (path_length < s_pixel_capacity) {

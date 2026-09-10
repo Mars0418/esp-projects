@@ -1,3 +1,5 @@
 /sdkconfig
 /dependencies.lock
 /captures/
+/firmware/
+/tests/tour_*_test.exe
