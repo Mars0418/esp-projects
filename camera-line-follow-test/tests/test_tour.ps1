@@ -1,7 +1,19 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
     $flags=@('-std=c11','-I','tests/tour_stubs','-I','tests/host_stubs','-I','main','-Dheap_caps_free=free','-DESP_FAIL=-1')
+    & gcc @flags tests/tour_serial_test.c -o tests/tour_serial_test.exe
+    if($LASTEXITCODE) {throw "serial test compilation failed"}
+    & ./tests/tour_serial_test.exe
+    if($LASTEXITCODE) {throw "serial test failed"}
+    & gcc @flags tests/tour_start_turn_test.c main/tour_start_turn.c -lm -o tests/tour_start_turn_test.exe
+    if($LASTEXITCODE) {throw "start turn test compilation failed"}
+    & ./tests/tour_start_turn_test.exe
+    if($LASTEXITCODE) {throw "start turn test failed"}
+    & gcc @flags tests/tour_station_test.c main/tour_stations.c -o tests/tour_station_test.exe
+    if($LASTEXITCODE) {throw "station test compilation failed"}
+    & ./tests/tour_station_test.exe
+    if($LASTEXITCODE) {throw "station test failed"}
     & gcc @flags tests/tour_corner_test.c -o tests/tour_corner_test.exe
     if($LASTEXITCODE) {throw 'corner test compilation failed'}
     & ./tests/tour_corner_test.exe

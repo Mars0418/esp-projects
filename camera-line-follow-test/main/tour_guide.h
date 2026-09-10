@@ -8,3 +8,8 @@ int tour_guide_route(void);
 bool tour_guide_waiting(void);
 bool tour_guide_departure_ready(int64_t now_us);
 void tour_guide_stop(void);
+void tour_guide_digit_status(int *digit, int *score);
+
+bool tour_guide_begin(void);
+void tour_guide_enable_scan(int64_t now_us);
+bool tour_guide_scanning(void);

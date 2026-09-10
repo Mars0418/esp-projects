@@ -10,6 +10,8 @@
 #include "camera_display.h"
 #include "camera_line_follow.h"
 #include "tour_guide.h"
+#include "tour_speech.h"
+#include "tour_network.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_check.h"
@@ -1021,7 +1023,17 @@ static void queue_line_debug_frame(const uint8_t *raw_pixels,
 {
     camera_line_follow_debug_status_t control = {0};
     camera_line_follow_get_debug_status(&control);
+    int digit, score;
+    tour_guide_digit_status(&digit, &score);
     const push_debug_metadata_t metadata = {
+        .tour_active = true, .tour_route = tour_guide_route(),
+        .tour_digit = digit, .tour_score = score,
+        .tour_corners = control.tour_corners, .tour_dwell_ms = control.tour_dwell_ms,
+        .tour_can_start = control.tour_can_start,
+        .tour_started = control.tour_started, .tour_finished = control.tour_finished,
+        .tour_turn_deg = control.tour_turn_deg, .tour_turn_target = control.tour_turn_target,
+        .tour_audio_ready = control.tour_audio_ready, .tour_audio_busy = control.tour_audio_busy,
+        .tour_audio_failed = control.tour_audio_failed,
         .phase_name = "LINE_FOLLOW",
         .captured_at_us = captured_at_us,
         .processed_at_us = esp_timer_get_time(),
@@ -1399,6 +1411,23 @@ static void frame_display_task(void *argument)
             output.height == DECODED_HEIGHT) {
             if (digit_phase) {
                 tour_guide_process_digit(s_decoded_frame, captured_at_us);
+                if (push_debug_stream_is_enabled()) {
+                    camera_line_follow_debug_status_t tour_control = {0};
+                    camera_line_follow_get_debug_status(&tour_control);
+                    int digit, score;
+                    tour_guide_digit_status(&digit, &score);
+                    const push_debug_metadata_t metadata = {
+                        .phase_name = "TOUR_DIGIT", .tour_active = true,
+                        .tour_can_start = tour_control.tour_can_start,
+                        .tour_audio_ready = tour_speech_ready(), .tour_audio_busy = tour_speech_busy(),
+                        .tour_audio_failed = tour_speech_failed(),
+                        .tour_route = tour_guide_route(), .tour_digit = digit, .tour_score = score,
+                        .captured_at_us = captured_at_us, .processed_at_us = esp_timer_get_time(),
+                        .mission_state_name = "WAIT_DIGIT", .push_entry_name = "NONE",
+                        .line_control_state_name = tour_control.valid ? tour_control.state : "WAIT_START",
+                    };
+                    push_debug_stream_queue_frame(s_decoded_frame, output.width, output.height, &metadata);
+                }
                 release_mjpeg_slot(slot_index);
                 vTaskDelay(1);
                 continue;
@@ -2514,6 +2543,23 @@ static void frame_display_task(void *argument)
             output.height == decoded_height) {
             if (digit_phase) {
                 tour_guide_process_digit(s_decoded_frame, captured_at_us);
+                if (push_debug_stream_is_enabled()) {
+                    camera_line_follow_debug_status_t tour_control = {0};
+                    camera_line_follow_get_debug_status(&tour_control);
+                    int digit, score;
+                    tour_guide_digit_status(&digit, &score);
+                    const push_debug_metadata_t metadata = {
+                        .phase_name = "TOUR_DIGIT", .tour_active = true,
+                        .tour_can_start = tour_control.tour_can_start,
+                        .tour_audio_ready = tour_speech_ready(), .tour_audio_busy = tour_speech_busy(),
+                        .tour_audio_failed = tour_speech_failed(),
+                        .tour_route = tour_guide_route(), .tour_digit = digit, .tour_score = score,
+                        .captured_at_us = captured_at_us, .processed_at_us = esp_timer_get_time(),
+                        .mission_state_name = "WAIT_DIGIT", .push_entry_name = "NONE",
+                        .line_control_state_name = tour_control.valid ? tour_control.state : "WAIT_START",
+                    };
+                    push_debug_stream_queue_frame(s_decoded_frame, output.width, output.height, &metadata);
+                }
                 release_mjpeg_slot(slot_index);
                 vTaskDelay(1);
                 continue;
@@ -3080,6 +3126,7 @@ void app_main(void)
     s_uvc_events = xEventGroupCreate();
     ESP_ERROR_CHECK(s_uvc_events == NULL ? ESP_ERR_NO_MEM : ESP_OK);
     ESP_ERROR_CHECK(initialize_usb_host());
+    ESP_ERROR_CHECK(tour_speech_init());
 
     libuvc_adapter_config_t adapter_config = {
         .create_background_task = true,
@@ -3095,6 +3142,9 @@ void app_main(void)
         ESP_LOGE(TAG, "uvc_init failed: %s", uvc_error_string(init_result));
         return;
     }
+
+    esp_err_t network_result=tour_network_init();
+    if(network_result!=ESP_OK) ESP_LOGW(TAG,"Optional XiaoZhi network unavailable: %s",esp_err_to_name(network_result));
 
     while (true) {
         ESP_LOGI(TAG, "CAMERA_STATUS=WAITING_FOR_USB_CAMERA");

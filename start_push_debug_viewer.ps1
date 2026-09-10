@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Port = "",
     [switch]$AutoConnect
@@ -7,7 +7,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$candidates = @()
+$candidates = @("C:\Espressif\tools\python\v5.5.5\venv\Scripts\python.exe")
 if ($env:IDF_PYTHON_ENV_PATH) {
     $candidates += Join-Path $env:IDF_PYTHON_ENV_PATH "Scripts\python.exe"
 }

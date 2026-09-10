@@ -50,7 +50,7 @@ cmd = [sys.executable, str(idf / 'tools/idf.py'), '-B', str(build),
 if a.action == 'build':
     cmd += ['build']
 else:
-    cmd += ['-p', a.port, 'app-flash' if a.action == 'flash' else 'monitor']
+    cmd += ['-p', a.port, 'flash' if a.action == 'flash' else 'monitor']
 result = subprocess.run(cmd, cwd=project, env=env)
 if result.returncode:
     sys.exit(result.returncode)

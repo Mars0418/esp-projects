@@ -13,9 +13,30 @@ elseif(SIMPLE_BALL_TEST)
 else()
     set(PROJECT_VER "cam-p41-ballcapturer")
 endif()
-set(PROJECT_VER "smart-tour-v3")
+set(PROJECT_VER "smart-tour-v7")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(camera-line-follow-test)
+
+# Windows ld needs an ASCII path for prebuilt archives. Do not edit managed files.
+if(CMAKE_HOST_WIN32)
+    idf_component_get_property(codec_dir espressif__esp_audio_codec COMPONENT_DIR)
+    foreach(codec_kind codec simple_dec)
+        set(codec_file "libesp_audio_${codec_kind}.a")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/codec_libs")
+        configure_file("${codec_dir}/lib/${CONFIG_IDF_TARGET}/${codec_file}"
+            "${CMAKE_BINARY_DIR}/codec_libs/${codec_file}" COPYONLY)
+        add_library(tour_${codec_kind} STATIC IMPORTED GLOBAL)
+        set_target_properties(tour_${codec_kind} PROPERTIES
+            IMPORTED_LOCATION "${CMAKE_BINARY_DIR}/codec_libs/${codec_file}")
+    endforeach()
+    foreach(link_property LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+        get_target_property(codec_links __idf_espressif__esp_audio_codec ${link_property})
+        string(REPLACE "esp_acodec" "tour_codec" codec_links "${codec_links}")
+        string(REPLACE "esp_sdec" "tour_simple_dec" codec_links "${codec_links}")
+        string(REPLACE "${codec_dir}/lib/${CONFIG_IDF_TARGET}" "${CMAKE_BINARY_DIR}/codec_libs" codec_links "${codec_links}")
+        set_target_properties(__idf_espressif__esp_audio_codec PROPERTIES ${link_property} "${codec_links}")
+    endforeach()
+endif()
 
 # JPEG decoding dominates the frame budget; keep speed optimization independent
 # of the application's debug-friendly SDK configuration.

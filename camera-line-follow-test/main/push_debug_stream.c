@@ -1,4 +1,5 @@
 #include "push_debug_stream.h"
+#include "xiaozhi_client.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -94,6 +95,8 @@ static int build_metadata(char *buffer, size_t capacity,
         ",\"processed_us\":%" PRId64 ",\"emitted_us\":%" PRId64
         ",\"width\":%d,\"height\":%d,\"format\":\"%s\""
         ",\"stream\":{\"queued\":%" PRIu32 ",\"dropped\":%" PRIu32 "}"
+        ",\"xiaozhi\":{\"state\":%d,\"binding_code\":%d}"
+        ",\"tour\":{\"active\":%d,\"route\":%d,\"digit\":%d,\"score\":%d,\"corners\":%d,\"dwell_ms\":%d,\"can_start\":%d,\"started\":%d,\"finished\":%d,\"audio_ready\":%d,\"audio_busy\":%d,\"audio_failed\":%d,\"turn_deg\":%d,\"turn_target\":%d}"
         ",\"mission\":{\"state_id\":%d,\"state\":\"%s\""
         ",\"push_entry_id\":%d,\"push_entry\":\"%s\""
         ",\"selected_ball\":%d,\"target_goal\":%d,\"ball_held\":%d"
@@ -129,6 +132,9 @@ static int build_metadata(char *buffer, size_t capacity,
         m->captured_at_us, m->processed_at_us, emitted_at_us,
         (int)slot->width, (int)slot->height, SIMPLE_BALL_TEST ? "RGB565BE" : "RGB332",
         s_queued_frames, s_dropped_frames,
+        xiaozhi_status(), xiaozhi_binding_code(),
+        m->tour_active, m->tour_route, m->tour_digit, m->tour_score,
+        m->tour_corners, m->tour_dwell_ms, m->tour_can_start, m->tour_started, m->tour_finished, m->tour_audio_ready, m->tour_audio_busy, m->tour_audio_failed, m->tour_turn_deg, m->tour_turn_target,
         m->mission_state, slot->mission_state_name,
         m->push_entry, slot->push_entry_name, m->selected_ball,
         m->target_goal, m->ball_held, m->visual_goal_locked,

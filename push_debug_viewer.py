@@ -13,7 +13,7 @@ import struct
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, simpledialog
 import zlib
 
 try:
@@ -140,6 +140,7 @@ class SerialWorker:
             target=self._read_loop, name="push-debug-serial", daemon=True
         )
         self.thread.start()
+        self.write(f"@TIME,{int(time.time())}\n".encode("ascii"))
 
     def write(self, payload: bytes) -> None:
         port = self.port
@@ -257,6 +258,7 @@ class PushDebugViewer:
         self.status_var = tk.StringVar(value="Disconnected")
         self.stats_var = tk.StringVar(value="Waiting for frames")
         self.control_var = tk.StringVar(value="Control: --")
+        self.xiaozhi_var = tk.StringVar(value="小智：等待设备状态")
         self.mission_var = tk.StringVar(value="Mission: --")
         self.objects_var = tk.StringVar(value="Objects: --")
         self.record_var = tk.BooleanVar(value=True)
@@ -286,6 +288,9 @@ class PushDebugViewer:
             toolbar, text="开始红球→紫球", command=self.start_simple_push, state="disabled"
         )
         self.simple_start_button.pack(side="left", padx=4)
+        self.pause_button = ttk.Button(toolbar, text="停车", command=self.pause_tour)
+        self.pause_button.pack(side="left", padx=4)
+        ttk.Button(toolbar, text="试听欢迎词", command=self.preview_speech).pack(side="left", padx=4)
         ttk.Button(toolbar, text="Emergency stop", command=self.emergency_stop).pack(
             side="left", padx=(8, 0)
         )
@@ -321,6 +326,13 @@ class PushDebugViewer:
         ttk.Label(details_panel, textvariable=self.objects_var, wraplength=340).pack(
             anchor="w", fill="x", pady=(0, 8)
         )
+        ttk.Label(details_panel, textvariable=self.xiaozhi_var, wraplength=340).pack(anchor="w", pady=4)
+        voice_bar = ttk.Frame(details_panel)
+        voice_bar.pack(anchor="w", pady=4)
+        ttk.Button(voice_bar, text="小智开启", command=lambda: self.voice_command("XZ,ON")).pack(side="left")
+        ttk.Button(voice_bar, text="关闭监听", command=lambda: self.voice_command("XZ,OFF")).pack(side="left")
+        ttk.Button(voice_bar, text="绑定", command=lambda: self.voice_command("XZ,BIND")).pack(side="left")
+        ttk.Button(details_panel, text="配置 Wi-Fi（开始前）", command=self.configure_wifi).pack(anchor="w")
         ttk.Label(details_panel, text="Frame metadata").pack(anchor="w")
         self.metadata_text = tk.Text(details_panel, height=20, width=46, wrap="none")
         self.metadata_text.pack(fill="both", expand=True, pady=(4, 0))
@@ -369,9 +381,46 @@ class PushDebugViewer:
 
     def emergency_stop(self) -> None:
         try:
-            self.serial_worker.write(b"X")
+            self.serial_worker.write(b"\x03")
         except serial.SerialException as exc:
             self.events.put(("error", str(exc)))
+
+    def voice_command(self, command):
+        if not self.serial_worker.connected:
+            messagebox.showinfo("小智", "请先连接 COM6")
+            return
+        try:
+            self.serial_worker.write(("@" + command + "\n").encode("utf-8"))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def configure_wifi(self):
+        ssid = simpledialog.askstring("Wi-Fi", "2.4 GHz 热点名称（请在开始导览前配置）：", parent=self.root)
+        if not ssid:
+            return
+        password = simpledialog.askstring("Wi-Fi", "热点密码：", show="*", parent=self.root)
+        if password is None:
+            return
+        if (not 1 <= len(ssid.encode("utf-8")) <= 32 or "," in ssid
+                or any(c in ssid + password for c in "\r\n\x03")
+                or (password and not 8 <= len(password.encode("utf-8")) <= 63)):
+            messagebox.showerror("Wi-Fi", "名称需为 1–32 字节且不含逗号；密码为空或 8–63 字节，不能包含换行。")
+            return
+        self.voice_command("WIFI," + ssid + "," + password)
+
+    def preview_speech(self):
+        if self.serial_worker.connected:
+            try:
+                self.serial_worker.write(b"SAY,0\n")
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+    def pause_tour(self):
+        if self.serial_worker.connected:
+            try:
+                self.serial_worker.write(b"P")
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
 
     def start_simple_push(self) -> None:
         try:
@@ -529,13 +578,22 @@ class PushDebugViewer:
         )
 
         mission = metadata.get("mission", {})
-        self.start_line_course = phase == "LINE_FOLLOW"
+        xz = metadata.get("xiaozhi", {})
+        voice_state = {0: "未连接（检查 Wi-Fi / 麦克风 / 绑定）", 1: "连接中", 2: "正在监听", 3: "回复中", 4: "监听已关闭"}.get(xz.get("state"), "固件未提供状态")
+        code = xz.get("binding_code", -1)
+        self.xiaozhi_var.set("小智：" + voice_state + (f"\n绑定码：{code:06d}，请到 xiaozhi.me 添加设备" if code >= 0 else ""))
+        tour = metadata.get("tour", {})
+        is_tour = bool(tour.get("active"))
+        self.start_line_course = is_tour or phase == "LINE_FOLLOW"
         line_control = metadata.get("line", {}).get("control", {})
         can_start = (self.start_line_course and not line_control.get("enabled", False)) or (
             phase in ("SIMPLE_RED_PUSH", "SIMPLE_BALL_PUSH") and
             isinstance(mission, dict) and mission.get("state") == "WAIT_START")
+        self.pause_button.configure(state="normal" if is_tour and self.serial_worker.connected and bool(line_control.get("enabled")) else "disabled")
+        if is_tour:
+            can_start = bool(tour.get("can_start"))
         self.simple_start_button.configure(
-            text="开始循迹→避障→推球" if self.start_line_course else "开始红球→紫球",
+            text=("开始" if line_control.get("state")=="WAIT_START" else "起步 / 继续") if is_tour else ("开始循迹→避障→推球" if self.start_line_course else "开始红球→紫球"),
             state="normal" if can_start and self.serial_worker.connected else "disabled"
         )
         navigation = metadata.get("navigation", {})
@@ -599,6 +657,16 @@ class PushDebugViewer:
                 )
             )
 
+        if is_tour:
+            route_name = {0: "等待数字", 1: "左路", 2: "右路", -1: "停车锁定"}.get(tour.get("route"), "未知")
+            self.mission_var.set(
+                f"导览: {route_name} | 数字 {tour.get('digit', -1)} | 置信度 {tour.get('score', 0)}% | "
+                f"起点转角 {tour.get('turn_deg', 0)}° / {tour.get('turn_target', 0)}° | 拐点 {tour.get('corners', 0)} | 最少停留 {tour.get('dwell_ms', 0)} ms | "
+                f"喇叭 {'故障' if tour.get('audio_failed') else '播报中' if tour.get('audio_busy') else '就绪' if tour.get('audio_ready') else '未连接'}")
+            if phase == "TOUR_DIGIT":
+                state = line_control.get("state", "WAIT_START")
+                self.control_var.set({"WAIT_START":"点击开始：先播放欢迎词，再识别数字", "WELCOME":"欢迎词播放中，暂不识别数字", "WAIT_DIGIT":"请展示 1 或 2；1 左转30度，2 右转30度"}.get(state,state))
+                self.objects_var.set("实时相机原始画面；TFT 同时显示识别框与数字")
         self.metadata_text.configure(state="normal")
         self.metadata_text.delete("1.0", "end")
         self.metadata_text.insert("1.0", json.dumps(metadata, indent=2, ensure_ascii=False))

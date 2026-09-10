@@ -18,6 +18,15 @@ int main(int argc,char **argv) {
     int choice=argc>1?atoi(argv[1]):1;
     assert(tour_guide_init()==ESP_OK);
     assert(tour_guide_waiting() && !tour_guide_departure_ready(10000000));
+    prediction=choice;
+    for(int i=1;i<=3;++i) tour_guide_process_digit(NULL,i*10000);
+    assert(tour_guide_route()==0);
+    assert(tour_guide_begin());
+    assert(!tour_guide_begin());
+    for(int i=4;i<=6;++i) tour_guide_process_digit(NULL,i*10000);
+    assert(tour_guide_route()==0);
+    tour_guide_enable_scan(100000);
+    assert(tour_guide_scanning());
     prediction=7;
     for(int i=1;i<=3;++i) tour_guide_process_digit(NULL,i*100000);
     assert(tour_guide_waiting());
@@ -43,3 +52,5 @@ esp_err_t camera_display_show_digit(const uint8_t *p, const uint8_t *i,
     const digit_region_t *r, int d, float score, bool stable) {
     (void)p;(void)i;(void)r;(void)d;(void)score;(void)stable;return ESP_OK;
 }
+
+esp_err_t camera_display_show_rotated_rgb565(const uint8_t *p, size_t w, size_t h) {(void)p;(void)w;(void)h; return ESP_OK;}

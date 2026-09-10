@@ -1,6 +1,11 @@
 #include "camera_line_follow.h"
 #include "tour_guide.h"
 #include "tour_corner.h"
+#include "tour_speech.h"
+#include "xiaozhi_client.h"
+#include "tour_network.h"
+#include "tour_serial_frame.h"
+#include "tour_start_turn.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -315,6 +320,10 @@ static int64_t s_latest_frame_us;
 static uint32_t s_result_sequence;
 static volatile bool s_enabled;
 static bool s_tour_started;
+static bool s_tour_session, s_tour_align_active;
+static tour_start_turn_t s_tour_turn;
+static bool s_tour_paused, s_tour_resume_requested, s_tour_finished;
+static int64_t s_tour_paused_at_us;
 static bool s_tour_corner_seen;
 static bool s_tour_corner_complete;
 static int s_tour_straight_frames;
@@ -329,7 +338,8 @@ static volatile bool s_course_complete;
 static volatile bool s_handoff_requested;
 static volatile bool s_handoff_ready;
 static volatile bool s_auto_start_pending;
-static char s_uart_line[64];
+static char s_uart_line[192];
+static tour_serial_frame_t s_command_frame;
 static size_t s_uart_line_length;
 
 static int clamp_int(int value, int minimum, int maximum)
@@ -1682,6 +1692,8 @@ static void process_uart_line(void)
             ESP_LOGE(TAG, "VSTREAM command failed: %s",
                      esp_err_to_name(error));
         }
+    } else if (strcmp(s_uart_line, "SAY,0") == 0) {
+        if (!s_enabled && !tour_speech_busy()) tour_speech_play(0);
     } else if (strcmp(s_uart_line, "STATUS") == 0) {
         const line_vision_rgb_thresholds_t thresholds =
             line_vision_get_rgb_thresholds();
@@ -1699,38 +1711,44 @@ static void handle_uart_command(void)
     const int count = uart_read_bytes(UART_NUM_0, input, sizeof(input), 0);
     for (int index = 0; index < count; ++index) {
         const uint8_t value = input[index];
-        if (value == 'f' || value == 'F') {
-            if (!tour_guide_departure_ready(esp_timer_get_time()) || s_tour_started) continue;
-            s_auto_start_pending = false;
-            portENTER_CRITICAL(&s_result_lock);
-            s_course_complete = false;
-            portEXIT_CRITICAL(&s_result_lock);
-            if (s_tuner_enabled || s_calibration_enabled) {
-                s_enabled = false;
-                stop_motors();
+        int framed=tour_serial_feed(&s_command_frame,value);
+        if(framed==2) {
+            const char *line=s_command_frame.data;
+            if(!(s_tour_session && !strncmp(line,"WIFI,",5))) {
+                if(!tour_network_command(line)) {
+                    if(!strcmp(line,"XZ,ON")) xiaozhi_command("xz connect");
+                    else if(!strcmp(line,"XZ,OFF")) xiaozhi_command("xz stop");
+                    else if(!strcmp(line,"XZ,BIND")) xiaozhi_command("xz bind");
+                }
+            }
+            memset(&s_command_frame,0,sizeof(s_command_frame));
+        }
+        if(framed) { s_uart_line_length=0; continue; }
+        if(value==3) s_uart_line_length=0;
+        if (value == 'p' || value == 'P') {
+            if (s_enabled && !s_tour_paused) {
+                s_tour_paused_at_us = esp_timer_get_time();
+                s_tour_paused = true;
+                s_tour_resume_requested = false;
+                brake_motors();
+            }
+        } else if (value == 'f' || value == 'F') {
+            if (s_tour_started) {
+                if (s_enabled && (s_tour_paused || s_tour_dwell_until_us > 0))
+                    s_tour_resume_requested = true;
                 continue;
             }
-            line_vision_result_t result;
-            int64_t frame_us;
-            portENTER_CRITICAL(&s_result_lock);
-            result = s_latest_result;
-            frame_us = s_latest_frame_us;
-            portEXIT_CRITICAL(&s_result_lock);
-            if (result_ready(&result, frame_us, esp_timer_get_time()) &&
-                result.foot_track_valid) {
-                s_enabled = true;
-                ESP_LOGW(TAG, "PATH PURSUIT ENABLED");
-            } else {
-                s_enabled = false;
-                stop_motors();
-                ESP_LOGW(TAG,
-                         "START REFUSED: no fresh track under foot gate");
+            if (!s_tour_session && tour_speech_ready() && !tour_speech_busy() &&
+                !tour_speech_failed() && tour_guide_begin()) {
+                if (tour_speech_play(0)) s_tour_session=true;
+                else tour_guide_stop();
             }
         } else if (value == 'x' || value == 'X' || value == ' ' || value == 3) {
             s_auto_start_pending = false;
             s_enabled = false;
             stop_motors();
             tour_guide_stop();
+            tour_speech_cancel();
             ESP_LOGW(TAG, "TOUR ABORTED: reboot to restart");
         } else if (value == '\r' || value == '\n') {
             if (s_uart_line_length > 0) process_uart_line();
@@ -1754,7 +1772,7 @@ static void control_task(void *argument)
     uint32_t processed_sequence = 0;
     int64_t last_report_us = 0;
     bool previous_enabled = false;
-    int auto_start_frames = 0;
+
 
     while (true) {
         if (s_handoff_requested) {
@@ -1795,24 +1813,21 @@ static void control_task(void *argument)
             }
         }
 
-        if (!s_tour_started && tour_guide_departure_ready(now_us) &&
-            s_auto_start_pending && !s_enabled && new_frame &&
-            !s_tuner_enabled && !s_calibration_enabled) {
-            auto_start_frames = foot_valid ? auto_start_frames + 1 : 0;
-            if (auto_start_frames >= AUTO_START_CONFIRM_FRAMES) {
-                portENTER_CRITICAL(&s_result_lock);
-                s_course_complete = false;
-                portEXIT_CRITICAL(&s_result_lock);
-                s_auto_start_pending = false;
-                s_enabled = true;
-                ESP_LOGW(TAG,
-                         "PATH PURSUIT AUTO-STARTED after %d stable track frames",
-                         auto_start_frames);
-            }
+        if (s_tour_session && tour_guide_waiting() && !tour_speech_busy()) {
+            if (tour_speech_failed()) tour_guide_stop();
+            else tour_guide_enable_scan(now_us);
+        }
+        if (s_tour_session && !s_tour_started && tour_guide_departure_ready(now_us) &&
+            frame_fresh && !s_tuner_enabled && !s_calibration_enabled) {
+            s_enabled=true;
         }
 
         if (s_enabled && !previous_enabled) {
             s_tour_started = true;
+            int32_t counts[3];
+            camera_line_follow_get_encoder_counts(&counts[0],&counts[1],&counts[2]);
+            tour_start_turn_begin(&s_tour_turn,tour_guide_route(),counts,now_us);
+            s_tour_align_active=true;
             reset_controller(&controller);
             reset_obstacle_controller(&obstacle, now_us);
         } else if (!s_enabled && previous_enabled) {
@@ -1836,10 +1851,57 @@ static void control_task(void *argument)
             reset_controller(&controller);
             reset_obstacle_controller(&obstacle, now_us);
             ESP_LOGE(TAG, "STALE CAMERA FRAME: motors stopped");
+        } else if (tour_speech_failed()) {
+            s_enabled=false;
+            brake_motors();
+            tour_guide_stop();
+            ESP_LOGE(TAG,"TOUR AUDIO ERROR: stopped");
+        } else if (tour_speech_busy()) {
+            brake_motors();
+            if (new_frame) processed_sequence=sequence;
+        } else if (s_tour_paused) {
+            brake_motors();
+            if (s_tour_resume_requested) {
+                if (controller.pivot_active)
+                    controller.pivot_started_us += now_us - s_tour_paused_at_us;
+                if (s_tour_align_active) s_tour_turn.started_us += now_us - s_tour_paused_at_us;
+                s_tour_paused = false;
+                s_tour_resume_requested = s_tour_dwell_until_us > 0;
+            }
+            if (new_frame) processed_sequence = sequence;
+        } else if (s_tour_align_active) {
+            int32_t counts[3];
+            camera_line_follow_get_encoder_counts(&counts[0],&counts[1],&counts[2]);
+            int direction=tour_start_turn_step(&s_tour_turn,counts,now_us);
+            if (!direction) {
+                brake_motors();
+                controller.a_command=controller.d_command=0;
+            } else {
+                const int duty=145;
+                /* Same tangential motor polarities as post_line_navigation. */
+                motor_prepare(&s_motor_a,-direction,duty);
+                motor_prepare(&s_motor_b,direction,duty);
+                motor_prepare(&s_motor_d,direction,duty);
+                ESP_ERROR_CHECK(gpio_set_level(DRIVER_STBY,1));
+                controller.a_command=direction*duty;
+                controller.d_command=-direction*duty;
+            }
+            if (s_tour_turn.failed) {
+                s_enabled=false; stop_motors(); tour_guide_stop();
+                ESP_LOGE(TAG,"START TURN failed: angle=%d target=%d",(int)s_tour_turn.angle_deg,(int)s_tour_turn.target_deg);
+            } else if (s_tour_turn.done) {
+                s_tour_align_active=false;
+                reset_controller(&controller);
+                controller.turn_arm_ignore_until_us=now_us+500000;
+                ESP_LOGI(TAG,"START TURN settled at %d degrees; follow line",(int)s_tour_turn.angle_deg);
+            }
+            if (new_frame) processed_sequence=sequence;
         } else if (s_tour_dwell_until_us > 0) {
             brake_motors();
             controller.a_command = controller.d_command = 0;
-            if (now_us >= s_tour_dwell_until_us) {
+            if (tour_station_departure_allowed(s_tour_resume_requested, now_us, s_tour_dwell_until_us, tour_speech_busy())) {
+                s_tour_resume_requested = false;
+                s_tour_rearm_after_us = now_us + 500000;
                 s_tour_dwell_until_us = 0;
                 if (s_tour_pending_pivot) {
                     s_tour_pending_pivot = false;
@@ -1851,10 +1913,14 @@ static void control_task(void *argument)
                    controller.clean_straight_frames >= TURN_CLEAN_STRAIGHT_FRAMES &&
                    result.big_turn && result.turn_angle_deg >= 25 &&
                    result.turn_confidence >= 50 && result.corner_path_distance <= 22) {
+            s_tour_resume_requested = false;
             s_tour_corner_seen = true;
             s_tour_corner_complete = false;
             s_tour_straight_frames = 0;
             ++s_tour_corner_count;
+            if (!tour_speech_play(tour_station_clip(tour_guide_route(),s_tour_corner_count,false))) {
+                s_enabled=false; tour_guide_stop();
+            }
             s_tour_dwell_until_us = now_us + 2000000;
             s_tour_rearm_after_us = s_tour_dwell_until_us + 500000;
             brake_motors();
@@ -1972,10 +2038,14 @@ static void control_task(void *argument)
                              result.foot_center_pixel_count,
                              result.foot_path_length_pixels);
                     if (!s_tour_corner_seen) {
+                        s_tour_resume_requested = false;
                         s_tour_corner_seen = true;
                         s_tour_corner_complete = false;
                         s_tour_straight_frames = 0;
                         ++s_tour_corner_count;
+                        if (!tour_speech_play(tour_station_clip(tour_guide_route(),s_tour_corner_count,false))) {
+                            s_enabled=false; tour_guide_stop();
+                        }
                         s_tour_pending_pivot = true;
                         s_tour_dwell_until_us = now_us + 2000000;
                         s_tour_rearm_after_us = s_tour_dwell_until_us + 500000;
@@ -1998,6 +2068,9 @@ static void control_task(void *argument)
                            FOOT_LOST_STOP_FRAMES) {
                     s_enabled = false;
                     stop_motors();
+                    const int end_clip = tour_station_clip(tour_guide_route(),s_tour_corner_count,true);
+                    s_tour_finished = s_tour_corner_complete && end_clip >= 0;
+                    if (s_tour_finished && !tour_speech_play(end_clip)) ESP_LOGE(TAG,"End speech failed");
                     ESP_LOGW(TAG,
                              "TOUR %s: line absent for %d frames; reboot to restart",
                              s_tour_corner_complete ? "END" : "FAULT_BEFORE_FINAL_LEG",
@@ -2008,7 +2081,13 @@ static void control_task(void *argument)
             }
         }
 
-        const char *state = obstacle.state != OBSTACLE_IDLE
+        const char *state = s_tour_finished ? "FINISHED" :
+            tour_guide_route() < 0 ? "LOCKED" :
+            s_tour_paused ? "PAUSED" :
+            s_tour_dwell_until_us > 0 ? "WAIT_DEPARTURE" :
+            !s_tour_session ? "WAIT_START" :
+            !s_tour_started ? (tour_speech_busy()?"WELCOME":tour_guide_route()==0?"WAIT_DIGIT":"CLEAR_CARD") :
+            s_tour_align_active ? "TURN_30" : obstacle.state != OBSTACLE_IDLE
             ? obstacle_state_name(obstacle.state)
             : (s_tour_dwell_until_us ? "TOUR_DWELL" : controller.pivot_active ? "PIVOT" :
                 (controller.turn_armed ? "READY" : "FOLLOW"));
@@ -2022,6 +2101,17 @@ static void control_task(void *argument)
             .encoder_delta_a = controller.speed_delta_a,
             .encoder_delta_d = controller.speed_delta_d,
             .distance_mm = obstacle.latest_distance_mm,
+            .tour_corners = s_tour_corner_count,
+            .tour_dwell_ms = s_tour_dwell_until_us > now_us ? (int)((s_tour_dwell_until_us-now_us)/1000) : 0,
+            .tour_can_start = tour_speech_ready() && !tour_speech_failed() && !tour_speech_busy() &&
+                ((!s_tour_session && tour_guide_route()>=0) ||
+                 (tour_guide_route()>0 && frame_fresh && s_enabled &&
+                  (s_tour_paused || (s_tour_dwell_until_us>0 && now_us>=s_tour_dwell_until_us)))),
+            .tour_turn_deg = (int)s_tour_turn.angle_deg, .tour_turn_target = (int)s_tour_turn.target_deg,
+            .tour_started = s_tour_started,
+            .tour_finished = s_tour_finished,
+            .tour_audio_ready = tour_speech_ready(), .tour_audio_busy = tour_speech_busy(),
+            .tour_audio_failed = tour_speech_failed(),
         };
         snprintf(debug_status.state, sizeof(debug_status.state), "%s", state);
         portENTER_CRITICAL(&s_result_lock);
@@ -2059,7 +2149,7 @@ esp_err_t camera_line_follow_init(void)
     s_course_complete = false;
     s_handoff_requested = false;
     s_handoff_ready = false;
-    s_auto_start_pending = true;
+    s_auto_start_pending = false;
     set_output_low(DRIVER_STBY);
     const motor_t *motors[] = {&s_motor_a, &s_motor_b, &s_motor_d};
     for (size_t index = 0; index < 3; ++index) {

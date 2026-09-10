@@ -17,6 +17,12 @@ typedef struct {
     int encoder_delta_a;
     int encoder_delta_d;
     int distance_mm;
+    int tour_corners;
+    int tour_dwell_ms;
+    bool tour_can_start;
+    bool tour_started, tour_finished;
+    int tour_turn_deg, tour_turn_target;
+    bool tour_audio_ready, tour_audio_busy, tour_audio_failed;
 } camera_line_follow_debug_status_t;
 
 esp_err_t camera_line_follow_init(void);

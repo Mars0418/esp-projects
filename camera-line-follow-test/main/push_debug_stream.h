@@ -20,6 +20,12 @@ typedef struct {
 } push_debug_detection_t;
 
 typedef struct {
+    bool tour_active;
+    int tour_route, tour_digit, tour_score, tour_corners, tour_dwell_ms;
+    bool tour_can_start;
+    bool tour_started, tour_finished;
+    int tour_turn_deg, tour_turn_target;
+    bool tour_audio_ready, tour_audio_busy, tour_audio_failed;
     const char *phase_name;
     int64_t captured_at_us;
     int64_t processed_at_us;

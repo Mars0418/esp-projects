@@ -1,0 +1,32 @@
+[
+  {
+    "id": 0,
+    "seconds": 7.79,
+    "bytes": 62320
+  },
+  {
+    "id": 1,
+    "seconds": 2.39,
+    "bytes": 19120
+  },
+  {
+    "id": 2,
+    "seconds": 2.645,
+    "bytes": 21160
+  },
+  {
+    "id": 3,
+    "seconds": 6.325,
+    "bytes": 50600
+  },
+  {
+    "id": 4,
+    "seconds": 2.78,
+    "bytes": 22240
+  },
+  {
+    "id": 5,
+    "seconds": 4.22,
+    "bytes": 33760
+  }
+]

@@ -1,0 +1,1 @@
+Vendored from https://github.com/espressif/esp-usb commit bc0904a6429389d2db72646c58ef626193180ec7, host/class/uac/usb_host_uac. Local CMake uses ESP-IDF 5.5.5 built-in USB without component manager helper. Apache-2.0; see LICENSE.

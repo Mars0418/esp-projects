@@ -25,6 +25,7 @@
 static const char *TAG = "CAMERA_TFT";
 static spi_device_handle_t s_tft;
 static uint8_t *s_framebuffer;
+static uint8_t *s_dma_chunk;
 static SemaphoreHandle_t s_display_mutex;
 
 static esp_err_t tft_write(bool data_mode, const void *data, size_t length)
@@ -38,6 +39,14 @@ static esp_err_t tft_write(bool data_mode, const void *data, size_t length)
         .length = length * 8,
         .tx_buffer = data,
     };
+    if(length<=sizeof(transaction.tx_data)) {
+        transaction.flags=SPI_TRANS_USE_TXDATA;
+        memcpy(transaction.tx_data,data,length);
+    } else {
+        if(length>TFT_SPI_CHUNK) return ESP_ERR_INVALID_SIZE;
+        memcpy(s_dma_chunk,data,length);
+        transaction.tx_buffer=s_dma_chunk;
+    }
     return spi_device_polling_transmit(s_tft, &transaction);
 }
 
@@ -68,10 +77,11 @@ static esp_err_t tft_pixel_data(const void *data, size_t length)
         if (chunk > TFT_SPI_CHUNK) {
             chunk = TFT_SPI_CHUNK;
         }
+        memcpy(s_dma_chunk,bytes+offset,chunk);
         spi_transaction_t transaction = {
             .flags = offset + chunk < length ? SPI_TRANS_CS_KEEP_ACTIVE : 0,
             .length = chunk * 8,
-            .tx_buffer = bytes + offset,
+            .tx_buffer = s_dma_chunk,
         };
         result = spi_device_polling_transmit(s_tft, &transaction);
         if (result != ESP_OK) {
@@ -133,8 +143,9 @@ esp_err_t camera_display_init(void)
                         TAG, "add TFT failed");
 
     s_framebuffer = heap_caps_calloc(TFT_WIDTH * TFT_HEIGHT, 2,
-                                     MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_framebuffer != NULL, ESP_ERR_NO_MEM, TAG,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_dma_chunk=heap_caps_malloc(TFT_SPI_CHUNK,MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL);
+    ESP_RETURN_ON_FALSE(s_framebuffer != NULL && s_dma_chunk != NULL, ESP_ERR_NO_MEM, TAG,
                         "framebuffer allocation failed");
 
     const gpio_config_t dc_config = {
