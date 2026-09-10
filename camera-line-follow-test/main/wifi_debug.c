@@ -217,6 +217,32 @@ static void network_event(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
+bool wifi_debug_uart_command(const char *line)
+{
+    if (strncmp(line, "wifi config ", 12) != 0) return false;
+    cJSON *obj = cJSON_Parse(line + 12);
+    cJSON *ssid = cJSON_GetObjectItemCaseSensitive(obj, "ssid");
+    cJSON *pass = cJSON_GetObjectItemCaseSensitive(obj, "password");
+    if (!cJSON_IsString(ssid) || !cJSON_IsString(pass) ||
+        strlen(ssid->valuestring) == 0 || strlen(ssid->valuestring) > 32 ||
+        strlen(pass->valuestring) > 63 ||
+        (strlen(pass->valuestring) != 0 && strlen(pass->valuestring) < 8)) {
+        ESP_LOGW(TAG, "UART_CONFIG invalid SSID/password length");
+    } else {
+        wifi_config_t config = {0};
+        memcpy(config.sta.ssid, ssid->valuestring, strlen(ssid->valuestring));
+        memcpy(config.sta.password, pass->valuestring, strlen(pass->valuestring));
+        config.sta.threshold.authmode = strlen(pass->valuestring) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        config.sta.pmf_cfg.capable = true;
+        xQueueOverwrite(s_config_queue, &config);
+        memset(&config, 0, sizeof(config));
+        ESP_LOGI(TAG, "UART_CONFIG accepted (credentials not logged)");
+    }
+    if (cJSON_IsString(pass)) memset(pass->valuestring, 0, strlen(pass->valuestring));
+    cJSON_Delete(obj);
+    return true;
+}
+
 static void network_task(void *arg)
 {
     bool configured = false;

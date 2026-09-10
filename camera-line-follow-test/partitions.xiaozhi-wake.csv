@@ -1,0 +1,6 @@
+# NVS and PHY offsets unchanged: preserve Wi-Fi credentials and device UUID.
+# Name, Type, SubType, Offset, Size
+nvs, data, nvs, 0x9000, 0x6000
+phy_init, data, phy, 0xf000, 0x1000
+factory, app, factory, 0x10000, 0x400000
+model, data, spiffs, 0x410000, 0x800000

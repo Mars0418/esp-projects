@@ -10,3 +10,4 @@ dependencies:
   espressif/usb_host_uac: "==1.5.0"
   espressif/esp_audio_codec: "~2.5.0"
   espressif/esp_websocket_client: "^1.4.0"
+  espressif/esp-sr: "~2.2.0"

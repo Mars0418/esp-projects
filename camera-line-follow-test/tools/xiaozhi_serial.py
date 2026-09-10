@@ -7,7 +7,7 @@ import serial
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["bind", "connect", "listen", "send", "stop", "status"])
+    parser.add_argument("command", choices=["bind", "connect", "listen", "send", "stop", "end", "status", "wake on", "wake off"])
     parser.add_argument("--port", default="COM9")
     parser.add_argument("--seconds", type=int, default=30)
     args = parser.parse_args()
@@ -28,7 +28,7 @@ def main():
         while time.monotonic() < end:
             line = port.readline().decode("utf-8", errors="replace")
             line = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
-            if line and any(tag in line for tag in ("XIAOZHI", "CAR_AUDIO", "esp-tls", "HTTP_CLIENT", "Guru", "assert", "mbedtls", "wifi:connected", "LAN_URL", "certificate")):
+            if line and any(tag in line for tag in ("XIAOZHI", "LEDi_WAKE", "CAR_AUDIO", "esp-tls", "HTTP_CLIENT", "Guru", "assert", "mbedtls", "wifi:connected", "LAN_URL", "certificate")):
                 print(line, flush=True)
     except KeyboardInterrupt:
         if port.is_open:

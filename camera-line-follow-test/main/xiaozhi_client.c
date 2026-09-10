@@ -1,6 +1,9 @@
 #include "xiaozhi_client.h"
+#include "xiaozhi_wake.h"
+#include "dialogue_control.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -29,7 +32,8 @@
 #define WS_DOWN BIT1
 #define AUDIO_FAULT BIT2
 static const char *TAG = "XIAOZHI";
-typedef enum { CMD_BIND=1, CMD_CONNECT, CMD_LISTEN, CMD_SEND, CMD_STOP, CMD_STATUS } command_t;
+typedef enum { CMD_BIND=1, CMD_CONNECT, CMD_LISTEN, CMD_SEND, CMD_STOP, CMD_STATUS,
+               CMD_WAKE_ON, CMD_WAKE_OFF, CMD_WAKE, CMD_END } command_t;
 typedef struct { uint16_t len; uint8_t opcode; uint8_t bytes[RX_MAX]; } message_t;
 typedef struct { int16_t pcm[XZ_PCM_SAMPLES]; } capture_t;
 static QueueHandle_t s_commands, s_rx, s_tx, s_play;
@@ -38,6 +42,12 @@ static EventGroupHandle_t s_events;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_capture;
 static bool s_playback_allowed;
+static bool s_local_listening;
+static atomic_bool s_wake_enabled = true;
+/* Only the cloud task owns the dialogue lifecycle. */
+static bool s_wake_pending, s_auto_dialogue, s_resume_dialogue;
+static int64_t s_output_until, s_rearm_at;
+static unsigned s_voice_frames, s_silence_frames, s_listen_frames;
 static char s_mac[18], s_uuid[37], s_url[512], s_token[1024], s_session[128];
 static int s_version = 1;
 static esp_websocket_client_handle_t s_ws;
@@ -65,6 +75,26 @@ bool xiaozhi_allows_playback(void)
     portENTER_CRITICAL(&s_lock); bool value=s_playback_allowed; portEXIT_CRITICAL(&s_lock);
     return value;
 }
+bool xiaozhi_local_listening(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool value = s_local_listening && s_wake_enabled;
+    portEXIT_CRITICAL(&s_lock);
+    return value && xiaozhi_wake_ready();
+}
+static void local_listening(bool enabled)
+{
+    portENTER_CRITICAL(&s_lock); s_local_listening=enabled; portEXIT_CRITICAL(&s_lock);
+}
+void xiaozhi_request_wake(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool allowed = s_wake_enabled && s_local_listening;
+    if (allowed) s_local_listening=false;
+    portEXIT_CRITICAL(&s_lock);
+    command_t command=CMD_WAKE;
+    if (allowed && xQueueSend(s_commands, &command, 0) != pdTRUE) local_listening(true);
+}
 bool xiaozhi_push_pcm(const int16_t *pcm)
 {
     if (!s_tx || !xiaozhi_wants_microphone()) return false;
@@ -74,7 +104,13 @@ bool xiaozhi_push_pcm(const int16_t *pcm)
 }
 bool xiaozhi_take_playback(xz_playback_t *frame)
 {
-    return s_play && xQueueReceive(s_play, frame, 0) == pdTRUE;
+    /* Mark in-flight audio before dequeue, so an empty queue is not mistaken
+     * for a silent USB speaker by the cloud task. The USB buffer is 8192 B. */
+    if (!s_play || uxQueueMessagesWaiting(s_play)==0) return false;
+    portENTER_CRITICAL(&s_lock);
+    s_output_until=esp_timer_get_time()+900000;
+    portEXIT_CRITICAL(&s_lock);
+    return xQueueReceive(s_play, frame, 0) == pdTRUE;
 }
 void xiaozhi_audio_fault(void)
 {
@@ -84,13 +120,24 @@ void xiaozhi_audio_fault(void)
 }
 bool xiaozhi_command(const char *text)
 {
-    const char *names[] = {"xz bind", "xz connect", "xz listen", "xz send", "xz stop", "xz status"};
-    for (int i = 0; i < 6; ++i) {
+    if (strcmp(text, "xz end") == 0) {
+        capture_enable(false);
+        portENTER_CRITICAL(&s_lock); s_playback_allowed=false; portEXIT_CRITICAL(&s_lock);
+        command_t command=CMD_END;
+        if (!s_commands || xQueueSend(s_commands, &command, 0) != pdTRUE)
+            ESP_LOGW(TAG, "Busy; retry xz end");
+        return true;
+    }
+    const char *names[] = {"xz bind", "xz connect", "xz listen", "xz send", "xz stop", "xz status",
+                           "xz wake on", "xz wake off"};
+    for (int i = 0; i < 8; ++i) {
         if (strcmp(text, names[i]) != 0) continue;
         command_t command = i + 1;
-        if (command == CMD_STOP || command == CMD_SEND) capture_enable(false);
-        if (command == CMD_STOP) {
-            portENTER_CRITICAL(&s_lock); s_playback_allowed=false; portEXIT_CRITICAL(&s_lock);
+        if (command == CMD_STOP || command == CMD_SEND || command == CMD_WAKE_OFF) capture_enable(false);
+        if (command == CMD_STOP || command == CMD_WAKE_OFF) {
+            portENTER_CRITICAL(&s_lock);
+            s_playback_allowed=false; s_wake_enabled=false; s_local_listening=false;
+            portEXIT_CRITICAL(&s_lock);
         }
         if (!s_commands || xQueueSend(s_commands, &command, 0) != pdTRUE)
             ESP_LOGW(TAG, "Busy; retry command");
@@ -248,6 +295,9 @@ static void ws_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void close_session(void)
 {
+    local_listening(false);
+    s_wake_pending=false; s_auto_dialogue=false; s_resume_dialogue=false;
+    s_rearm_at=esp_timer_get_time()+1500000;
     capture_enable(false); s_turn = false; s_speaking = false; s_hello = false; s_end_listen = false;
     portENTER_CRITICAL(&s_lock); s_playback_allowed=false; portEXIT_CRITICAL(&s_lock);
     if (s_ws) {
@@ -335,10 +385,12 @@ static void listen_message(bool start)
     cJSON_free(text); cJSON_Delete(obj);
     if (!ok) xiaozhi_audio_fault();
     else if (start) {
+        local_listening(false);
+        s_voice_frames=0; s_silence_frames=0; s_listen_frames=0;
         xQueueReset(s_tx); s_turn = true; s_speaking = false; s_end_listen = false;
         s_deadline = esp_timer_get_time() + 15000000;
         capture_enable(true);
-        ESP_LOGW(TAG, "LISTENING: microphone audio goes to XiaoZhi; xz send ends utterance, xz stop aborts; max 15s");
+        ESP_LOGW(TAG, "LISTENING: please speak; audio uploads to XiaoZhi, silence ends speech; max 15s; xz stop disables wake");
     } else {
         s_end_listen = false;
         s_deadline = esp_timer_get_time() + 60000000;
@@ -389,6 +441,8 @@ static void process_message(message_t *message, xz_playback_t *pcm)
                 xQueueReset(s_tx); esp_opus_dec_reset(s_decoder);
             } else if (strcmp(state, "stop") == 0) {
                 s_speaking = false; s_turn = false;
+                s_resume_dialogue=s_auto_dialogue;
+                s_rearm_at=esp_timer_get_time()+1000000;
                 ESP_LOGI(TAG, "REPLY_RECEIVED frames=%lu; queued playback draining, microphone remains off", (unsigned long)s_received);
             }
         }
@@ -396,7 +450,13 @@ static void process_message(message_t *message, xz_playback_t *pcm)
         if (s_turn && copy_string(obj, "text", text, sizeof(text))) ESP_LOGI(TAG, "ASSISTANT: %s", text);
     } else if (strcmp(type, "stt") == 0) {
         char text[1024];
-        if (copy_string(obj, "text", text, sizeof(text))) ESP_LOGI(TAG, "USER: %s", text);
+        if (copy_string(obj, "text", text, sizeof(text))) {
+            ESP_LOGI(TAG, "USER: %s", text);
+            if (s_turn && dialogue_is_end_request(text)) {
+                close_session();
+                ESP_LOGI(TAG, "DIALOGUE_ENDED source=voice; return to local wake if enabled");
+            }
+        }
     } else if (strcmp(type, "alert") == 0) {
         char text[512];
         if (copy_string(obj, "message", text, sizeof(text))) ESP_LOGW(TAG, "SERVER_ALERT: %s", text);
@@ -426,6 +486,8 @@ static void cloud_task(void *arg)
     ESP_LOGI(TAG, "CODEC_STACK_FREE=%u internal_free=%u", (unsigned)uxTaskGetStackHighWaterMark(NULL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "Commands: xz bind | xz connect | xz listen | xz send | xz stop | xz status");
+    esp_err_t wake_error=xiaozhi_wake_init();
+    if (wake_error!=ESP_OK) ESP_LOGE(TAG, "Wake init: %s (manual voice available)", esp_err_to_name(wake_error));
     for (;;) {
         EventBits_t events = xEventGroupGetBits(s_events);
         if (events & (WS_DOWN | AUDIO_FAULT)) {
@@ -442,20 +504,53 @@ static void cloud_task(void *arg)
             switch (command) {
             case CMD_BIND: close_session(); bind_device(); break;
             case CMD_CONNECT: connect_session(); break;
+            case CMD_WAKE_ON:
+                portENTER_CRITICAL(&s_lock); s_wake_enabled=true; portEXIT_CRITICAL(&s_lock);
+                ESP_LOGI(TAG, "Wake enabled: say 你好乐迪; idle audio stays local"); break;
+            case CMD_WAKE_OFF:
+                close_session(); ESP_LOGI(TAG, "Wake disabled; microphone off"); break;
+            case CMD_WAKE:
+                if (!s_wake_enabled || s_turn || s_resume_dialogue) break;
+                if (!s_hello) connect_session();
+                if (s_hello || s_ws) { s_wake_pending=true; s_auto_dialogue=true; }
+                else { s_rearm_at=esp_timer_get_time()+3000000; ESP_LOGW(TAG, "Wake: hotspot/session unavailable; try again later"); }
+                break;
             case CMD_LISTEN:
+                s_auto_dialogue=false;
                 if (s_hello && !s_turn && uxQueueMessagesWaiting(s_play)==0) listen_message(true);
                 else ESP_LOGW(TAG, "Not ready or replying; xz connect first, wait SESSION_READY");
                 break;
             case CMD_SEND: if (s_turn && !s_speaking) s_end_listen = true; break;
             case CMD_STOP: close_session(); ESP_LOGI(TAG, "Stopped: microphone off, playback queue cleared"); break;
+            case CMD_END:
+                close_session();
+                ESP_LOGI(TAG, "DIALOGUE_ENDED source=uart; return to local wake if enabled"); break;
             case CMD_STATUS:
                 ESP_LOGI(TAG, "STATE configured=%d session_ready=%d recording=%d replying=%d sent=%lu received=%lu motors=disabled",
                          s_url[0]!=0, s_hello, xiaozhi_wants_microphone(), s_speaking,
-                         (unsigned long)s_sent, (unsigned long)s_received); break;
+                         (unsigned long)s_sent, (unsigned long)s_received);
+                ESP_LOGI(TAG, "WAKE enabled=%d ready=%d local_listening=%d auto_dialogue=%d", s_wake_enabled,
+                         xiaozhi_wake_ready(), xiaozhi_local_listening(), s_auto_dialogue); break;
             }
         }
         for (int i=0; i<4 && xQueueReceive(s_rx, message, 0)==pdTRUE; ++i) process_message(message, pcm);
+        if (s_wake_pending && s_hello) {
+            s_wake_pending=false; listen_message(true);
+        }
         if (s_hello && s_turn && !s_speaking && xQueueReceive(s_tx, input, 0)==pdTRUE) {
+            /* Bounded endpoint detector for this calibrated USB microphone.
+             * Energy gate is not a word recognizer; MultiNet handles wake. */
+            uint64_t energy=0;
+            for (unsigned i=0; i<XZ_PCM_SAMPLES; ++i) energy+=(int64_t)input->pcm[i]*input->pcm[i];
+            ++s_listen_frames;
+            if (energy/XZ_PCM_SAMPLES >= 600*600) { ++s_voice_frames; s_silence_frames=0; }
+            else ++s_silence_frames;
+            if (s_auto_dialogue && s_voice_frames < 3 && s_listen_frames >= 134) {
+                close_session(); ESP_LOGI(TAG, "No speech for 8s; return to local wake"); continue;
+            }
+            if (s_auto_dialogue && s_voice_frames>=3 && s_silence_frames>=20) {
+                capture_enable(false); s_end_listen=true;
+            }
             int len = encode(input);
             if (len <= 0) xiaozhi_audio_fault();
             else {
@@ -471,6 +566,18 @@ static void cloud_task(void *arg)
             }
         }
         int64_t now = esp_timer_get_time();
+        portENTER_CRITICAL(&s_lock); int64_t output_until=s_output_until; portEXIT_CRITICAL(&s_lock);
+        bool silent=now>output_until && uxQueueMessagesWaiting(s_play)==0;
+        if (!s_turn && !s_wake_pending && !s_hello_deadline && silent && now>s_rearm_at) {
+            if (s_resume_dialogue && s_hello && s_wake_enabled) {
+                s_resume_dialogue=false;
+                portENTER_CRITICAL(&s_lock); s_playback_allowed=false; portEXIT_CRITICAL(&s_lock);
+                listen_message(true);
+            } else {
+                portENTER_CRITICAL(&s_lock); s_playback_allowed=false; portEXIT_CRITICAL(&s_lock);
+                local_listening(true);
+            }
+        }
         if (xiaozhi_wants_microphone() && now > s_deadline) { capture_enable(false); s_end_listen=true; }
         if (s_end_listen && uxQueueMessagesWaiting(s_tx)==0) listen_message(false);
         if ((s_hello_deadline && now>s_hello_deadline) || (s_turn && !xiaozhi_wants_microphone() && !s_end_listen && now>s_deadline)) {

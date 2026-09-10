@@ -1,5 +1,7 @@
 #include "usb_audio.h"
 #include "xiaozhi_client.h"
+#include "xiaozhi_wake.h"
+#include "wifi_debug.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -28,6 +30,7 @@ static uint32_t s_samples, s_peak;
 static uint64_t s_energy;
 static int64_t s_report_us;
 static bool s_cloud_mic;
+static bool s_local_mic;
 static int16_t s_cloud_pcm[XZ_PCM_SAMPLES];
 static size_t s_cloud_used;
 static int64_t s_last_playback;
@@ -110,10 +113,12 @@ static void read_microphone(void)
         if (error != ESP_OK || received == 0) break;
         for (unsigned i = 0; i + 1 < received; i += 2) {
             int value = (int16_t)(pcm[i] | ((unsigned)pcm[i + 1] << 8));
-            if (s_cloud_mic && xiaozhi_wants_microphone()) {
+            if ((s_cloud_mic && xiaozhi_wants_microphone()) ||
+                (s_local_mic && xiaozhi_local_listening())) {
                 s_cloud_pcm[s_cloud_used++] = value;
                 if (s_cloud_used == XZ_PCM_SAMPLES) {
-                    xiaozhi_push_pcm(s_cloud_pcm);
+                    if (s_cloud_mic) xiaozhi_push_pcm(s_cloud_pcm);
+                    else xiaozhi_wake_feed(s_cloud_pcm);
                     s_cloud_used = 0;
                 }
             }
@@ -165,6 +170,7 @@ static void tone(void)
 
 static void command(const char *line)
 {
+    if (wifi_debug_uart_command(line)) return;
     if (xiaozhi_command(line)) return;
     if ((s_cloud_mic || xiaozhi_allows_playback()) && strcmp(line, "audio status") != 0) {
         ESP_LOGW(TAG, "Cloud microphone active; use xz send or xz stop first");
@@ -203,6 +209,20 @@ static void command(const char *line)
 static void service_cloud_audio(void)
 {
     bool wanted = xiaozhi_wants_microphone();
+    bool local = !wanted && xiaozhi_wake_ready() && xiaozhi_local_listening();
+    if (local != s_local_mic || (local && !s_mic.streaming)) {
+        s_cloud_used = 0;
+        if (local && s_mic.handle && !s_mic.streaming) {
+            esp_err_t error = uac_host_device_set_mute(s_mic.handle, false);
+            if (error == ESP_OK || error == ESP_ERR_NOT_SUPPORTED)
+                error = uac_host_device_resume(s_mic.handle);
+            s_mic.streaming = error == ESP_OK;
+            s_samples=0; s_energy=0; s_peak=0; s_report_us=esp_timer_get_time();
+        } else if (!local && s_local_mic && s_mic.handle && s_mic.streaming) {
+            if (uac_host_device_suspend(s_mic.handle) == ESP_OK) s_mic.streaming=false;
+        }
+        s_local_mic = local && s_mic.handle && s_mic.streaming;
+    }
     if (wanted && !s_cloud_mic) {
         if (!s_mic.handle || !s_speaker.handle) { xiaozhi_audio_fault(); return; }
         if (s_mic.streaming) uac_host_device_suspend(s_mic.handle);
@@ -251,7 +271,7 @@ static void service_cloud_audio(void)
 static void audio_task(void *arg)
 {
     (void)arg;
-    char line[64];
+    char line[512];
     size_t used = 0;
     bool overflow = false;
     for (;;) {
@@ -265,8 +285,9 @@ static void audio_task(void *arg)
             if (input[i] == '\n' || input[i] == '\r') {
                 line[used] = 0;
                 if (!overflow) command(line);
+                memset(line, 0, sizeof(line));
                 used = 0; overflow = false;
-            } else if (input[i] >= 32 && input[i] <= 126) {
+            } else if (input[i] >= 32 && input[i] != 127) {
                 if (used + 1 < sizeof(line)) line[used++] = input[i];
                 else overflow = true;
             }

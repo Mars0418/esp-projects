@@ -13,3 +13,5 @@ bool xiaozhi_allows_playback(void);
 bool xiaozhi_push_pcm(const int16_t *pcm); /* exactly 960 samples */
 bool xiaozhi_take_playback(xz_playback_t *frame);
 void xiaozhi_audio_fault(void);
+bool xiaozhi_local_listening(void);
+void xiaozhi_request_wake(void);
